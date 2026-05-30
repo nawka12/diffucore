@@ -26,6 +26,7 @@ import torch
 from PIL import Image
 
 from ..runtime import on_device
+from ._base import _step_progress
 from ..sampling import (
     FlowSamplingView,
     flow_matching_schedule,
@@ -173,7 +174,8 @@ def anima_text_to_image(
             kwargs = {}
             if sampler in _FLOW_AWARE_SAMPLERS:
                 kwargs = dict(generator=gen, model_type="flow", shift=shift)
-            x = get_sampler(sampler)(denoise, x.float(), sigmas, **kwargs)
+            with _step_progress(len(sigmas) - 1) as on_step:
+                x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
     # ---- 5. process_out then decode
     with torch.no_grad(), _staged([model.vae], device, policy.offload_idle):

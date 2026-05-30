@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from PIL import Image
+from tqdm.auto import tqdm
 
 from ..conditioning import Conditioner, SDXLConditioner
 from ..models.unet import timestep_embedding
@@ -78,6 +79,17 @@ def _staged(modules, device, offload):
         for module in modules:
             stack.enter_context(on_device(module, device))
         yield
+
+
+@contextmanager
+def _step_progress(total: int):
+    """A tqdm bar over the ``total`` sampling steps, advanced through the
+    sampler's ``callback`` hook. Yields the callback; closes the bar on exit."""
+    bar = tqdm(total=total, desc="sampling", leave=False)
+    try:
+        yield lambda *_: bar.update(1)
+    finally:
+        bar.close()
 
 
 class _Pipeline:
@@ -171,7 +183,8 @@ class _Pipeline:
     def _sample(self, sampler, cfg, x, sigmas, policy):
         with torch.no_grad():
             with _staged([self.model.backbone], policy.device, policy.offload_unet):
-                return get_sampler(sampler)(cfg, x, sigmas)
+                with _step_progress(len(sigmas) - 1) as on_step:
+                    return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
 
     # --- decode --------------------------------------------------------------
     def _decode(self, x0, policy, width, height) -> Image.Image:
