@@ -1,0 +1,9 @@
+Diffucore
+Copyright 2026 The Diffucore Authors
+
+This product includes software developed by The Diffucore Authors.
+
+Diffucore is an independent diffusion inference engine. It is not affiliated
+with, endorsed by, or derived from any other diffusion UI or framework. Model
+architectures and sampling algorithms are implemented from their original
+research publications.

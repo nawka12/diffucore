@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "diffucore"
+version = "0.0.1"
+description = "A clean, from-scratch diffusion inference engine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The Diffucore Authors" }]
+keywords = ["diffusion", "stable-diffusion", "image-generation", "inference"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.25",
+    "safetensors>=0.4",
+    "tokenizers>=0.15",
+    "Pillow>=10.0",
+    "einops>=0.7",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://example.com/diffucore"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/diffucore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
