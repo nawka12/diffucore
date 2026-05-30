@@ -54,17 +54,19 @@ src/diffucore/
     samplers.py          Euler, Heun, ancestral — pure σ-space steppers.
     denoiser.py          wraps a backbone: applies scalings + CFG.
   models/                nn.Module backbones, implemented from papers.
-    clip_text.py         CLIP ViT-L/14 text encoder.
-    unet.py              SD1.5 UNet (eps).
+    clip_text.py         CLIP ViT-L/14 text encoder (SD1.5 + SDXL encoder 1).
+    open_clip_text.py    OpenCLIP ViT-bigG/14 text encoder (SDXL encoder 2).
+    unet.py              config-driven eps UNet (SD1.5 and SDXL).
     vae.py               AutoencoderKL encode/decode.
-  conditioning/          tokenizer + text-encoder orchestration.
+  conditioning/          tokenizer(s) + text-encoder orchestration (incl. SDXL dual).
   loading/               safetensors IO, arch detection.
   runtime/               device/dtype selection (offload, tiling: planned).
   pipelines/             TextToImage — user-facing glue.
 ```
 
-The full SD1.5 text-to-image path is implemented. `runtime/` offload + tiled VAE
-remain the only planned items (not needed for 512² on 12 GB); see `ROADMAP.md`.
+The full SD1.5 (512²) and SDXL (1024²) text-to-image paths are implemented.
+`runtime/` offload + tiled VAE remain the main planned items (not needed for
+512² SD1.5 on 12 GB; would let SDXL run on smaller cards); see `ROADMAP.md`.
 
 ## 4. Core abstractions
 

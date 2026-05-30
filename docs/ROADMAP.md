@@ -14,6 +14,7 @@ verified on the RTX 2060 (12 GB).
 | M5 | VAE | AutoencoderKL encode/decode; `decode(encode(img)) ≈ img` (PSNR threshold). | CUDA ✅ |
 | M6 | UNet (SD1.5) | eps backbone forward; single denoise step runs at 512² in fp16 under ~6 GB. | CUDA ✅ |
 | M7 | **End-to-end t2i** | `TextToImage` produces a coherent 512² image from a real SD1.5 checkpoint; fixed seed reproducible. | CUDA ✅ |
+| SX | **SDXL** | Dual text encoders (CLIP-L + OpenCLIP bigG) + generalized UNet + size/pooled conditioning; coherent 1024² image, seed reproducible. | CUDA ✅ |
 
 ## Current status
 
@@ -32,17 +33,28 @@ verified on the RTX 2060 (12 GB).
 - The end-to-end SD1.5 text-to-image path (`load_checkpoint` → `TextToImage`) is
   working. HF `transformers`/`diffusers` are used only as numerical oracles in
   verification, not as runtime dependencies.
+- **SDXL implemented and verified on the RTX 2060** (detection → both text
+  encoders → generalized UNet → pipeline):
+  - bigG (OpenCLIP) — strict load; penultimate hidden bit-identical to diffusers
+    `text_encoder_2` (max|Δ|=0), pooled max|Δ|~1e-6.
+  - Dual conditioner — 2048-d context bit-identical to diffusers `encode_prompt`
+    (max|Δ|=0).
+  - UNet — generalized `UNetModel` strict-loads SDXL and matches diffusers
+    (fp16 relative ~1e-3); **SD1.5 stays bit-exact** (max|Δ|=0, smoke test green).
+  - t2i — coherent 1024² image, seed-reproducible; ~19 s / 20 steps at ~10.7 GB.
 
-## After SD1.5
+## After SDXL
 
-Once M7 lands, the natural extensions (each its own slice): SDXL (dual text
-encoders + larger UNet), img2img / inpainting (alternate initial latents +
-masks), and a first DiT-style architecture to validate the §8 extensibility
-seams. These are intentionally not scheduled until SD1.5 is solid.
+The remaining extensions (each its own slice): img2img / inpainting (alternate
+initial latents + masks), VRAM management for SDXL on smaller cards (sequential
+CPU offload + tiled VAE — currently 1024² SDXL needs ~11 GB resident), and a
+first DiT-style architecture to validate the §8 extensibility seams.
 
 ## Verification notes
 
 - The laptop (Intel iGPU, no CUDA) runs the CPU suite via a Python 3.11 venv with
   CPU-only PyTorch.
-- CUDA milestones (M4–M7) are validated on the RTX 2060. fp16 is the default
-  working dtype there; the VAE and σ math stay fp32.
+- CUDA milestones (M4–M7, SDXL) are validated on the RTX 2060. fp16 is the
+  default working dtype there; the VAE and σ math stay fp32.
+- Numerical oracles (`transformers`/`diffusers`) require `transformers<5` to load
+  SDXL checkpoints via diffusers `from_single_file` / `StableDiffusionXLPipeline`.

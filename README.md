@@ -8,13 +8,14 @@ loop, and VAE decoding — and exposes a small Python API that a separate UI can
 drive. It is **not** a node-graph editor; there is no workflow JSON and no node
 system.
 
-> **Status: pre-alpha, but end-to-end working.** Stable Diffusion 1.5
-> text-to-image runs: `load_checkpoint` → `TextToImage` produces a coherent,
-> seed-reproducible 512² image. The sampling core + checkpoint detection are unit
-> tested (32 CPU tests); the model components (CLIP, VAE, UNet) are verified on an
-> RTX 2060 against HF `transformers`/`diffusers` as numerical oracles (CLIP and
-> UNet match bit-for-bit; VAE round-trip 35 dB PSNR). See
-> [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md),
+> **Status: pre-alpha, but end-to-end working.** Stable Diffusion 1.5 (512²) and
+> SDXL (1024²) text-to-image both run: `load_checkpoint` → `TextToImage` produces
+> a coherent, seed-reproducible image. The sampling core + checkpoint detection
+> are unit tested (CPU); the model components (CLIP, OpenCLIP bigG, VAE, UNet) are
+> verified on an RTX 2060 against HF `transformers`/`diffusers` as numerical
+> oracles (text encoders and UNet match bit-for-bit in fp32; VAE round-trip 35 dB
+> PSNR). See [`docs/ROADMAP.md`](docs/ROADMAP.md),
+> [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md),
 > and [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 ## Design at a glance
@@ -43,8 +44,9 @@ one thing — diffusion inference — and is easy to embed behind a custom UI.
 
 ## Development
 
-The first target is **Stable Diffusion 1.5** text-to-image. CPU is supported for
-testing; real generation targets CUDA (developed against an RTX 2060 12 GB).
+The first targets are **Stable Diffusion 1.5** and **SDXL** text-to-image. CPU is
+supported for testing; real generation targets CUDA (developed against an RTX
+2060 12 GB — SDXL at 1024² needs ~11 GB resident).
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate

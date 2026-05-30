@@ -1,9 +1,12 @@
 # Implementation Spec — M4–M7 (SD1.5 model components + pipeline)
 
 > **Status: implemented and verified** (see [`ROADMAP.md`](ROADMAP.md)). This
-> remains the authoritative description of *what was built*; the code in
-> `src/diffucore/` follows it. Implementation learnings/deviations are recorded
-> in [`HANDOFF.md`](HANDOFF.md) "Gotchas".
+> remains the authoritative description of *what was built* for SD1.5; the code in
+> `src/diffucore/` follows it. **SDXL** (dual text encoders, generalized UNet,
+> size/pooled conditioning, VAE scale 0.13025) was built on top of these
+> components and is verified the same way — its design notes and the SD1.5→SDXL
+> deltas live in [`HANDOFF.md`](HANDOFF.md) "Gotchas". Implementation
+> learnings/deviations are recorded there too.
 
 This is the build sheet for the parts that can only be verified on the RTX 2060
 with real weights. The sampling core they plug into (schedules, samplers, the
