@@ -59,4 +59,36 @@ class Conditioner:
         return embeddings.expand(batch, -1, -1)
 
 
-__all__ = ["CLIPTokenizer", "Conditioner"]
+class SDXLConditioner:
+    """SDXL dual text conditioning.
+
+    Runs CLIP-L and OpenCLIP bigG on the prompt (both at ``clip_skip=2`` =
+    penultimate hidden, no final norm), concatenates their hidden states into the
+    2048-d cross-attention context, and returns bigG's pooled embedding (1280-d)
+    for the UNet's added conditioning.
+
+    The two encoders pad differently: CLIP-L with EOS (49407), bigG with 0.
+
+    Contract: ``__call__(prompt, batch=1) -> (context[batch, 77, 2048],
+    pooled[batch, 1280])``.
+    """
+
+    def __init__(self, tokenizer: "CLIPTokenizer", clip_l, clip_g, clip_skip: int = 2):
+        self.tokenizer = tokenizer
+        self.clip_l = clip_l
+        self.clip_g = clip_g
+        self.clip_skip = clip_skip
+
+    def __call__(self, prompt: str, batch: int = 1):
+        device = next(self.clip_g.parameters()).device
+        ids_l = self.tokenizer.encode(prompt, pad_token=EOS_TOKEN).unsqueeze(0).to(device)
+        ids_g = self.tokenizer.encode(prompt, pad_token=0).unsqueeze(0).to(device)
+
+        hidden_l = self.clip_l(ids_l, clip_skip=self.clip_skip)        # [1, 77, 768]
+        hidden_g, pooled = self.clip_g(ids_g, clip_skip=self.clip_skip)  # [1, 77, 1280], [1, 1280]
+
+        context = torch.cat([hidden_l, hidden_g], dim=-1)              # [1, 77, 2048]
+        return context.expand(batch, -1, -1), pooled.expand(batch, -1)
+
+
+__all__ = ["CLIPTokenizer", "Conditioner", "SDXLConditioner"]
