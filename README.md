@@ -1,104 +1,168 @@
 # Diffucore
 
-A clean, from-scratch diffusion **inference engine** in PyTorch.
+**A clean, from-scratch diffusion inference engine in PyTorch.**
 
-Diffucore turns a model checkpoint plus a prompt into an image. It owns the full
-generation path — checkpoint loading, text conditioning, the sampling/denoising
-loop, and VAE decoding — and exposes a small Python API that a separate UI can
-drive. It is **not** a node-graph editor; there is no workflow JSON and no node
-system.
+Point it at a checkpoint, give it a prompt, get an image. Diffucore owns the
+entire generation path — checkpoint loading, text conditioning, the
+sampling/denoising loop, and VAE decoding — in one small, readable library you
+can `import` or embed behind your own UI.
 
-> **Status: alpha.** Stable Diffusion 1.5 (512²) and SDXL (1024²) run
-> text-to-image, image-to-image, and inpainting — `load_checkpoint` →
-> `TextToImage` / `ImageToImage` / `Inpaint` produces a coherent,
-> seed-reproducible image. Both **epsilon- and v-prediction** checkpoints are
-> supported (auto-detected), including **zero-terminal-SNR** schedules with CFG
-> rescale, and **LoRA / LoKr** adapters fuse in at load time. **Anima**
-> (CircleStone Labs' 2 B DiT built on Cosmos-Predict2 with Qwen3-0.6B +
-> Qwen-Image VAE) is integrated as the first DiT family —
-> `load_anima_checkpoint(dit, vae, te)` → `TextToImage` generates a coherent
-> 1024² image (~46 s / 20 steps on an RTX 2060, ~8.6 GB peak; flow-matching with
-> shift=3, CFG, seed-reproducible). Ten samplers and several schedulers are
-> available, with the DPM++ / ER-SDE family made flow-aware so they drive Anima
-> too (see [Samplers & schedulers](#samplers--schedulers)). The sampling core +
-> checkpoint detection are unit tested (CPU); the model components (CLIP,
-> OpenCLIP bigG, VAE, UNet, Qwen3) are verified on an RTX 2060 against HF
-> `transformers`/`diffusers` as numerical oracles (text encoders and UNet match
-> bit-for-bit in fp32; VAE round-trip 35 dB PSNR on SD, 49 dB on Qwen-Image).
-> See [`docs/ROADMAP.md`](docs/ROADMAP.md),
-> [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md),
-> and [`docs/HANDOFF.md`](docs/HANDOFF.md).
+![status](https://img.shields.io/badge/status-alpha-orange)
+![python](https://img.shields.io/badge/python-3.10%2B-blue)
+![license](https://img.shields.io/badge/license-Apache--2.0-green)
 
-## Design at a glance
+It's a focused library, not a node-graph app: no workflow JSON, no node system,
+and no runtime dependency on `diffusers` or ComfyUI.
 
 ```python
 import torch
 from diffucore import load_checkpoint, TextToImage
 
-model = load_checkpoint("models/v1-5-pruned-emaonly.safetensors",
-                        device="cuda", dtype=torch.float16)
-pipe = TextToImage(model)
-image = pipe(prompt="a photo of an astronaut riding a horse",
-             negative_prompt="blurry, low quality",
-             steps=20, cfg_scale=7.5, seed=0)
-image.save("out.png")
+model = load_checkpoint("models/sdxl.safetensors", device="cuda", dtype=torch.float16)
+image = TextToImage(model)(
+    prompt="a watercolor fox in a misty forest",
+    negative_prompt="blurry, low quality",
+    steps=25, cfg_scale=6.0, width=1024, height=1024, seed=0,
+)
+image.save("fox.png")
 ```
 
-The architecture and the rationale behind it live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+## Highlights
 
-## Samplers & schedulers
+- **Three model families, one API** — Stable Diffusion 1.5, SDXL, and **Anima**
+  (a 2 B DiT built on Cosmos-Predict2 with Qwen3-0.6B + Qwen-Image VAE). Load any
+  of them, drive them all the same way.
+- **Text-to-image, image-to-image, and inpainting** out of the box.
+- **Checkpoint types auto-detected** — epsilon and v-prediction, with
+  zero-terminal-SNR (ZTSNR) + CFG-rescale handled for you.
+- **LoRA & LoKr** adapters fuse into the weights at load time (kohya/A1111,
+  PEFT, and Anima naming conventions).
+- **10 samplers, multiple schedulers** — Euler, Heun, ancestral, DPM2, the full
+  DPM++ family, and ER-SDE; Karras / exponential / sgm_uniform / simple / flow
+  schedules. The DPM++ and ER-SDE samplers are flow-aware, so they drive Anima too.
+- **Runs on modest GPUs** — optional sequential CPU offload + tiled VAE decode
+  fit SDXL into ~6.6 GB.
+- **Seed-reproducible** — same seed, same image, every run.
+- **From scratch** — every backbone is implemented from the original papers and
+  verified against reference implementations (the text encoders and SD1.5 UNet
+  match bit-for-bit in fp32). No `diffusers`/ComfyUI at runtime.
 
-Pick them per call via `sampler=` and `scheduler=`:
-
-```python
-image = pipe(prompt, negative_prompt,
-             steps=32, cfg_scale=4.5, sampler="dpmpp_2m", scheduler="sgm_uniform")
-```
-
-- **Samplers** — `euler`, `heun`, `euler_ancestral`, `dpm_2`, `dpm_2_ancestral`,
-  `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`. The DPM++ and
-  ER-SDE family are flow-aware (half-logSNR mapping), so they drive Anima as well
-  as SD/SDXL.
-- **Schedulers** — SD/SDXL: `karras`, `exponential`, `polyexponential`,
-  `sgm_uniform`, `simple`. Anima (flow): `flow` (the default rectified-flow
-  schedule), `sgm_uniform`, `simple`.
-
-Samplers and schedulers follow the conventions of (and are cross-checked
-against) ComfyUI's k-diffusion implementations. The SDE samplers re-inject
-seeded Gaussian noise rather than ComfyUI's Brownian-tree noise — output is
-coherent and seed-reproducible but not bit-identical to a ComfyUI render.
-
-## Why another engine
-
-Existing engines are excellent but tend to be node-graph-first and carry large
-surface areas. Diffucore is a focused library: a small, readable core that does
-one thing — diffusion inference — and is easy to embed behind a custom UI.
-
-## Development
-
-The first targets are **Stable Diffusion 1.5** and **SDXL** text-to-image;
-**Anima** is the first DiT family on top of the same engine. CPU is supported
-for testing; real generation targets CUDA (developed against an RTX 2060 12 GB).
-SDXL at 1024² needs ~10 GB resident, or ~6.6 GB with the opt-in
-`DevicePolicy(offload=True)` sequential CPU offload + tiled VAE decode (see
-[`docs/RUNTIME_SPEC.md`](docs/RUNTIME_SPEC.md)); Anima at 1024² currently runs
-~8.6 GB resident (offload-aware for the Anima path is a follow-up).
+## Install
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"          # numpy/safetensors/tokenizers/Pillow/einops/pytest
-pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA build for your GPU
-pytest                            # runs the CPU-only test suite
+pip install -e .
+# then install the CUDA build of torch for your GPU:
+pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
 
-For real generation, fetch an SD1.5 checkpoint (e.g. `v1-5-pruned-emaonly.safetensors`)
-into `models/` (gitignored). Numerical verification additionally uses HF
-`transformers`/`diffusers` as oracles — they are dev-only and not runtime deps.
+Runtime dependencies are small: `torch`, `numpy`, `safetensors`, `tokenizers`,
+`Pillow`, `einops`, `tqdm`.
+
+## Usage
+
+### Choosing samplers & schedulers
+
+```python
+image = TextToImage(model)(
+    prompt, negative_prompt,
+    steps=30, cfg_scale=5.0,
+    sampler="dpmpp_2m", scheduler="sgm_uniform", seed=0,
+)
+```
+
+- **Samplers** — `euler`, `heun`, `euler_ancestral`, `dpm_2`, `dpm_2_ancestral`,
+  `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`.
+- **Schedulers** — `karras`, `exponential`, `polyexponential`, `sgm_uniform`,
+  `simple` (SD/SDXL); `flow` (default), `sgm_uniform`, `simple` (Anima).
+
+### Anima (DiT)
+
+```python
+from diffucore import load_anima_checkpoint, TextToImage
+
+model = load_anima_checkpoint(
+    "anima/dit.safetensors", "anima/qwen_image_vae.safetensors", "anima/qwen3_te.safetensors",
+    device="cuda", dtype=torch.float16,
+)
+image = TextToImage(model)(
+    prompt, negative_prompt,
+    steps=32, cfg_scale=4.5, width=832, height=1216,
+    sampler="er_sde", shift=3.0, seed=0,
+)
+```
+
+### Image-to-image & inpainting
+
+```python
+from PIL import Image
+from diffucore import ImageToImage, Inpaint
+
+edit = ImageToImage(model)(prompt, Image.open("input.png"), strength=0.6, seed=0)
+fill = Inpaint(model)(prompt, Image.open("input.png"), Image.open("mask.png"), seed=0)
+```
+
+### LoRA / LoKr
+
+```python
+from diffucore import apply_lora
+
+report = apply_lora(model, "loras/style.safetensors", multiplier=0.8)
+print(report)  # matched / unmatched module counts
+```
+
+### Fitting bigger models on smaller GPUs
+
+```python
+import torch
+from diffucore import load_checkpoint
+from diffucore.runtime import DevicePolicy
+
+policy = DevicePolicy(device=torch.device("cuda"), offload=True, vae_tile=True)
+model = load_checkpoint("models/sdxl.safetensors", policy=policy)
+```
+
+## Supported models
+
+| Family | Native res | Modes | Notes |
+|---|---|---|---|
+| Stable Diffusion 1.5 | 512² | t2i · img2img · inpaint | eps + v-pred, ZTSNR |
+| SDXL | 1024² | t2i · img2img · inpaint | dual text encoders, eps + v-pred, ZTSNR |
+| Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i | flow-matching, Qwen3 + Qwen-Image VAE |
+
+LoRA / LoKr adapters are supported on all three.
+
+## Performance
+
+Measured on an RTX 2060 (12 GB), fp16, 20 steps:
+
+| Model | Resolution | Time | Peak VRAM |
+|---|---|---|---|
+| SD 1.5 | 512² | ~3.6 s | ~3.2 GB |
+| SDXL | 1024² | ~19 s | ~10.7 GB (≈6.6 GB with offload) |
+| Anima | 1024² | ~46 s | ~8.6 GB |
+
+## Status
+
+Diffucore is in **alpha**. The engine is end-to-end working and seed-reproducible
+across all three model families, with the sampling core and checkpoint detection
+unit-tested and every backbone verified against reference implementations. APIs
+may still shift before 1.0. CPU works for testing; real generation targets CUDA.
+
+**For ComfyUI users:** samplers and schedulers follow ComfyUI's k-diffusion
+conventions, but the SDE samplers re-inject seeded Gaussian noise instead of
+Brownian-tree noise — results are coherent and reproducible, but not bit-identical
+to a ComfyUI render.
+
+## Documentation
+
+- [Architecture & rationale](docs/ARCHITECTURE.md)
+- [Roadmap & verified milestones](docs/ROADMAP.md)
+- [Runtime / VRAM (offload + tiled VAE)](docs/RUNTIME_SPEC.md)
+- [Implementation notes](docs/IMPLEMENTATION_SPEC.md) · [build log](docs/HANDOFF.md)
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
-
-Diffucore is an independent implementation. Model architectures and sampling
-algorithms are implemented from their original research publications.
+Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Diffucore is an
+independent implementation; model architectures and sampling algorithms are
+implemented from their original research publications.
