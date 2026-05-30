@@ -9,6 +9,6 @@ see ``docs/IMPLEMENTATION_SPEC.md`` and ``docs/HANDOFF.md``.
 __version__ = "0.0.1"
 
 from .bundle import ModelBundle, load_checkpoint
-from .pipelines import ImageToImage, TextToImage
+from .pipelines import ImageToImage, Inpaint, TextToImage
 
-__all__ = ["__version__", "ModelBundle", "load_checkpoint", "ImageToImage", "TextToImage"]
+__all__ = ["__version__", "ModelBundle", "load_checkpoint", "ImageToImage", "Inpaint", "TextToImage"]

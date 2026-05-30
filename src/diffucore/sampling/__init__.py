@@ -14,7 +14,7 @@ from .parameterization import (
     EpsScaling,
     VScaling,
 )
-from .denoiser import ModelDenoiser, CFGDenoiser
+from .denoiser import ModelDenoiser, CFGDenoiser, MaskedDenoiser
 from .samplers import (
     to_d,
     get_ancestral_step,
@@ -38,6 +38,7 @@ __all__ = [
     "VScaling",
     "ModelDenoiser",
     "CFGDenoiser",
+    "MaskedDenoiser",
     "to_d",
     "get_ancestral_step",
     "sample_euler",

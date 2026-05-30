@@ -51,9 +51,17 @@ The remaining extensions (each its own slice):
   noise at a `strength`-chosen point on the schedule, denoises the rest, and
   decodes (reuses the shared pipeline base, so offload + tiled VAE apply). Verified
   end-to-end on **SD1.5 and SDXL** (`AkashicPulse-v3.0` on the RTX 2060): RGB
-  output, seed-reproducible, strength changes the result. Inpainting (masks) is
-  the next slice — it needs a per-step masked-blend hook the current sampler
-  signature doesn't expose.
+  output, seed-reproducible, strength changes the result.
+- **inpainting (masks) — done.** `Inpaint` repaints the white region of a mask and
+  keeps the black region. No sampler changes: a `MaskedDenoiser` pins the keep
+  region of the x0 estimate to the original latent `z0`, so the sampler's ODE
+  (`dx/dσ = (x − z0)/σ`, integrated exactly by Euler/Heun for a constant target)
+  carries that region along `z0 + noise·σ` and lands on `z0` at σ→0. After decode,
+  the original pixels are composited back over the keep region (hard edge) so
+  untouched areas are byte-exact. Verified on **SD1.5 and SDXL** (RTX 2060):
+  keep region byte-exact, masked region repainted, seed-reproducible; the
+  keep-region-pinning is also checked at the sampler level on CPU (no checkpoint).
+  Mask blur / "inpaint at full res" are later refinements.
 - **VRAM management for SDXL on smaller cards — R1–R4 done.** Sequential CPU
   offload + tiled VAE, specced in [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md). Verified on
   the RTX 2060 against `AkashicPulse-v3.0` (SDXL, 1024²): R1–R3 — offload

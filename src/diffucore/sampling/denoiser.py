@@ -60,3 +60,28 @@ class CFGDenoiser:
             return x0_cond
         x0_uncond = self.denoiser(x, sigma, **self.uncond)
         return x0_uncond + self.scale * (x0_cond - x0_uncond)
+
+
+class MaskedDenoiser:
+    """Pin the keep region of the x0 estimate to the original latent (inpainting).
+
+    Wraps any ``(x, sigma) -> x0`` denoiser. Where ``mask == 0`` (the keep region)
+    it overrides the model's estimate with the original latent ``z0``; where
+    ``mask == 1`` (the region to repaint) it passes the estimate through. With a
+    constant target ``z0``, the sampler's ODE ``dx/dsigma = (x - z0) / sigma`` has
+    the exact solution ``x = z0 + noise * sigma`` — which Euler/Heun integrate
+    exactly — so the keep region tracks the noised original and lands on ``z0`` at
+    ``sigma -> 0``. No sampler changes are needed; the masking lives here.
+
+    ``mask`` is broadcastable to ``x`` (e.g. ``[1, 1, h, w]``) and matches ``x``'s
+    dtype/device; soft values in ``[0, 1]`` blend linearly at the boundary.
+    """
+
+    def __init__(self, denoiser, z0: torch.Tensor, mask: torch.Tensor):
+        self.denoiser = denoiser
+        self.z0 = z0
+        self.mask = mask
+
+    def __call__(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        denoised = self.denoiser(x, sigma)
+        return denoised * self.mask + self.z0 * (1 - self.mask)

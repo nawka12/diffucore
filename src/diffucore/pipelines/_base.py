@@ -12,6 +12,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -36,6 +37,23 @@ _SCHEDULERS = {
     "exponential": exponential_schedule,
     "polyexponential": polyexponential_schedule,
 }
+
+
+def img2img_start(steps: int, strength: float) -> int:
+    """Index into the full ([steps + 1]) sigma schedule where a strength-based run
+    starts. Runs ``int(strength * steps)`` denoising steps (the k-diffusion / A1111
+    convention): ``strength=1`` starts at index 0 (the full schedule), smaller
+    values start later (fewer steps, more of the init image preserved). Shared by
+    img2img and inpainting."""
+    return steps - int(strength * steps)
+
+
+def preprocess_image(image: Image.Image, width: int, height: int) -> torch.Tensor:
+    """PIL image -> ``FloatTensor[1, 3, height, width]`` in ``[-1, 1]``, resized to
+    ``(width, height)`` — the input range the VAE encoder expects."""
+    image = image.convert("RGB").resize((width, height), Image.LANCZOS)
+    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0  # [H, W, 3]
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
 
 
 @contextmanager
@@ -144,3 +162,13 @@ class _Pipeline:
                 image = tiled_vae_decode(self.model.vae, latent) if tile else self.model.vae.decode(latent)
         image = ((image.clamp(-1, 1) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
         return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy())
+
+    # --- encode (img2img / inpaint) ------------------------------------------
+    def _encode_image(self, init_image, width, height, policy, generator):
+        """Encode ``init_image`` to a scaled latent on the compute device, with the
+        (fp32) VAE staged onto the GPU when offloading."""
+        image = preprocess_image(init_image, width, height).to(policy.device, policy.vae_dtype)
+        with torch.no_grad():
+            with _staged([self.model.vae], policy.device, policy.offload_idle):
+                z = self.model.vae.encode(image, generator=generator)
+        return z.to(policy.compute_dtype)

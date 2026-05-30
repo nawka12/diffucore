@@ -10,33 +10,12 @@ the shared :class:`._base._Pipeline` machinery, so offload + tiling apply here t
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-import numpy as np
 import torch
 from PIL import Image
 
-from ._base import _Pipeline, _staged
-
-if TYPE_CHECKING:  # avoid importing the bundle (and torch-heavy models) eagerly
-    from ..bundle import ModelBundle
-
-
-def img2img_start(steps: int, strength: float) -> int:
-    """Index into the full ([steps + 1]) sigma schedule where img2img starts.
-
-    Runs ``int(strength * steps)`` denoising steps (the k-diffusion / A1111
-    convention): ``strength=1`` starts at index 0 (the full schedule), smaller
-    values start later (fewer steps, more of the init image preserved)."""
-    return steps - int(strength * steps)
-
-
-def preprocess_image(image: Image.Image, width: int, height: int) -> torch.Tensor:
-    """PIL image -> ``FloatTensor[1, 3, height, width]`` in ``[-1, 1]``, resized to
-    ``(width, height)`` — the input range the VAE encoder expects."""
-    image = image.convert("RGB").resize((width, height), Image.LANCZOS)
-    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0  # [H, W, 3]
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+# ``img2img_start`` / ``preprocess_image`` live in ``._base`` (shared with inpaint);
+# re-exported here so they stay importable from this module.
+from ._base import _Pipeline, img2img_start, preprocess_image  # noqa: F401
 
 
 class ImageToImage(_Pipeline):
@@ -83,12 +62,3 @@ class ImageToImage(_Pipeline):
 
         x0 = self._sample(sampler, cfg, x, sigmas, policy)
         return self._decode(x0, policy, width, height)
-
-    def _encode_image(self, init_image, width, height, policy, generator):
-        """Encode ``init_image`` to a scaled latent on the compute device, with the
-        (fp32) VAE staged onto the GPU when offloading."""
-        image = preprocess_image(init_image, width, height).to(policy.device, policy.vae_dtype)
-        with torch.no_grad():
-            with _staged([self.model.vae], policy.device, policy.offload_idle):
-                z = self.model.vae.encode(image, generator=generator)
-        return z.to(policy.compute_dtype)
