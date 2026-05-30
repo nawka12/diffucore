@@ -34,7 +34,28 @@ class UNetConfig:
     channel_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_heads: int = 8
     context_dim: int = 768
-    transformer_depth: int = 1
+    transformer_depth: int | tuple[int, ...] = 1
+    # SDXL extras (defaults keep the SD1.5 path unchanged):
+    num_head_channels: int = -1        # >0 fixes head dim (SDXL=64); else use num_heads
+    adm_in_channels: int = 0           # >0 adds the label_emb (pooled+size) conditioning
+    use_linear_in_transformer: bool = False  # SDXL: Linear proj_in/out (SD1.5: conv 1x1)
+
+
+def sdxl_unet_config() -> UNetConfig:
+    """The SDXL base UNet: 3 levels, per-level transformer depth [0, 2, 10],
+    64-channel attention heads, 2048-d context, and 2816-d added conditioning."""
+    return UNetConfig(
+        channel_mult=(1, 2, 4),
+        transformer_depth=(0, 2, 10),
+        num_head_channels=64,
+        context_dim=2048,
+        adm_in_channels=2816,
+        use_linear_in_transformer=True,
+    )
+
+
+def _is_seq(x) -> bool:
+    return isinstance(x, (list, tuple))
 
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
@@ -169,24 +190,38 @@ class BasicTransformerBlock(nn.Module):
 
 
 class SpatialTransformer(nn.Module):
-    def __init__(self, channels: int, num_heads: int, context_dim: int, depth: int):
+    def __init__(self, channels: int, num_heads: int, context_dim: int, depth: int, use_linear: bool = False):
         super().__init__()
+        self.use_linear = use_linear
         self.norm = nn.GroupNorm(32, channels, eps=1e-6, affine=True)
-        self.proj_in = nn.Conv2d(channels, channels, 1)
+        proj = nn.Linear if use_linear else lambda i, o: nn.Conv2d(i, o, 1)
+        self.proj_in = proj(channels, channels)
         self.transformer_blocks = nn.ModuleList(
             BasicTransformerBlock(channels, num_heads, context_dim) for _ in range(depth)
         )
-        self.proj_out = nn.Conv2d(channels, channels, 1)
+        self.proj_out = proj(channels, channels)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
         x_in = x
-        x = self.proj_in(self.norm(x))
-        x = x.reshape(b, c, h * w).transpose(1, 2)  # b, hw, c
-        for block in self.transformer_blocks:
-            x = block(x, context)
-        x = x.transpose(1, 2).reshape(b, c, h, w)
-        return self.proj_out(x) + x_in
+        x = self.norm(x)
+        # SD1.5 projects with a 1x1 conv (before flattening); SDXL projects with a
+        # Linear (after flattening). The transformer math in between is identical.
+        if self.use_linear:
+            x = x.reshape(b, c, h * w).transpose(1, 2)  # b, hw, c
+            x = self.proj_in(x)
+            for block in self.transformer_blocks:
+                x = block(x, context)
+            x = self.proj_out(x)
+            x = x.transpose(1, 2).reshape(b, c, h, w)
+        else:
+            x = self.proj_in(x)
+            x = x.reshape(b, c, h * w).transpose(1, 2)  # b, hw, c
+            for block in self.transformer_blocks:
+                x = block(x, context)
+            x = x.transpose(1, 2).reshape(b, c, h, w)
+            x = self.proj_out(x)
+        return x + x_in
 
 
 class Downsample(nn.Module):
@@ -221,31 +256,53 @@ class UNetModel(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        def make_transformer(channels):
-            return SpatialTransformer(channels, cfg.num_heads, cfg.context_dim, cfg.transformer_depth)
+        # SDXL: pooled-text + size conditioning added to the time embedding.
+        self.label_emb = None
+        if cfg.adm_in_channels > 0:
+            self.label_emb = nn.Sequential(
+                nn.Sequential(
+                    nn.Linear(cfg.adm_in_channels, time_embed_dim),
+                    nn.SiLU(),
+                    nn.Linear(time_embed_dim, time_embed_dim),
+                )
+            )
+
+        # Per-level attention depth (0 = no attention). A scalar transformer_depth
+        # is the SD1.5 convention: attention at levels whose downsample factor is
+        # in attention_resolutions. A per-level sequence is the SDXL convention.
+        depths = self._depths_per_level(cfg)
+        middle_depth = cfg.transformer_depth[-1] if _is_seq(cfg.transformer_depth) else cfg.transformer_depth
+
+        def heads_for(channels):
+            if cfg.num_head_channels > 0:
+                return channels // cfg.num_head_channels
+            return cfg.num_heads
+
+        def make_transformer(channels, depth):
+            return SpatialTransformer(
+                channels, heads_for(channels), cfg.context_dim, depth, cfg.use_linear_in_transformer
+            )
 
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(nn.Conv2d(cfg.in_channels, mc, 3, padding=1))]
         )
         input_block_chans = [mc]
         ch = mc
-        ds = 1
         for level, mult in enumerate(cfg.channel_mult):
             for _ in range(cfg.num_res_blocks):
                 layers = [ResBlock(ch, time_embed_dim, mult * mc)]
                 ch = mult * mc
-                if ds in cfg.attention_resolutions:
-                    layers.append(make_transformer(ch))
+                if depths[level] > 0:
+                    layers.append(make_transformer(ch, depths[level]))
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 input_block_chans.append(ch)
             if level != len(cfg.channel_mult) - 1:
                 self.input_blocks.append(TimestepEmbedSequential(Downsample(ch)))
                 input_block_chans.append(ch)
-                ds *= 2
 
         self.middle_block = TimestepEmbedSequential(
             ResBlock(ch, time_embed_dim, ch),
-            make_transformer(ch),
+            make_transformer(ch, middle_depth),
             ResBlock(ch, time_embed_dim, ch),
         )
 
@@ -255,11 +312,10 @@ class UNetModel(nn.Module):
                 ich = input_block_chans.pop()
                 layers = [ResBlock(ch + ich, time_embed_dim, mult * mc)]
                 ch = mult * mc
-                if ds in cfg.attention_resolutions:
-                    layers.append(make_transformer(ch))
+                if depths[level] > 0:
+                    layers.append(make_transformer(ch, depths[level]))
                 if level != 0 and i == cfg.num_res_blocks:
                     layers.append(Upsample(ch))
-                    ds //= 2
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
 
         self.out = nn.Sequential(
@@ -268,9 +324,27 @@ class UNetModel(nn.Module):
             nn.Conv2d(mc, cfg.out_channels, 3, padding=1),
         )
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _depths_per_level(cfg: "UNetConfig") -> list[int]:
+        if _is_seq(cfg.transformer_depth):
+            return list(cfg.transformer_depth)
+        depths, ds = [], 1
+        for _ in range(len(cfg.channel_mult)):
+            depths.append(cfg.transformer_depth if ds in cfg.attention_resolutions else 0)
+            ds *= 2
+        return depths
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        context: torch.Tensor,
+        y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         t_emb = timestep_embedding(timesteps, self.config.model_channels)
         emb = self.time_embed(t_emb.to(x.dtype))
+        if self.label_emb is not None:
+            emb = emb + self.label_emb(y.to(x.dtype))
 
         hs = []
         h = x
