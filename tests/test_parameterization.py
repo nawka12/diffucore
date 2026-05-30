@@ -23,6 +23,18 @@ def test_discrete_schedule_ascending_sigmas():
     assert torch.all(sched.sigmas[1:] >= sched.sigmas[:-1])
 
 
+def test_zero_terminal_snr_rescale():
+    """ZTSNR rescale preserves sigma_min (anchored at index 0), blows sigma_max up
+    from the ~14.6 default to a large finite value, and stays monotonic ascending."""
+    betas = P.make_betas("scaled_linear", 1000)
+    base = P.DiscreteSchedule(betas)
+    ztsnr = P.DiscreteSchedule(betas, zero_terminal_snr=True)
+    assert torch.allclose(ztsnr.sigma_min, base.sigma_min, atol=1e-4)
+    assert base.sigma_max < 20.0
+    assert ztsnr.sigma_max > 1000.0 and torch.isfinite(ztsnr.sigma_max)
+    assert torch.all(ztsnr.sigmas[1:] > ztsnr.sigmas[:-1])
+
+
 def test_sigma_t_roundtrip():
     sched = P.DiscreteSchedule(P.make_betas("scaled_linear", 1000))
     lo, hi = sched.sigma_min.item(), sched.sigma_max.item()

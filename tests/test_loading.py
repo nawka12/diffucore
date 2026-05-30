@@ -56,6 +56,14 @@ def test_detect_v_prediction_from_marker():
     assert spec.prediction == "v"
 
 
+def test_detect_ztsnr_from_marker():
+    """A bare ``ztsnr`` marker tensor requests zero-terminal-SNR sampling."""
+    shapes = dict(sd15_shapes())
+    assert detect_architecture(shapes).zero_terminal_snr is False
+    shapes["ztsnr"] = ()
+    assert detect_architecture(shapes).zero_terminal_snr is True
+
+
 def test_detect_unsupported_family_raises():
     # SD2.x (context_dim 1024, OpenCLIP ViT-H) is recognized but not implemented.
     shapes = dict(sd15_shapes())

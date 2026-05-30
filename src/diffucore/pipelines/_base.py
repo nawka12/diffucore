@@ -131,10 +131,14 @@ class _Pipeline:
         return torch.cat([pooled, size_emb.to(pooled.dtype)], dim=-1)
 
     # --- sampling ------------------------------------------------------------
-    def _denoiser(self, cond, uncond, cfg_scale):
+    def _denoiser(self, cond, uncond, cfg_scale, cfg_rescale=None):
+        # ZTSNR checkpoints default to CFG rescale 0.7 (Lin et al.); everything else
+        # to plain CFG. Pass an explicit ``cfg_rescale`` to override either way.
+        if cfg_rescale is None:
+            cfg_rescale = 0.7 if self.model.spec.zero_terminal_snr else 0.0
         scaling = VScaling() if self.model.spec.prediction == "v" else EpsScaling()
         denoiser = ModelDenoiser(self.model.backbone, scaling, self.model.schedule)
-        return CFGDenoiser(denoiser, cond, uncond, scale=cfg_scale)
+        return CFGDenoiser(denoiser, cond, uncond, scale=cfg_scale, rescale=cfg_rescale)
 
     def _sigmas(self, scheduler, steps, device, dtype):
         """The full descending sigma schedule ([steps + 1] values, ending at 0)."""

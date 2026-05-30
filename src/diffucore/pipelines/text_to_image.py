@@ -27,6 +27,7 @@ class TextToImage(_Pipeline):
         *,
         steps: int = 20,
         cfg_scale: float = 7.0,
+        cfg_rescale: float | None = None,
         width: int | None = None,
         height: int | None = None,
         sampler: str = "euler",
@@ -34,7 +35,8 @@ class TextToImage(_Pipeline):
         seed: int | None = None,
     ) -> Image.Image:
         """Return a ``PIL.Image`` for ``prompt``. ``width``/``height`` default to
-        the model's native resolution (512 for SD1.5, 1024 for SDXL)."""
+        the model's native resolution (512 for SD1.5, 1024 for SDXL). ``cfg_rescale``
+        defaults to 0.7 for ZTSNR checkpoints, 0 otherwise (see ``CFGDenoiser``)."""
         model = self.model
         policy = self._policy()
         device, compute_dtype = policy.device, policy.compute_dtype
@@ -44,7 +46,7 @@ class TextToImage(_Pipeline):
             height = model.spec.image_size
 
         cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
-        cfg = self._denoiser(cond, uncond, cfg_scale)
+        cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
         sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
 
         generator = torch.Generator(device=device)

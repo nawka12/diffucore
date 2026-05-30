@@ -45,3 +45,26 @@ def test_cfg_endpoints_and_linearity():
     assert torch.allclose(cfg0(x, sigma), uncond_x0, atol=1e-5)
     assert torch.allclose(cfg1(x, sigma), cond_x0, atol=1e-5)
     assert torch.allclose(cfg2(x, sigma), uncond_x0 + 2.0 * (cond_x0 - uncond_x0), atol=1e-5)
+
+
+def test_cfg_rescale():
+    # Distinct cond/uncond predictions so the guided estimate has a different std
+    # than the conditioned one (otherwise rescale is a no-op).
+    cond_val = torch.randn(1, 4, 8, 8)
+    uncond_val = torch.randn(1, 4, 8, 8) * 0.3
+    backbone = lambda model_input, t, val: val  # noqa: E731  (returns the conditioning tensor)
+    den = ModelDenoiser(backbone, EpsScaling(), _schedule())
+    x = torch.zeros(1, 4, 8, 8)
+    sigma = torch.tensor([1.0])
+    cond, uncond = {"val": cond_val}, {"val": uncond_val}
+
+    plain = CFGDenoiser(den, cond, uncond, scale=7.0, rescale=0.0)(x, sigma)
+    # rescale=0 is plain CFG; rescale=1 renormalizes the guided x0 to the cond std.
+    full = CFGDenoiser(den, cond, uncond, scale=7.0, rescale=1.0)(x, sigma)
+
+    den_cond = den(x, sigma, **cond)
+    assert not torch.allclose(full, plain)                       # rescale changed the result
+    assert torch.allclose(full.std(), den_cond.std(), atol=1e-5)  # std matched to cond's
+    # A partial rescale lands between plain and the fully-rescaled estimate.
+    half = CFGDenoiser(den, cond, uncond, scale=7.0, rescale=0.5)(x, sigma)
+    assert torch.allclose(half, 0.5 * full + 0.5 * plain, atol=1e-5)

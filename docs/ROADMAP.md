@@ -69,8 +69,16 @@ The remaining extensions (each its own slice):
   2060 with `AnimaTensor-Pro` (v-pred + ZTSNR SDXL): coherent 1024² image. Along
   the way, CLIP's `position_ids` became a non-persistent buffer (a derived
   `arange` constant many finetunes omit), so such checkpoints load strictly.
-  ZTSNR-aware sampling (raising σ_max for the zero-terminal-SNR schedule) is the
-  next slice — without it, very dark/bright scenes are slightly limited.
+- **zero-terminal-SNR (ZTSNR) — done.** Detected from the `ztsnr` marker; the
+  schedule is rescaled (Lin et al., 2024) so terminal SNR ≈ 0, raising σ_max from
+  ~14.6 to ~4500 — the model finally starts from true pure noise and can render
+  full-range darks/brights. Paired with **CFG rescale** (a `cfg_rescale` knob on
+  every pipeline, default 0.7 for ZTSNR checkpoints) to curb high-CFG
+  over-exposure. Verified on `AnimaTensor-Pro`: a "pitch-black" prompt yields a
+  genuinely dark, detailed image (mean 22 vs the plain schedule's washed floor),
+  a bright prompt stays vivid. **Required an fp32 fix in `Scaling.scalings`** —
+  σ_max≈4500 makes σ² overflow fp16 (→inf→black); the coefficients now compute in
+  fp32 and cast back, leaving the normal fp16 path unchanged.
 - **VRAM management for SDXL on smaller cards — R1–R4 done.** Sequential CPU
   offload + tiled VAE, specced in [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md). Verified on
   the RTX 2060 against `AkashicPulse-v3.0` (SDXL, 1024²): R1–R3 — offload

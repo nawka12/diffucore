@@ -30,6 +30,7 @@ import torch
 __all__ = [
     "append_dims",
     "make_betas",
+    "rescale_zero_terminal_snr",
     "DiscreteSchedule",
     "Scaling",
     "EpsScaling",
@@ -74,18 +75,41 @@ def make_betas(
     raise ValueError(f"unknown beta schedule: {schedule!r}")
 
 
+def rescale_zero_terminal_snr(sigmas: torch.Tensor) -> torch.Tensor:
+    """Rescale an ascending sigma table to (near-)zero terminal SNR.
+
+    Lin et al. (2024): the default SD schedule leaves a little signal at the last
+    timestep, so the model never sees pure noise and can't render very dark or
+    bright images. This shifts/scales ``alphas_cumprod`` so its terminal value is
+    ~0 (``sigma_max`` → large) while the first entry (``sigma_min``) is preserved.
+    The terminal is clamped to a tiny epsilon rather than exactly 0 so
+    ``sigma_max`` is large-but-finite instead of ``inf``. Requires v-prediction —
+    eps-prediction is ill-conditioned as ``sigma → ∞``.
+    """
+    alphas_cumprod = 1.0 / (sigmas ** 2 + 1.0)
+    sqrt_acp = alphas_cumprod.sqrt()
+    first, last = sqrt_acp[0].clone(), sqrt_acp[-1].clone()
+    sqrt_acp = (sqrt_acp - last) * (first / (first - last))  # 0 at the terminal, first preserved
+    alphas_cumprod = sqrt_acp ** 2
+    alphas_cumprod[-1] = 4.8973451890853435e-08              # avoid sigma_max = inf
+    return ((1.0 - alphas_cumprod) / alphas_cumprod).sqrt()
+
+
 class DiscreteSchedule:
     """Per-timestep sigma table derived from training betas, plus sigma<->t.
 
     ``sigmas`` is ascending (index 0 = least noise). ``sigma_to_t`` /
     ``t_to_sigma`` interpolate linearly in ``log(sigma)`` over the table, which
     lets a continuous sampler address a model trained on discrete timesteps.
+    ``zero_terminal_snr`` rescales the table for ZTSNR checkpoints.
     """
 
-    def __init__(self, betas: torch.Tensor):
+    def __init__(self, betas: torch.Tensor, zero_terminal_snr: bool = False):
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod).sqrt().float()
+        if zero_terminal_snr:
+            sigmas = rescale_zero_terminal_snr(sigmas)
         self.sigmas = sigmas
         self.log_sigmas = sigmas.log()
 
@@ -138,12 +162,17 @@ class Scaling:
         return append_dims(c_skip, x.ndim) * x + append_dims(c_out, x.ndim) * model_output
 
 
+# sigma**2 is computed in fp32 even when the sampler runs fp16: ZTSNR pushes
+# sigma_max to ~4500, and 4500**2 overflows fp16's 65504 ceiling to inf (which
+# would zero out c_in/c_skip and collapse the latent). Coefficients are cast back
+# to the input dtype so the fp16 path is otherwise unchanged.
 class EpsScaling(Scaling):
     """Epsilon-prediction (the model predicts the added noise). Used by SD1.5."""
 
     def scalings(self, sigma: torch.Tensor):
         sigma = torch.as_tensor(sigma)
-        c_in = 1.0 / (sigma ** 2 + 1.0).sqrt()
+        s = sigma.float()
+        c_in = (1.0 / (s ** 2 + 1.0).sqrt()).to(sigma.dtype)
         c_out = -sigma
         c_skip = torch.ones_like(sigma)
         return c_skip, c_out, c_in
@@ -154,8 +183,9 @@ class VScaling(Scaling):
 
     def scalings(self, sigma: torch.Tensor):
         sigma = torch.as_tensor(sigma)
-        denom = sigma ** 2 + 1.0
-        c_in = 1.0 / denom.sqrt()
-        c_skip = 1.0 / denom
-        c_out = -sigma / denom.sqrt()
+        s = sigma.float()
+        denom = s ** 2 + 1.0
+        c_in = (1.0 / denom.sqrt()).to(sigma.dtype)
+        c_skip = (1.0 / denom).to(sigma.dtype)
+        c_out = (-s / denom.sqrt()).to(sigma.dtype)
         return c_skip, c_out, c_in

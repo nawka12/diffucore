@@ -146,9 +146,17 @@ Learned while adding img2img / inpainting and v-prediction:
   `persistent=False` and stripped in `_load_sub`, so checkpoints with *or* without
   it both strict-load. (The marker tensors `v_pred`/`ztsnr` are likewise ignored —
   they match no module prefix.)
-- **ZTSNR is not yet handled.** v-pred ZTSNR models train with terminal SNR 0
-  (σ_max→∞); we still sample from the discrete-schedule σ_max (~14.6), which is
-  coherent but limits extreme dark/bright. Raising σ_max is the open slice.
+- **ZTSNR rescales the schedule.** Detected from the `ztsnr` marker;
+  `DiscreteSchedule(..., zero_terminal_snr=True)` shifts/scales `alphas_cumprod`
+  so terminal SNR≈0 (σ_max ~14.6 → ~4500, terminal clamped to ε to stay finite),
+  anchored so σ_min is unchanged. Pairs with CFG rescale (`cfg_rescale`, default
+  0.7 for ZTSNR) in `CFGDenoiser`.
+- **σ² must be fp32 (ZTSNR's teeth).** The sampler runs fp16, but σ_max≈4500 makes
+  `σ²=2e7` overflow fp16's 65504 ceiling → inf → `c_in`/`c_skip` zero out → the
+  latent collapses to pure black. `Scaling.scalings` computes the σ²-terms in fp32
+  and casts the coefficients back to the latent dtype, so the normal fp16 path is
+  unchanged but ZTSNR's huge σ no longer overflows. (This is the concrete bite of
+  the "σ math stays fp32" rule — it had been latent because normal σ_max≈14.6.)
 
 ## Project map
 

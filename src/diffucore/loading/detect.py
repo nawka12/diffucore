@@ -30,6 +30,7 @@ class ModelSpec:
 
     architecture: str          # e.g. "sd15", "sdxl"
     prediction: str            # "eps" | "v"
+    zero_terminal_snr: bool    # rescale the schedule to zero terminal SNR (ZTSNR)
     latent_channels: int       # VAE latent channel count
     context_dim: int           # text-encoder hidden size seen by cross-attention
     image_size: int = 512      # native training resolution
@@ -59,15 +60,18 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
         raise ValueError("could not determine text context dim (no attn2.to_k weight found)")
 
     # v-prediction checkpoints flag themselves with a bare ``v_pred`` marker tensor
-    # (the NoobAI / A1111 / reForge convention; ``ztsnr`` often rides along). The
-    # weights are otherwise identical to an eps model, so this flag is the only
-    # signal. Absent it, assume epsilon (the SD default).
+    # (the NoobAI / A1111 / reForge convention); a ``ztsnr`` marker often rides
+    # along to request zero-terminal-SNR sampling. The weights are otherwise
+    # identical to an eps model, so these flags are the only signal. Absent them,
+    # assume epsilon (the SD default) and the standard schedule.
     prediction = "v" if "v_pred" in shapes else "eps"
+    zero_terminal_snr = "ztsnr" in shapes
 
     if context_dim == 768:
         return ModelSpec(
             architecture="sd15",
             prediction=prediction,
+            zero_terminal_snr=zero_terminal_snr,
             latent_channels=4,
             context_dim=768,
             image_size=512,
@@ -78,6 +82,7 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
         return ModelSpec(
             architecture="sdxl",
             prediction=prediction,
+            zero_terminal_snr=zero_terminal_snr,
             latent_channels=4,
             context_dim=2048,
             image_size=1024,

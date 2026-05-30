@@ -40,6 +40,7 @@ class Inpaint(_Pipeline):
         strength: float = 1.0,
         steps: int = 20,
         cfg_scale: float = 7.0,
+        cfg_rescale: float | None = None,
         width: int | None = None,
         height: int | None = None,
         sampler: str = "euler",
@@ -62,7 +63,7 @@ class Inpaint(_Pipeline):
             height = model.spec.image_size
 
         cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
-        cfg = self._denoiser(cond, uncond, cfg_scale)
+        cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
 
         sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
         sigmas = sigmas[img2img_start(steps, strength):]

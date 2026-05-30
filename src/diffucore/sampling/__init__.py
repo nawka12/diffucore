@@ -9,6 +9,7 @@ from .schedules import (
 from .parameterization import (
     append_dims,
     make_betas,
+    rescale_zero_terminal_snr,
     DiscreteSchedule,
     Scaling,
     EpsScaling,
@@ -32,6 +33,7 @@ __all__ = [
     "polyexponential_schedule",
     "append_dims",
     "make_betas",
+    "rescale_zero_terminal_snr",
     "DiscreteSchedule",
     "Scaling",
     "EpsScaling",

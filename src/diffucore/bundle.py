@@ -76,7 +76,10 @@ def load_checkpoint(
 
     # The training schedule is fully determined by the spec; keep its sigma table
     # (fp32) on the compute device so sigma<->t stays with the latents.
-    schedule = DiscreteSchedule(make_betas(spec.beta_schedule, spec.num_train_timesteps))
+    schedule = DiscreteSchedule(
+        make_betas(spec.beta_schedule, spec.num_train_timesteps),
+        zero_terminal_snr=spec.zero_terminal_snr,
+    )
     schedule.sigmas = schedule.sigmas.to(policy.device)
     schedule.log_sigmas = schedule.log_sigmas.to(policy.device)
 
