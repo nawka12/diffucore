@@ -31,11 +31,13 @@ class CLIPTokenizer:
         self.vocab_path = str(vocab_path or _DEFAULT_VOCAB)
         self._tokenizer = Tokenizer.from_file(self.vocab_path)
 
-    def encode(self, text: str) -> torch.Tensor:
+    def encode(self, text: str, pad_token: int = EOS_TOKEN) -> torch.Tensor:
+        """Tokenize to ``LongTensor[77]``. ``pad_token`` is the fill for the unused
+        tail: SD1.5/CLIP-L pad with EOS (49407); SDXL's OpenCLIP bigG pads with 0."""
         ids = self._tokenizer.encode(text).ids
         ids = ids[:MAX_LENGTH]
         if len(ids) < MAX_LENGTH:
-            ids = ids + [EOS_TOKEN] * (MAX_LENGTH - len(ids))
+            ids = ids + [pad_token] * (MAX_LENGTH - len(ids))
         return torch.tensor(ids, dtype=torch.long)
 
 
