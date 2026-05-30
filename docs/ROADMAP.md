@@ -85,7 +85,46 @@ The remaining extensions (each its own slice):
   byte-identical to all-resident, tiled-VAE PSNR 37.55 dB, peak VRAM 9.97 GB →
   6.6 GB; R4 — `offload="encoders"` cheap mode (UNet stays resident) is also
   byte-identical, and a 1024² generation completes under an emulated 8 GB cap.
-- A first DiT-style architecture to validate the §8 extensibility seams.
+- **First DiT-style architecture — Anima (Cosmos-Predict2-2B family) — done.**
+  `load_anima_checkpoint(dit, vae, te)` → `TextToImage` produces a coherent
+  1024² image (RTX 2060, ~46 s / 20 steps / 8.6 GB peak). Components, each
+  verified at landing:
+  - **Detection** — Anima identified by ``net.llm_adapter.blocks.0.cross_attn.q_proj.weight``;
+    spec carries ``architecture="anima"``, ``prediction="flow"``, ``latent_channels=16``,
+    ``context_dim=1024``, ``image_size=1024``.
+  - **Qwen-Image VAE** — 3D-causal-conv autoencoder shared with Wan2.1
+    (16-channel latents, 8× spatial); image-only T=1 path. Strict-load 194/194
+    keys; round-trip PSNR 49 dB on a smooth gradient (asserted > 40).
+  - **Qwen3 0.6B text encoder** — 28 layers, GQA (16/8), head_dim 128, RoPE
+    θ=1e6, per-head q/k RMSNorm before RoPE, SwiGLU MLP, eager attention.
+    Strict-load 310/310; **max|Δ|=0 in fp32** vs `transformers.Qwen3Model`.
+  - **LLM-Adapter** — 6-block bridge transformer at dim 1024; embeds T5 token
+    IDs as the "query stream" and cross-attends to Qwen3 hidden states. RoPE
+    θ=10000 (not Qwen's 1e6). Strict-load 118/118. Behavioral tests cover
+    determinism + sensitivity to source/target/mask.
+  - **Anima DiT** — 28-block adaLN-LoRA transformer (model_channels=2048,
+    16 heads × head_dim 128) with 3D RoPE on self-attn only. Three independent
+    adaLN modulators per block (self/cross/MLP). Strict-load 685/685; **2.09 B
+    params** — matches the model's 2B label.
+  - **Flow-matching parameterization + schedule** —
+    `FlowMatchingConstScaling` (`c_skip=1, c_out=−σ, c_in=1`; model predicts
+    velocity v = ε − x0) + `flow_matching_schedule(steps, shift)` (SD3-style
+    shift; Anima uses 3.0). The existing σ-space Euler sampler integrates
+    rectified-flow ODE *exactly*; no sampler changes needed.
+  - **fp16 stability fix** — Cosmos's residual stream accumulates past
+    fp16's ±65504 ceiling over 28 blocks → NaN. The DiT now promotes the
+    residual to fp32 inside `_forward` while keeping attention/MLP in
+    compute_dtype, casting back to fp32 before each gated residual add
+    (same shape as NVIDIA's reference). fp32 / CPU path unaffected.
+  - **Tokenizer** — `AnimaTokenizer` lazily loads Qwen2.5 + T5 tokenizers
+    via `transformers` from a vendored ComfyUI tokenizer directory.
+    Vendoring proper `tokenizer.json` files under `conditioning/` (to drop
+    the runtime `transformers` dep on the Anima path) is a follow-up.
+  - **Verification posture** — DT3 (Qwen3) bit-matches `transformers`
+    in fp32. ComfyUI can't be imported in our venv (missing private
+    `comfy_aimdo` native dep), so DT4 (adapter) and DT5 (DiT) rely on
+    strict-load + behavioral tests; correctness is confirmed end-to-end at
+    DT7 by visual inspection vs the same prompt/seed in ComfyUI.
 
 ## Verification notes
 

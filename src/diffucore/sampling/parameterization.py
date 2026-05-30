@@ -19,6 +19,14 @@ at noise level ``sigma`` into an estimate of the clean sample ``x0``:
 :class:`VScaling` covers v-prediction models. The scaling coefficients are the
 preconditioning of Karras et al. (2022); the v parameterization follows Salimans
 & Ho (2022).
+
+:class:`FlowMatchingConstScaling` covers rectified-flow models that use the
+CONST convention — the model sees the raw noisy latent (no input scaling) and
+predicts a velocity ``v = ε - x0`` so that ``x_t = (1 − σ)·x0 + σ·ε``. Anima
+(Cosmos-Predict2), Flux, and SD3 all share this form. The sigma value here
+plays the role of the rectified-flow timestep ``t ∈ (0, 1]``; the existing
+Euler/Heun samplers integrate the ODE exactly (one step is closed-form for
+linear interpolation).
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ __all__ = [
     "Scaling",
     "EpsScaling",
     "VScaling",
+    "FlowMatchingConstScaling",
 ]
 
 
@@ -188,4 +197,26 @@ class VScaling(Scaling):
         c_in = (1.0 / denom.sqrt()).to(sigma.dtype)
         c_skip = (1.0 / denom).to(sigma.dtype)
         c_out = (-s / denom.sqrt()).to(sigma.dtype)
+        return c_skip, c_out, c_in
+
+
+class FlowMatchingConstScaling(Scaling):
+    """CONST-style rectified flow (Anima / Flux / SD3 convention).
+
+    Forward process:    ``x_t = (1 − σ)·x0 + σ·ε``   with ``σ ∈ (0, 1]``.
+    Model prediction:   the velocity ``v = ε − x0``.
+    Inversion:          ``x0 = x_t − σ·v``.
+
+    In Karras' preconditioning form that becomes ``c_skip = 1``, ``c_out = −σ``,
+    ``c_in = 1`` (the model sees the raw noisy latent, not a rescaled one).
+    Note that ``σ`` here is the *rectified-flow time* rather than a noise std;
+    the existing σ-space samplers nonetheless integrate the ODE exactly because
+    ``d = (x − x0)/σ = v`` for this parameterization.
+    """
+
+    def scalings(self, sigma: torch.Tensor):
+        sigma = torch.as_tensor(sigma)
+        c_in = torch.ones_like(sigma)
+        c_skip = torch.ones_like(sigma)
+        c_out = -sigma
         return c_skip, c_out, c_in

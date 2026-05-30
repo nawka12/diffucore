@@ -126,6 +126,66 @@ Learned while implementing SDXL:
   `ModelSpec.latent_scale` and is applied at the VAE boundary as before. Same VAE
   architecture, run fp32.
 
+Learned while integrating Anima (the first DiT family — Cosmos-Predict2 / 2 B):
+
+- **Anima ships as three files.** DiT + VAE + TE come from different
+  HuggingFace repos and live under separate ComfyUI-style directories on disk.
+  `load_anima_checkpoint(dit_path, vae_path, te_path)` mirrors
+  `load_checkpoint` but takes all three; everything past that is the same
+  `ModelBundle` and a `TextToImage` dispatch on `spec.architecture == "anima"`.
+- **Two tokenizers, only one encoder.** Anima feeds the prompt through *both*
+  Qwen2.5 (consumed by the Qwen3 encoder) **and** T5 (token IDs only — *not*
+  encoded; embedded directly inside the DiT's 6-block LLM-Adapter via a
+  `[32128, 1024]` embedding table). The adapter cross-attends T5 token
+  embeddings to Qwen3 hidden states to produce the DiT's 1024-d context.
+- **Bit-match against `transformers.Qwen3Model` requires eager attention.**
+  SDPA's flash/efficient kernels reorder reductions and lose ~1 fp32 ULP per
+  layer; over 28 layers that compounds to ~7e-5 final-state drift. The Qwen3
+  encoder uses explicit `matmul→softmax→matmul`; the perf cost at
+  ≤512 tokens is negligible, and ``max\|Δ\|=0`` matches the SDXL bar.
+- **No in-process oracle for DT4/DT5.** The local ComfyUI install needs a
+  private native dep (`comfy_aimdo`) we don't have in the venv, so the
+  LLM-Adapter and the DiT backbone fall back to strict-load + behavioural
+  tests. Correctness is checked end-to-end at DT7 against a ComfyUI-generated
+  reference for the same prompt/seed/shift/cfg.
+- **fp16 residual stream overflows in the 28-block DiT.** First-pass Anima
+  generation came back all-black. Cosmos's `MiniTrainDIT` promotes the
+  residual to fp32 inside `_forward` while keeping attention/MLP in compute
+  dtype; my DiT now does the same — cast x to fp32 once, cast in/out of each
+  attention and MLP block, gates cast back to residual_dtype before the add.
+  fp32 / CPU path unaffected; the `if dtype == fp16: x.float()` branch is a
+  no-op there.
+- **`net.*` prefix.** The Anima safetensors prepends `net.` to every key
+  (DiT, adapter, etc.) — the existing `_load_sub(module, sd, "net.")`
+  prefix-stripping idiom handles this without remapping. The VAE and TE
+  checkpoints have no prefix; load them directly.
+- **3D RoPE needs broadcastable shape.** `VideoRopePosition3DEmb` outputs
+  `(L, D/2, 2, 2)`; you must `.unsqueeze(1).unsqueeze(0)` to
+  `(1, L, 1, D/2, 2, 2)` so the L axis aligns over batch and head dims when
+  applying it to a `(B, L, H, D)` query. (The Cosmos reference does the
+  unsqueeze inline in its `_forward`.)
+- **Patch-input channel count = 17, not 16.** The Anima DiT prepends a
+  one-channel `concat_padding_mask` to the 16-channel Qwen-Image latent, so
+  the patch-embed sees `(16+1)·2·2·1 = 68` features per patch (this is why
+  `x_embedder.proj.1.weight` is `[2048, 68]`). Output is `16·2·2·1 = 64`
+  (no mask channel on the way out).
+- **Anima uses CONST flow with `multiplier=1`, so σ is t.** ComfyUI's
+  `ModelType.FLOW` pairs `CONST` (model sees raw x, predicts v = ε − x0;
+  denoised = x − σ·v) with `ModelSamplingDiscreteFlow` (shift-transformed
+  schedule). With `multiplier=1` the DiT consumes σ directly as its
+  timestep — no σ⇄t bridge needed. The existing σ-space Euler integrator
+  is exact for any constant x0 estimate (closed-form linear interpolation).
+- **Qwen-Image VAE shares the Wan-2.1 latent normalization.** 16-channel
+  per-channel `(latents_mean, latents_std)` rather than the scalar
+  `latent_scale` SD uses. The VAE exposes `process_in` / `process_out`;
+  the pipeline applies `process_out` after sampling, before decode.
+- **Tokenizer dep is still `transformers` for now.** `AnimaTokenizer` lazily
+  loads Qwen2.5 + T5 via `transformers.Qwen2Tokenizer.from_pretrained` /
+  `T5TokenizerFast.from_pretrained` from a ComfyUI-style directory.
+  Vendoring proper `tokenizer.json` files under `conditioning/` (matching
+  the existing `clip_tokenizer.json` pattern) to drop the runtime
+  `transformers` dep is the planned follow-up.
+
 Learned while adding img2img / inpainting and v-prediction:
 
 - **img2img/inpaint share the pipeline base.** `_base._Pipeline` holds the
@@ -162,20 +222,24 @@ Learned while adding img2img / inpainting and v-prediction:
 
 ```
 src/diffucore/
-  sampling/      ✅ schedules, parameterization, samplers, denoiser   (DONE, tested)
-  loading/       ✅ state_dict (safetensors), detect (ModelSpec)       (DONE, tested)
-  models/        ✅ clip_text, open_clip_text, vae, unet               (M4–M6 + SDXL, verified)
-  conditioning/  ✅ CLIPTokenizer (+clip_tokenizer.json), Conditioner, SDXLConditioner
-  runtime/       ✅ DevicePolicy + CPU offload (on_device/encoders) + tiled VAE (R1–R4)
+  sampling/      ✅ schedules, parameterization, samplers, denoiser
+                   (incl. flow_matching_schedule + FlowMatchingConstScaling)
+  loading/       ✅ state_dict (safetensors), detect (SD1.5 + SDXL + Anima)
+  models/        ✅ clip_text, open_clip_text, vae, unet (SD1.5 + SDXL)
+                 ✅ qwen_image_vae, qwen3_text, llm_adapter, anima_dit (Anima)
+  conditioning/  ✅ CLIPTokenizer (+clip_tokenizer.json), Conditioner, SDXLConditioner,
+                   AnimaTokenizer (Qwen2.5 + T5; transformers-loaded, vendor pending)
+  runtime/       ✅ DevicePolicy + CPU offload + tiled VAE (R1–R4)
   pipelines/     ✅ TextToImage / ImageToImage / Inpaint (SD1.5 + SDXL; eps + v-pred)
-  bundle.py      ✅ load_checkpoint (detect + build + strict load; SD1.5 + SDXL)
+                 ✅ TextToImage (Anima, via _anima.anima_text_to_image dispatch)
+  bundle.py      ✅ load_checkpoint (SD1.5 + SDXL) + load_anima_checkpoint (Anima)
 docs/
-  ARCHITECTURE.md         design + rationale
-  ROADMAP.md              milestones + status
-  IMPLEMENTATION_SPEC.md  ← the build sheet for M4–M7 (read this first)
-  RUNTIME_SPEC.md         VRAM offload + tiled VAE (R1–R4 done)
+  ARCHITECTURE.md         design + rationale (incl. DiT seams)
+  ROADMAP.md              milestones + status (M0–SX, DT0–DT7)
+  IMPLEMENTATION_SPEC.md  ← the build sheet for M4–M7 (SD1.5 specific)
+  RUNTIME_SPEC.md         VRAM offload + tiled VAE (R1–R4 done; Anima TBD)
   HANDOFF.md              this file
-tests/                    CPU suite + opt-in pipeline smoke (SD1.5 + SDXL)
+tests/                    CPU suite + opt-in pipeline smoke (SD1.5 + SDXL + Anima)
 ```
 
 ## Licensing reminder

@@ -91,4 +91,9 @@ class SDXLConditioner:
         return context.expand(batch, -1, -1), pooled.expand(batch, -1)
 
 
-__all__ = ["CLIPTokenizer", "Conditioner", "SDXLConditioner"]
+from .anima_tokenizer import AnimaTokenized, AnimaTokenizer
+
+__all__ = [
+    "CLIPTokenizer", "Conditioner", "SDXLConditioner",
+    "AnimaTokenizer", "AnimaTokenized",
+]

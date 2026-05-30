@@ -1,8 +1,16 @@
+import os
+from pathlib import Path
+
 import pytest
 import torch
 from safetensors.torch import save_file
 
 from diffucore.loading import load_state_dict, read_header, detect_architecture
+
+_ANIMA_CKPT = Path(os.environ.get(
+    "DIFFUCORE_ANIMA_CKPT",
+    "/run/media/kayfa/a75ef841-da8c-45bc-9f54-ce6166f2c98a/comfy/ComfyUI/models/diffusion_models/anima-base-v1.0.safetensors",
+))
 
 
 def sd15_shapes():
@@ -96,3 +104,39 @@ def test_detect_from_real_header(tmp_path):
 def test_load_rejects_pickle_checkpoint():
     with pytest.raises(ValueError):
         load_state_dict("model.ckpt")
+
+
+def test_detect_anima_from_fingerprint():
+    """Anima carries bare ``net.*`` keys; the LLM-adapter fingerprint is enough
+    to identify it without the LDM-style ``model.diffusion_model.`` prefix."""
+    shapes = {
+        "net.llm_adapter.blocks.0.cross_attn.q_proj.weight": (1024, 1024),
+        "net.blocks.0.adaln_modulation_self_attn.1.weight": (256, 2048),
+        "net.x_embedder.proj.1.weight": (2048, 68),
+    }
+    spec = detect_architecture(shapes)
+    assert spec.architecture == "anima"
+    assert spec.prediction == "flow"
+    assert spec.zero_terminal_snr is False
+    assert spec.latent_channels == 16          # Qwen-Image VAE
+    assert spec.context_dim == 1024            # LLM-adapter output dim
+    assert spec.image_size == 1024
+
+
+def test_detect_anima_takes_precedence_over_missing_unet():
+    """Without the Anima marker, an unrelated key set raises ValueError. The
+    marker alone identifies the family — there is no ``model.diffusion_model.``
+    prefix to find."""
+    shapes_no_marker = {"net.blocks.0.adaln_modulation_self_attn.1.weight": (256, 2048)}
+    with pytest.raises(ValueError):
+        detect_architecture(shapes_no_marker)
+
+
+@pytest.mark.skipif(not _ANIMA_CKPT.exists(), reason=f"anima checkpoint not at {_ANIMA_CKPT}")
+def test_detect_anima_from_real_header():
+    """End-to-end: read the actual Anima checkpoint's header and detect."""
+    spec = detect_architecture(read_header(str(_ANIMA_CKPT)))
+    assert spec.architecture == "anima"
+    assert spec.prediction == "flow"
+    assert spec.latent_channels == 16
+    assert spec.context_dim == 1024

@@ -3,6 +3,11 @@
 Architecture detection (implemented, M3) runs here; building the modules and
 loading their weights is the M4–M6 work described in
 ``docs/IMPLEMENTATION_SPEC.md``.
+
+Anima checkpoints ship as three separate files (DiT / VAE / Qwen3 TE) rather
+than one bundled safetensors; the :func:`load_anima_checkpoint` entrypoint
+takes all three paths and returns the same :class:`ModelBundle` type as
+:func:`load_checkpoint` so the pipelines can dispatch by ``spec.architecture``.
 """
 
 from __future__ import annotations
@@ -11,9 +16,12 @@ from dataclasses import dataclass
 
 import torch
 
-from .conditioning import CLIPTokenizer
+from .conditioning import AnimaTokenizer, CLIPTokenizer
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header
-from .models import AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig
+from .models import (
+    AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig,
+    AnimaDiT, QwenImageVAE, Qwen3TextEncoder,
+)
 from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy
 from .sampling import DiscreteSchedule, make_betas
@@ -119,4 +127,73 @@ def load_checkpoint(
     )
 
 
-__all__ = ["ModelBundle", "load_checkpoint"]
+_ANIMA_DIT_PREFIX = "net."
+
+
+def load_anima_checkpoint(
+    dit_path: str,
+    vae_path: str,
+    te_path: str,
+    *,
+    qwen2_tokenizer_dir: str | None = None,
+    t5_tokenizer_dir: str | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float16,
+    policy: DevicePolicy | None = None,
+) -> ModelBundle:
+    """Load Anima's three-file split (DiT + Qwen-Image VAE + Qwen3 TE) into a
+    :class:`ModelBundle`. The VAE stays fp32 (per-channel latent stats blow up
+    in fp16); the DiT and Qwen3 encoder run in ``dtype``.
+
+    ``schedule`` is left ``None`` — flow-matching models drive sampling from a
+    σ table built at pipeline time by :func:`diffucore.sampling.flow_matching_schedule`,
+    not from a discrete training schedule.
+    """
+    if policy is None:
+        policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
+
+    # Detection runs on the DiT file (the VAE/TE have their own keys and are
+    # already known by name). It validates the file is Anima before we build
+    # the 2B-param module.
+    spec = detect_architecture(read_header(dit_path))
+    if spec.architecture != "anima":
+        raise ValueError(
+            f"{dit_path!r} is not an Anima checkpoint (detected {spec.architecture!r})"
+        )
+
+    idle_target = policy.offload_device if policy.offload_idle else policy.device
+    unet_target = policy.offload_device if policy.offload_unet else policy.device
+
+    # VAE: independent file with no key prefix.
+    vae = QwenImageVAE()
+    vae.load_state_dict(load_state_dict(vae_path, device="cpu"), strict=True)
+    vae = vae.to(idle_target, policy.vae_dtype).eval()
+
+    # Text encoder: independent Qwen3 file, keys at ``model.*``.
+    qwen3 = Qwen3TextEncoder()
+    qwen3.load_state_dict(load_state_dict(te_path, device="cpu"), strict=True)
+    qwen3 = qwen3.to(idle_target, policy.compute_dtype).eval()
+
+    # DiT (incl. the LLM-Adapter under ``llm_adapter``): keys live under ``net.*``.
+    sd_dit = load_state_dict(dit_path, device="cpu")
+    sd_dit = {k[len(_ANIMA_DIT_PREFIX):]: v for k, v in sd_dit.items()
+              if k.startswith(_ANIMA_DIT_PREFIX)}
+    backbone = AnimaDiT()
+    backbone.load_state_dict(sd_dit, strict=True)
+    backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+
+    tokenizer = AnimaTokenizer(qwen2_dir=qwen2_tokenizer_dir, t5_dir=t5_tokenizer_dir)
+
+    return ModelBundle(
+        spec=spec,
+        schedule=None,                  # flow-matching: σ-schedule built at sample time
+        tokenizer=tokenizer,
+        text_encoder=qwen3,
+        backbone=backbone,
+        vae=vae,
+        text_encoder_2=None,
+        policy=policy,
+    )
+
+
+__all__ = ["ModelBundle", "load_checkpoint", "load_anima_checkpoint"]

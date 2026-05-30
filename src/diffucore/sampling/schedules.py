@@ -21,6 +21,7 @@ __all__ = [
     "karras_schedule",
     "exponential_schedule",
     "polyexponential_schedule",
+    "flow_matching_schedule",
 ]
 
 
@@ -86,4 +87,32 @@ def polyexponential_schedule(
     ramp = torch.linspace(1, 0, steps, device=device, dtype=dtype) ** rho
     log_min, log_max = math.log(sigma_min), math.log(sigma_max)
     sigmas = (ramp * (log_max - log_min) + log_min).exp()
+    return append_zero(sigmas)
+
+
+def flow_matching_schedule(
+    steps: int,
+    shift: float = 1.0,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """SD3-style shifted rectified-flow schedule.
+
+    Anima (Cosmos-Predict2) and Flux sample σ values from
+    ``σ(t) = shift·t / (1 + (shift − 1)·t)`` for ``t = (N − i)/N``,
+    ``i = 0..N−1`` — descending uniform-in-t with the SD3 shift applied.
+    ``shift = 1`` collapses to the plain linear schedule. Higher ``shift``
+    concentrates more steps near ``σ = 1`` (where the model spent more
+    training compute). A trailing ``0`` is appended for the clean endpoint.
+
+    Anima ships with ``shift = 3.0``; the canonical Flux default is 1.15.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if shift < 1.0:
+        raise ValueError("shift must be >= 1")
+    # descending uniform t in (0, 1]
+    t = torch.arange(steps, 0, -1, device=device, dtype=dtype) / steps
+    sigmas = shift * t / (1.0 + (shift - 1.0) * t)
     return append_zero(sigmas)

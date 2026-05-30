@@ -12,10 +12,15 @@ system.
 > SDXL (1024²) run text-to-image, image-to-image, and inpainting —
 > `load_checkpoint` → `TextToImage` / `ImageToImage` / `Inpaint` produces a
 > coherent, seed-reproducible image. Both **epsilon- and v-prediction** checkpoints
-> are supported (auto-detected). The sampling core + checkpoint detection are unit
-> tested (CPU); the model components (CLIP, OpenCLIP bigG, VAE, UNet) are verified
-> on an RTX 2060 against HF `transformers`/`diffusers` as numerical oracles (text
-> encoders and UNet match bit-for-bit in fp32; VAE round-trip 35 dB PSNR). See
+> are supported (auto-detected). **Anima** (CircleStone Labs' 2 B DiT built on
+> Cosmos-Predict2 with Qwen3-0.6B + Qwen-Image VAE) is integrated as the first
+> DiT family — `load_anima_checkpoint(dit, vae, te)` → `TextToImage` generates a
+> coherent 1024² image (~46 s on RTX 2060, ~8.6 GB peak; flow-matching with
+> shift=3, CFG, seed-reproducible). The sampling core + checkpoint detection are
+> unit tested (CPU); the model components (CLIP, OpenCLIP bigG, VAE, UNet, Qwen3)
+> are verified on an RTX 2060 against HF `transformers`/`diffusers` as numerical
+> oracles (text encoders and UNet match bit-for-bit in fp32; VAE round-trip
+> 35 dB PSNR on SD, 49 dB on Qwen-Image). See
 > [`docs/ROADMAP.md`](docs/ROADMAP.md),
 > [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md),
 > and [`docs/HANDOFF.md`](docs/HANDOFF.md).
@@ -46,11 +51,13 @@ one thing — diffusion inference — and is easy to embed behind a custom UI.
 
 ## Development
 
-The first targets are **Stable Diffusion 1.5** and **SDXL** text-to-image. CPU is
-supported for testing; real generation targets CUDA (developed against an RTX
-2060 12 GB). SDXL at 1024² needs ~10 GB resident, or ~6.6 GB with the opt-in
+The first targets are **Stable Diffusion 1.5** and **SDXL** text-to-image;
+**Anima** is the first DiT family on top of the same engine. CPU is supported
+for testing; real generation targets CUDA (developed against an RTX 2060 12 GB).
+SDXL at 1024² needs ~10 GB resident, or ~6.6 GB with the opt-in
 `DevicePolicy(offload=True)` sequential CPU offload + tiled VAE decode (see
-[`docs/RUNTIME_SPEC.md`](docs/RUNTIME_SPEC.md)).
+[`docs/RUNTIME_SPEC.md`](docs/RUNTIME_SPEC.md)); Anima at 1024² currently runs
+~8.6 GB resident (offload-aware for the Anima path is a follow-up).
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate

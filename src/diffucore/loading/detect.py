@@ -7,6 +7,10 @@ the diffusion UNet lives under ``model.diffusion_model.``, the VAE under
 cross-attention key projection (``attn2.to_k``) — distinguishes the families:
 768 = SD1.x (CLIP ViT-L), 1024 = SD2.x (OpenCLIP ViT-H), 2048 = SDXL.
 
+DiT-style checkpoints break that convention. Anima (CircleStone Labs, built on
+NVIDIA's Cosmos-Predict2-2B with Qwen3-0.6B + Qwen-Image VAE) carries bare
+``net.*`` keys and is identified by its LLM-adapter fingerprint.
+
 Reading shapes is enough to identify the model, so this works on a header map
 without loading any weights.
 """
@@ -20,6 +24,7 @@ from typing import Mapping, Sequence
 UNET_PREFIX = "model.diffusion_model."
 _INPUT_CONV = UNET_PREFIX + "input_blocks.0.0.weight"
 _ATTN2_TO_K = re.compile(r"transformer_blocks\.\d+\.attn2\.to_k\.weight$")
+_ANIMA_FINGERPRINT = "net.llm_adapter.blocks.0.cross_attn.q_proj.weight"
 
 Shape = Sequence[int]
 
@@ -28,8 +33,8 @@ Shape = Sequence[int]
 class ModelSpec:
     """Everything the engine needs to know about a checkpoint before building it."""
 
-    architecture: str          # e.g. "sd15", "sdxl"
-    prediction: str            # "eps" | "v"
+    architecture: str          # e.g. "sd15", "sdxl", "anima"
+    prediction: str            # "eps" | "v" | "flow"
     zero_terminal_snr: bool    # rescale the schedule to zero terminal SNR (ZTSNR)
     latent_channels: int       # VAE latent channel count
     context_dim: int           # text-encoder hidden size seen by cross-attention
@@ -52,6 +57,20 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
     Raises ``ValueError`` if it isn't a recognizable diffusion checkpoint and
     ``NotImplementedError`` for a recognized-but-unsupported family.
     """
+    # Anima DiT (Cosmos-Predict2 family with the LLM-adapter cross-encoder).
+    # Bare ``net.*`` prefix and a 6-block adapter at ``net.llm_adapter.*``;
+    # checking the first adapter block's q_proj is enough to disambiguate.
+    if _ANIMA_FINGERPRINT in shapes:
+        return ModelSpec(
+            architecture="anima",
+            prediction="flow",
+            zero_terminal_snr=False,
+            latent_channels=16,
+            context_dim=1024,
+            image_size=1024,
+            latent_scale=1.0,
+        )
+
     if _INPUT_CONV not in shapes:
         raise ValueError(f"no UNet found (missing {_INPUT_CONV!r}); not a supported checkpoint")
 

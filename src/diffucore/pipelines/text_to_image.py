@@ -4,6 +4,10 @@ A thin wrapper over the shared pipeline machinery in :mod:`._base`: build the
 conditioning, sample a fresh-noise latent down the full sigma schedule, decode.
 Conditioning / sampling / decode (and their offload + tiling placement) live in
 :class:`._base._Pipeline`.
+
+For Anima (a flow-matching DiT with its own VAE, TE, and tokenizer pair) the
+call dispatches into :func:`._anima.anima_text_to_image` — that path doesn't
+share enough machinery with SD/SDXL to ride on top of ``_Pipeline``.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ from typing import TYPE_CHECKING
 import torch
 from PIL import Image
 
+from ._anima import anima_text_to_image
 from ._base import _Pipeline
 
 if TYPE_CHECKING:  # avoid importing the bundle (and torch-heavy models) eagerly
@@ -33,7 +38,16 @@ class TextToImage(_Pipeline):
         sampler: str = "euler",
         scheduler: str = "karras",
         seed: int | None = None,
+        shift: float = 3.0,
     ) -> Image.Image:
+        if self.model.spec.architecture == "anima":
+            return anima_text_to_image(
+                self.model, prompt, negative_prompt,
+                steps=steps, cfg_scale=cfg_scale, shift=shift,
+                width=width if width is not None else self.model.spec.image_size,
+                height=height if height is not None else self.model.spec.image_size,
+                seed=seed,
+            )
         """Return a ``PIL.Image`` for ``prompt``. ``width``/``height`` default to
         the model's native resolution (512 for SD1.5, 1024 for SDXL). ``cfg_rescale``
         defaults to 0.7 for ZTSNR checkpoints, 0 otherwise (see ``CFGDenoiser``)."""

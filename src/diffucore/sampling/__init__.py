@@ -5,6 +5,7 @@ from .schedules import (
     karras_schedule,
     exponential_schedule,
     polyexponential_schedule,
+    flow_matching_schedule,
 )
 from .parameterization import (
     append_dims,
@@ -14,6 +15,7 @@ from .parameterization import (
     Scaling,
     EpsScaling,
     VScaling,
+    FlowMatchingConstScaling,
 )
 from .denoiser import ModelDenoiser, CFGDenoiser, MaskedDenoiser
 from .samplers import (
@@ -31,6 +33,7 @@ __all__ = [
     "karras_schedule",
     "exponential_schedule",
     "polyexponential_schedule",
+    "flow_matching_schedule",
     "append_dims",
     "make_betas",
     "rescale_zero_terminal_snr",
@@ -38,6 +41,7 @@ __all__ = [
     "Scaling",
     "EpsScaling",
     "VScaling",
+    "FlowMatchingConstScaling",
     "ModelDenoiser",
     "CFGDenoiser",
     "MaskedDenoiser",

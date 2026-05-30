@@ -4,7 +4,9 @@ This document is the design spec for Diffucore's inference engine. It describes
 *what* the engine does and *how* the pieces fit, independent of any particular
 model. The first concrete target is Stable Diffusion 1.5 text-to-image; the
 abstractions are chosen so that later architectures (SDXL, and DiT-style models)
-slot in without reshaping the core.
+slot in without reshaping the core. **Anima** (Cosmos-Predict2-family DiT) was
+the first DiT integration and is now end-to-end working at 1024² — see
+[`ROADMAP.md`](ROADMAP.md) for the per-component status.
 
 ## 1. Scope and non-goals
 
@@ -85,7 +87,11 @@ SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
 - **Scaling** (`parameterization.py`) — the prediction parameterization. Given σ
   it yields `(c_skip, c_out, c_in)` so that
   `denoised = c_skip·x + c_out·model(c_in·x, t(σ))`. `EpsScaling` covers SD1.5;
-  `VScaling` covers v-prediction models.
+  `VScaling` covers v-prediction models; `FlowMatchingConstScaling` covers
+  rectified-flow models (Anima / Cosmos-Predict2 / Flux / SD3 CONST convention)
+  where the model receives the raw noisy latent and predicts a velocity
+  `v = ε − x0`. For flow, σ plays the role of the rectified-flow time
+  ``t ∈ (0, 1]``; the same σ-space Euler/Heun samplers integrate the ODE.
 
 - **Schedule** (`schedules.py`) — a sampling-time function
   `(steps, σ_min, σ_max) -> σ[0..steps]` (descending, trailing 0).
@@ -116,6 +122,27 @@ image = pipe(
     seed=0,
 )                                                       # -> PIL.Image
 ```
+
+Anima ships as three separate files (DiT + Qwen-Image VAE + Qwen3-0.6B TE) so
+the entry point takes the trio:
+
+```python
+from diffucore import load_anima_checkpoint, TextToImage
+
+model = load_anima_checkpoint(
+    dit_path="models/anima-base-v1.0.safetensors",
+    vae_path="models/qwen_image_vae.safetensors",
+    te_path="models/qwen_3_06b_base.safetensors",
+    device="cuda", dtype=torch.float16,
+)
+image = TextToImage(model)("a watercolor fox", steps=20, cfg_scale=4.0,
+                           width=1024, height=1024, shift=3.0, seed=0)
+```
+
+`TextToImage` dispatches by `model.spec.architecture`; the SD/SDXL and Anima
+paths share the bundle/conditioning/decode contract but diverge in the
+sampling-loop internals (different parameterization, schedule, and the DiT's
+extra `t5xxl_ids` kwarg routed through its built-in LLM-Adapter).
 
 Lower layers stay usable on their own (e.g. build a `Denoiser` and call a
 `Sampler` directly) so the engine is composable, not just a single black box.
@@ -154,12 +181,27 @@ the build sheet [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md).
 New work plugs in at the seams, without touching the loop:
 
 - A new **sampler** = one σ-space stepper function in `samplers.py`.
-- A new **schedule** = one function in `schedules.py`.
+- A new **schedule** = one function in `schedules.py` (e.g.
+  `flow_matching_schedule` for SD3-style shifted rectified-flow models).
+- A new **parameterization** = one `Scaling` subclass in `parameterization.py`
+  (`EpsScaling`, `VScaling`, `FlowMatchingConstScaling`).
 - A new **architecture** = a backbone module in `models/` + a detector entry +
   a `ModelSpec`. The loop and samplers are unaffected.
 
-This is deliberately minimal: no plugin registry or config DSL until a second
-real architecture proves the seams.
+These seams have now been exercised by Anima — a Cosmos-Predict2-family DiT
+with a different VAE family (Wan 3D-causal-conv), a different text encoder
+(Qwen3 decoder LM), an internal cross-encoder LLM-Adapter, and a different
+prediction parameterization (CONST flow) — all integrated by adding modules
+and one detector branch, without touching the σ-space samplers, the sigma
+schedules (other than adding `flow_matching_schedule`), or the
+denoising-loop scaffolding.
+
+The pipeline layer was the one place where Anima needed a dispatch rather
+than a drop-in: enough of SD's `_Pipeline` (Karras schedule, `EpsScaling`,
+fixed 4-channel latents, scalar `latent_scale`) doesn't apply to flow-matching
+DiTs that the Anima path lives in its own self-contained driver
+(`pipelines/_anima.py`) that `TextToImage` dispatches into. This is by
+design — see §9 in [`ROADMAP.md`](ROADMAP.md) for the DT0–DT7 build sheet.
 
 ## 9. Provenance and licensing
 
