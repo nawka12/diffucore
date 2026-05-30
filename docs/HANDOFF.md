@@ -126,6 +126,30 @@ Learned while implementing SDXL:
   `ModelSpec.latent_scale` and is applied at the VAE boundary as before. Same VAE
   architecture, run fp32.
 
+Learned while adding img2img / inpainting and v-prediction:
+
+- **img2img/inpaint share the pipeline base.** `_base._Pipeline` holds the
+  conditioning / sigma build / staged sample / staged decode / `_encode_image`;
+  `TextToImage`, `ImageToImage`, `Inpaint` are thin `__call__`s differing only in
+  the initial latent. Strength slices the sigma schedule at `img2img_start`.
+- **Inpainting needs no sampler change.** `MaskedDenoiser` forces the keep region
+  of the x0 estimate to `z0`; the sampler ODE `dx/dσ = (x − z0)/σ` has the exact
+  solution `z0 + noise·σ` (Euler/Heun integrate it exactly), so that region lands
+  on `z0` at σ→0. Original pixels are composited back after decode for byte-exact
+  preservation.
+- **v-prediction is a one-flag switch.** Detection sets `spec.prediction = "v"`
+  from the bare `v_pred` marker tensor; the pipeline then uses `VScaling`. The
+  weights are identical to an eps model, so nothing else changes — but feeding a
+  v-pred model through `EpsScaling` yields pure noise, so the flag must be right.
+- **`position_ids` is non-persistent.** It's the constant `arange(0..77)`, not a
+  weight; many SDXL finetunes (e.g. AnimaTensor) drop it. Registered
+  `persistent=False` and stripped in `_load_sub`, so checkpoints with *or* without
+  it both strict-load. (The marker tensors `v_pred`/`ztsnr` are likewise ignored —
+  they match no module prefix.)
+- **ZTSNR is not yet handled.** v-pred ZTSNR models train with terminal SNR 0
+  (σ_max→∞); we still sample from the discrete-schedule σ_max (~14.6), which is
+  coherent but limits extreme dark/bright. Raising σ_max is the open slice.
+
 ## Project map
 
 ```
@@ -134,14 +158,14 @@ src/diffucore/
   loading/       ✅ state_dict (safetensors), detect (ModelSpec)       (DONE, tested)
   models/        ✅ clip_text, open_clip_text, vae, unet               (M4–M6 + SDXL, verified)
   conditioning/  ✅ CLIPTokenizer (+clip_tokenizer.json), Conditioner, SDXLConditioner
-  runtime/       ✅ DevicePolicy + CPU offload (on_device) + tiled VAE (R1–R3)
-  pipelines/     ✅ TextToImage (SD1.5 + SDXL)                         (M7 + SDXL, verified)
+  runtime/       ✅ DevicePolicy + CPU offload (on_device/encoders) + tiled VAE (R1–R4)
+  pipelines/     ✅ TextToImage / ImageToImage / Inpaint (SD1.5 + SDXL; eps + v-pred)
   bundle.py      ✅ load_checkpoint (detect + build + strict load; SD1.5 + SDXL)
 docs/
   ARCHITECTURE.md         design + rationale
   ROADMAP.md              milestones + status
   IMPLEMENTATION_SPEC.md  ← the build sheet for M4–M7 (read this first)
-  RUNTIME_SPEC.md         VRAM offload + tiled VAE (R1–R3 done; R4 open)
+  RUNTIME_SPEC.md         VRAM offload + tiled VAE (R1–R4 done)
   HANDOFF.md              this file
 tests/                    CPU suite + opt-in pipeline smoke (SD1.5 + SDXL)
 ```

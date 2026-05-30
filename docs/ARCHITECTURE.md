@@ -73,7 +73,9 @@ SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
 - **ModelBundle** — the result of loading a checkpoint: the diffusion backbone,
   the VAE, the text encoder(s), and a small `ModelSpec` (architecture id,
   prediction type, latent channels/scale, training schedule). Detection fills
-  the spec from the checkpoint's tensor keys and shapes.
+  the spec from the checkpoint's tensor keys and shapes — including the
+  `prediction` type, which is `"v"` when the checkpoint carries the bare `v_pred`
+  marker tensor (the eps/v weights are otherwise identical) and `"eps"` otherwise.
 
 - **DiscreteSchedule** (`parameterization.py`) — derives the per-timestep σ table
   from the model's training betas and converts between σ and the continuous
@@ -89,8 +91,10 @@ SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
   `(steps, σ_min, σ_max) -> σ[0..steps]` (descending, trailing 0).
 
 - **Denoiser** — composes a backbone + `Scaling` + `DiscreteSchedule`
-  into the single callable the loop wants: `x, σ -> denoised`. CFG is applied
-  here (`CFGDenoiser`) by evaluating cond/uncond.
+  into the single callable the loop wants: `x, σ -> denoised`. The pipeline picks
+  the `Scaling` (`EpsScaling`/`VScaling`) from `spec.prediction`. CFG is applied
+  here (`CFGDenoiser`) by evaluating cond/uncond; inpainting wraps it with a
+  `MaskedDenoiser` that pins the keep region to the original latent.
 
 - **Sampler** — a pure function of σ-space: consumes `Denoiser`, an
   initial latent, and a σ schedule; returns the final latent. Knows nothing

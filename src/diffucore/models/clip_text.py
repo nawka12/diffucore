@@ -39,10 +39,13 @@ class CLIPEmbeddings(nn.Module):
         super().__init__()
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.position_embedding = nn.Embedding(cfg.max_position_embeddings, cfg.hidden_size)
+        # Non-persistent: position_ids is the constant arange(0..max), not a learned
+        # weight. Many SDXL finetunes drop it from their state dict, so requiring it
+        # would reject otherwise-valid checkpoints; it is regenerated here identically.
         self.register_buffer(
             "position_ids",
             torch.arange(cfg.max_position_embeddings).unsqueeze(0),
-            persistent=True,
+            persistent=False,
         )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:

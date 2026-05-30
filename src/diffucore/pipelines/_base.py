@@ -23,6 +23,7 @@ from ..sampling import (
     CFGDenoiser,
     EpsScaling,
     ModelDenoiser,
+    VScaling,
     exponential_schedule,
     get_sampler,
     karras_schedule,
@@ -131,7 +132,8 @@ class _Pipeline:
 
     # --- sampling ------------------------------------------------------------
     def _denoiser(self, cond, uncond, cfg_scale):
-        denoiser = ModelDenoiser(self.model.backbone, EpsScaling(), self.model.schedule)
+        scaling = VScaling() if self.model.spec.prediction == "v" else EpsScaling()
+        denoiser = ModelDenoiser(self.model.backbone, scaling, self.model.schedule)
         return CFGDenoiser(denoiser, cond, uncond, scale=cfg_scale)
 
     def _sigmas(self, scheduler, steps, device, dtype):

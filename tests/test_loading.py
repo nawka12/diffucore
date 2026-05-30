@@ -44,6 +44,18 @@ def test_detect_sdxl():
     assert spec.latent_scale == 0.13025
 
 
+def test_detect_v_prediction_from_marker():
+    """A bare ``v_pred`` marker tensor flips the prediction type to v; without it
+    the same checkpoint is read as epsilon."""
+    shapes = dict(sd15_shapes())
+    shapes["model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight"] = (640, 2048)
+    assert detect_architecture(shapes).prediction == "eps"
+    shapes["v_pred"] = ()
+    spec = detect_architecture(shapes)
+    assert spec.architecture == "sdxl"
+    assert spec.prediction == "v"
+
+
 def test_detect_unsupported_family_raises():
     # SD2.x (context_dim 1024, OpenCLIP ViT-H) is recognized but not implemented.
     shapes = dict(sd15_shapes())

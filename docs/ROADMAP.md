@@ -62,6 +62,15 @@ The remaining extensions (each its own slice):
   keep region byte-exact, masked region repainted, seed-reproducible; the
   keep-region-pinning is also checked at the sampler level on CPU (no checkpoint).
   Mask blur / "inpaint at full res" are later refinements.
+- **v-prediction checkpoints — done.** Detection reads the bare `v_pred` marker
+  tensor (NoobAI / A1111 / reForge convention) into `ModelSpec.prediction`, and
+  the pipeline selects `VScaling` vs `EpsScaling` from it — no other code path
+  changes (eps and v-pred weights are otherwise identical). Verified on the RTX
+  2060 with `AnimaTensor-Pro` (v-pred + ZTSNR SDXL): coherent 1024² image. Along
+  the way, CLIP's `position_ids` became a non-persistent buffer (a derived
+  `arange` constant many finetunes omit), so such checkpoints load strictly.
+  ZTSNR-aware sampling (raising σ_max for the zero-terminal-SNR schedule) is the
+  next slice — without it, very dark/bright scenes are slightly limited.
 - **VRAM management for SDXL on smaller cards — R1–R4 done.** Sequential CPU
   offload + tiled VAE, specced in [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md). Verified on
   the RTX 2060 against `AkashicPulse-v3.0` (SDXL, 1024²): R1–R3 — offload

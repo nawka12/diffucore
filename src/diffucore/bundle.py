@@ -29,6 +29,9 @@ _SDXL_CLIP_G = "conditioner.embedders.1.model."
 
 def _load_sub(module, state_dict, prefix):
     sub = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    # position_ids is a derived constant (non-persistent buffer); drop it if a
+    # checkpoint ships one so the strict load neither misses nor rejects it.
+    sub = {k: v for k, v in sub.items() if not k.endswith("position_ids")}
     module.load_state_dict(sub, strict=True)
     return module
 
