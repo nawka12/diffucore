@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 from PIL import Image
+from tqdm.auto import tqdm
 
 from ..runtime import on_device
 from ._base import _step_progress
@@ -141,7 +142,9 @@ def anima_text_to_image(
     backbone = model.backbone
     with torch.no_grad(), _staged([backbone], device, policy.offload_unet):
         if sampler == "euler":
-            for i in range(len(sigmas) - 1):
+            total = len(sigmas) - 1
+            bar = tqdm(total=total, desc="sampling", leave=False)
+            for i in range(total):
                 sigma, sigma_next = sigmas[i], sigmas[i + 1]
                 x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
                 t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
@@ -156,6 +159,8 @@ def anima_text_to_image(
                 # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
                 # (closed-form exact for any constant x0 estimate).
                 x = x + (sigma_next - sigma).to(dtype) * v
+                bar.update(1)
+            bar.close()
         else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
             def denoise(x_in, sigma_b):
                 """``model(x, σ) -> x0``: predict velocity (with CFG), return the
