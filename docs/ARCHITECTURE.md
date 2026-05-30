@@ -67,7 +67,7 @@ src/diffucore/
   loading/               safetensors IO, arch detection.
   runtime/               device/dtype policy + CPU offload + tiled VAE decode.
   pipelines/             TextToImage — user-facing glue.
-  lora.py                apply_lora: fuse LoRA/LoKr adapter deltas into a bundle.
+  lora.py                apply_lora / remove_lora / clear_loras: fuse and unfuse LoRA/LoKr deltas.
 ```
 
 The full SD1.5 (512²) and SDXL (1024²) text-to-image paths are implemented, as
@@ -197,7 +197,10 @@ New work plugs in at the seams, without touching the loop:
   `lora.py`'s `apply_lora` fuses the adapter's weight delta directly into the
   bundle's module weights (`W += multiplier·ΔW`). Because the fusion is in the
   weights, the sampling loop, the offload machinery, and every backbone are
-  oblivious to it — supporting a new adapter family means adding a delta
+  oblivious to it. LoRAs stack across calls; the first time a weight is touched a
+  pristine CPU snapshot is taken so `remove_lora` / `clear_loras` can undo a fuse
+  (restore the snapshot, replay the rest of the stack) without reloading the
+  checkpoint. Supporting a new adapter family means adding a delta
   reconstruction (`_compose_*`) and/or a key→module mapping, nothing more.
 
 These seams have now been exercised by Anima — a Cosmos-Predict2-family DiT

@@ -41,6 +41,8 @@ import torch.nn as nn
 
 from .loading import load_state_dict
 
+_CPU = torch.device("cpu")
+
 # Tensor-name suffixes -> the role we file them under. A module's keys share a
 # base (the kohya module name); the suffix says which factor each tensor is.
 _SUFFIXES = [
@@ -72,14 +74,53 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
     """Fuse a kohya-format LoRA at ``path`` into ``bundle``'s UNet and text
     encoder(s), scaled by ``multiplier``. Mutates the module weights in place.
 
+    LoRAs stack: each call adds its delta on top of any already applied. Before a
+    module's weight is first modified its pristine values are snapshotted (to CPU)
+    so the fuse can be undone — call :func:`remove_lora` to drop one LoRA or
+    :func:`clear_loras` to restore the base weights. The active stack is tracked
+    on the bundle.
+
     Returns a :class:`LoraReport`; inspect ``unmatched`` to spot keys that did
     not map to a layer (e.g. a SD1.5 LoRA applied to an SDXL bundle, or an
     unsupported LyCORIS file).
     """
-    state_dict = load_state_dict(path, device="cpu")
-    groups = _group(state_dict)
+    state = _lora_state(bundle)
     targets = _build_targets(bundle)
+    report = _fuse(path, multiplier, targets, state["base"])
+    state["stack"].append((path, multiplier))
+    return report
 
+
+def remove_lora(bundle, path: str) -> None:
+    """Remove a previously applied LoRA (matched by ``path``) and re-fuse the
+    rest, leaving the weights exactly as if that LoRA had never been applied:
+    restore the snapshotted base weights, then replay the remaining stack.
+
+    Raises ``ValueError`` if ``path`` is not on the stack; if it was applied more
+    than once, the most recent entry is removed."""
+    stack = _lora_state(bundle)["stack"]
+    for i in range(len(stack) - 1, -1, -1):
+        if stack[i][0] == path:
+            del stack[i]
+            break
+    else:
+        raise ValueError(f"{path!r} is not in the active LoRA stack")
+    _refuse(bundle)
+
+
+def clear_loras(bundle) -> None:
+    """Remove all applied LoRAs, restoring the bundle's original base weights and
+    dropping the snapshots. A no-op if none were applied."""
+    state = _lora_state(bundle)
+    _restore(state["base"])
+    state["base"].clear()
+    state["stack"].clear()
+
+
+def _fuse(path: str, multiplier: float, targets, base) -> LoraReport:
+    """Load the LoRA at ``path`` and add its scaled deltas into ``targets``,
+    snapshotting each touched weight into ``base`` before its first modification."""
+    groups = _group(load_state_dict(path, device="cpu"))
     applied, unmatched = 0, []
     for name, factors in groups.items():
         target = targets.get(name)
@@ -92,11 +133,49 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
         if delta is None:
             unmatched.append(name)          # unsupported factorization (e.g. Tucker)
             continue
+        _snapshot(base, weight)
         with torch.no_grad():
             view.add_(delta.to(view.device, view.dtype))
         applied += 1
 
     return LoraReport(applied=applied, unmatched=unmatched)
+
+
+def _refuse(bundle) -> None:
+    """Restore the base weights, then replay the active stack from scratch."""
+    state = _lora_state(bundle)
+    _restore(state["base"])
+    targets = _build_targets(bundle)
+    for path, multiplier in state["stack"]:
+        _fuse(path, multiplier, targets, state["base"])
+
+
+def _snapshot(base, weight) -> None:
+    """Save a pristine CPU copy of ``weight`` on first touch, keyed by storage
+    address (``.data`` hands back a fresh object each access, so identity is not
+    stable; the storage pointer is, and holding the weight ref keeps it alive).
+    bigG's q/k/v share one ``in_proj_weight``, so it is snapshotted once however
+    many LoRA keys target its row-slices."""
+    key = weight.data_ptr()
+    if key not in base:
+        base[key] = (weight, weight.detach().to(_CPU, copy=True))
+
+
+def _restore(base) -> None:
+    """Write every snapshotted weight back to its pristine values, in place."""
+    with torch.no_grad():
+        for weight, snapshot in base.values():
+            weight.copy_(snapshot.to(weight.device, weight.dtype))
+
+
+def _lora_state(bundle) -> dict:
+    """The bundle's LoRA bookkeeping — ``{"stack": [(path, multiplier), ...],
+    "base": {data_ptr: (weight, cpu_snapshot)}}`` — created on first use."""
+    state = getattr(bundle, "_lora_state", None)
+    if state is None:
+        state = {"stack": [], "base": {}}
+        bundle._lora_state = state
+    return state
 
 
 def _group(state_dict: dict[str, torch.Tensor]) -> dict[str, dict[str, torch.Tensor]]:
@@ -222,4 +301,4 @@ def _add_bigg_targets(targets, model, prefix) -> None:
         targets[mlp + "fc2"] = (block.mlp.c_proj.weight.data, None, None)
 
 
-__all__ = ["apply_lora", "LoraReport"]
+__all__ = ["apply_lora", "remove_lora", "clear_loras", "LoraReport"]

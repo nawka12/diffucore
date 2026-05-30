@@ -139,9 +139,13 @@ The remaining extensions (each its own slice):
   row-slices). Verified on the RTX 2060 against real files: SDXL LoKr
   (1052/1052 modules), Anima LoRA (448/448) and Anima LoKr (280/280) — all
   0 unmatched, coherent output, fused ΔW matching an independent reference to
-  fp16 precision. CPU unit tests run on tiny real-structure models
-  (`tests/test_lora.py`). Diffusers-format SD LoRAs and the LoHa variant are
-  not supported (their keys are reported in `LoraReport.unmatched`).
+  fp16 precision. LoRAs stack, and `remove_lora(bundle, path)` /
+  `clear_loras(bundle)` unfuse without reloading the checkpoint — a pristine CPU
+  snapshot (taken on first touch) is restored and the rest of the stack replayed,
+  so an unfuse is bit-exact and swapping is memory-bounded. CPU unit tests run on
+  tiny real-structure models (`tests/test_lora.py`, `tests/test_lora_swap.py`).
+  Diffusers-format SD LoRAs and the LoHa variant are not supported (their keys
+  are reported in `LoraReport.unmatched`).
 - **Sampler / scheduler set — done.** Beyond the original Euler/Heun/ancestral,
   the registry now carries **DPM2** (+ancestral), **DPM++** (`2m`, `sde`,
   `2m_sde`, `3m_sde`) and **ER-SDE-Solver-3**, plus the **`sgm_uniform`** and

@@ -102,10 +102,15 @@ fill = Inpaint(model)(prompt, Image.open("input.png"), Image.open("mask.png"), s
 ### LoRA / LoKr
 
 ```python
-from diffucore import apply_lora
+from diffucore import apply_lora, remove_lora, clear_loras
 
 report = apply_lora(model, "loras/style.safetensors", multiplier=0.8)
 print(report)  # matched / unmatched module counts
+
+# LoRAs stack; remove one (or all) without reloading the checkpoint
+apply_lora(model, "loras/character.safetensors", multiplier=0.6)
+remove_lora(model, "loras/style.safetensors")  # re-fuses the rest, exact
+clear_loras(model)                             # back to base weights
 ```
 
 ### Fitting bigger models on smaller GPUs

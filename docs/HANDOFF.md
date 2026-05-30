@@ -225,6 +225,16 @@ Learned while adding LoRA/LoKr (`lora.py`):
   the fused weights travel with them for free — no forward hooks, no change to
   the sampling loop. Compute ΔW in fp32 and cast back (the up/down matmul is
   precision-sensitive and CPU fp16 matmul is patchy).
+- **Unfuse by snapshot, not subtraction.** LoRAs stack; `remove_lora` /
+  `clear_loras` undo a fuse by restoring a pristine CPU snapshot taken on a
+  weight's first touch, then replaying the remaining stack — exact (bit-identical
+  in fp16), where add-then-subtract would drift. The snapshot is keyed by
+  `weight.data_ptr()` (`.data` returns a fresh object each access, so `id()` is
+  not stable; the storage pointer is, and the held weight ref keeps it alive), so
+  bigG's shared `in_proj_weight` is snapshotted once across its q/k/v keys. State
+  lives on the bundle as `_lora_state` (created lazily — no `ModelBundle` field).
+  Memory: one CPU copy per *touched* module (union across the stack, capped at
+  model size), bounded regardless of how many LoRAs you swap.
 - **Map keys by walking `named_modules()`, not by un-mangling.** kohya keys are
   the dotted module path with `.`→`_`, which is ambiguous to reverse (names
   contain underscores). Building `{mangled_name: module}` from the live module
@@ -287,7 +297,7 @@ src/diffucore/
   pipelines/     ✅ TextToImage / ImageToImage / Inpaint (SD1.5 + SDXL; eps + v-pred)
                  ✅ TextToImage (Anima, via _anima.anima_text_to_image dispatch)
   bundle.py      ✅ load_checkpoint (SD1.5 + SDXL) + load_anima_checkpoint (Anima)
-  lora.py        ✅ apply_lora: fuse LoRA/LoKr adapters (SD1.5 + SDXL + Anima)
+  lora.py        ✅ apply_lora / remove_lora / clear_loras: fuse + unfuse LoRA/LoKr (SD1.5 + SDXL + Anima)
 docs/
   ARCHITECTURE.md         design + rationale (incl. DiT seams)
   ROADMAP.md              milestones + status (M0–SX, DT0–DT7)
