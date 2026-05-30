@@ -135,8 +135,6 @@ def load_anima_checkpoint(
     vae_path: str,
     te_path: str,
     *,
-    qwen2_tokenizer_dir: str | None = None,
-    t5_tokenizer_dir: str | None = None,
     device: str = "cpu",
     dtype: torch.dtype = torch.float16,
     policy: DevicePolicy | None = None,
@@ -182,7 +180,7 @@ def load_anima_checkpoint(
     backbone.load_state_dict(sd_dit, strict=True)
     backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
-    tokenizer = AnimaTokenizer(qwen2_dir=qwen2_tokenizer_dir, t5_dir=t5_tokenizer_dir)
+    tokenizer = AnimaTokenizer()
 
     return ModelBundle(
         spec=spec,

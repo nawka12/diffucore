@@ -179,12 +179,12 @@ Learned while integrating Anima (the first DiT family — Cosmos-Predict2 / 2 B)
   per-channel `(latents_mean, latents_std)` rather than the scalar
   `latent_scale` SD uses. The VAE exposes `process_in` / `process_out`;
   the pipeline applies `process_out` after sampling, before decode.
-- **Tokenizer dep is still `transformers` for now.** `AnimaTokenizer` lazily
-  loads Qwen2.5 + T5 via `transformers.Qwen2Tokenizer.from_pretrained` /
-  `T5TokenizerFast.from_pretrained` from a ComfyUI-style directory.
-  Vendoring proper `tokenizer.json` files under `conditioning/` (matching
-  the existing `clip_tokenizer.json` pattern) to drop the runtime
-  `transformers` dep is the planned follow-up.
+- **Tokenizer is vendored — no runtime `transformers` dep.** `AnimaTokenizer`
+  loads `conditioning/qwen3_tokenizer.json` (Qwen3-0.6B, Apache-2.0) and
+  `conditioning/t5_tokenizer.json` (google-t5/t5-11b, Apache-2.0) via the
+  `tokenizers` library, matching the `clip_tokenizer.json` pattern. Both files
+  are bit-identical to the ComfyUI `qwen25_tokenizer/` + `t5_tokenizer/` dirs
+  they replace (parity test in `tests/test_anima_pipeline.py`).
 
 Learned while adding img2img / inpainting and v-prediction:
 
@@ -240,9 +240,10 @@ Learned while adding LoRA/LoKr (`lora.py`):
   `diffusion_model.<path>` + `lora_A`/`lora_B`; LyCORIS/kohya uses mangled
   `lora_unet_<path>` + `lokr_w1`/`lokr_w2`. The Anima target map registers the
   DiT under *both* so either file type maps.
-- **The Anima runtime tokenizer needs `transformers>=4.37`.** `Qwen2Tokenizer`
-  didn't exist in older releases; the pinned dev range (`>=4.44,<5`) covers it.
-  (Unrelated to LoRA, but surfaced while running the Anima LoRA end-to-end.)
+- **The Anima runtime tokenizer is vendored (no `transformers`).** It now loads
+  `tokenizer.json` files via the `tokenizers` library; `transformers` is only a
+  dev-time oracle (e.g. the vendored-tokenizer parity test). (Surfaced while
+  running the Anima LoRA end-to-end.)
 
 Learned while expanding the sampler / scheduler set (`samplers.py`, `schedules.py`):
 
@@ -281,7 +282,7 @@ src/diffucore/
   models/        ✅ clip_text, open_clip_text, vae, unet (SD1.5 + SDXL)
                  ✅ qwen_image_vae, qwen3_text, llm_adapter, anima_dit (Anima)
   conditioning/  ✅ CLIPTokenizer (+clip_tokenizer.json), Conditioner, SDXLConditioner,
-                   AnimaTokenizer (Qwen2.5 + T5; transformers-loaded, vendor pending)
+                   AnimaTokenizer (Qwen2.5 + T5; vendored tokenizer.json)
   runtime/       ✅ DevicePolicy + CPU offload + tiled VAE (R1–R4)
   pipelines/     ✅ TextToImage / ImageToImage / Inpaint (SD1.5 + SDXL; eps + v-pred)
                  ✅ TextToImage (Anima, via _anima.anima_text_to_image dispatch)

@@ -118,10 +118,10 @@ The remaining extensions (each its own slice):
     residual to fp32 inside `_forward` while keeping attention/MLP in
     compute_dtype, casting back to fp32 before each gated residual add
     (same shape as NVIDIA's reference). fp32 / CPU path unaffected.
-  - **Tokenizer** — `AnimaTokenizer` lazily loads Qwen2.5 + T5 tokenizers
-    via `transformers` from a vendored ComfyUI tokenizer directory.
-    Vendoring proper `tokenizer.json` files under `conditioning/` (to drop
-    the runtime `transformers` dep on the Anima path) is a follow-up.
+  - **Tokenizer** — `AnimaTokenizer` loads vendored `qwen3_tokenizer.json`
+    (Qwen3-0.6B, Apache-2.0) + `t5_tokenizer.json` (google-t5/t5-11b,
+    Apache-2.0) via the `tokenizers` library — no runtime `transformers` dep.
+    Both are bit-identical to the ComfyUI tokenizer dirs they replace.
   - **Verification posture** — DT3 (Qwen3) bit-matches `transformers`
     in fp32. ComfyUI can't be imported in our venv (missing private
     `comfy_aimdo` native dep), so DT4 (adapter) and DT5 (DiT) rely on

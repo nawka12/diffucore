@@ -7,3 +7,12 @@ Diffucore is an independent diffusion inference engine. It is not affiliated
 with, endorsed by, or derived from any other diffusion UI or framework. Model
 architectures and sampling algorithms are implemented from their original
 research publications.
+
+This product bundles tokenizer vocabularies, each under the Apache License 2.0:
+  - src/diffucore/conditioning/qwen3_tokenizer.json
+    Qwen3-0.6B tokenizer, Copyright Alibaba Cloud (Qwen Team).
+  - src/diffucore/conditioning/t5_tokenizer.json
+    google-t5/t5-11b tokenizer, Copyright Google LLC.
+
+The CLIP tokenizer (src/diffucore/conditioning/clip_tokenizer.json) is from
+OpenAI CLIP, under the MIT License.

@@ -40,10 +40,61 @@ def _require_files():
             pytest.skip(f"anima file missing: {p}")
 
 
+# --- Vendored tokenizer (no transformers, no model files needed) ---------------
+
+# Golden IDs frozen from the vendored tokenizer.json files; these were verified
+# bit-identical to transformers loading ComfyUI's qwen25_tokenizer/ + t5_tokenizer/.
+_GOLDEN_QWEN = [64, 8251, 11699, 389, 264, 5517]
+_GOLDEN_T5 = [3, 9, 1712, 3823, 30, 3, 9, 6928, 1]  # trailing 1 = T5 </s>
+
+
+def test_anima_tokenizer_golden_ids():
+    from diffucore.conditioning import AnimaTokenizer
+    out = AnimaTokenizer()("a cat sitting on a mat")
+    assert out.qwen_ids[0].tolist() == _GOLDEN_QWEN
+    assert out.qwen_mask[0].tolist() == [1] * len(_GOLDEN_QWEN)
+    assert out.t5_ids[0].tolist() == _GOLDEN_T5
+
+
+def test_anima_tokenizer_truncates_to_max_length():
+    from diffucore.conditioning import AnimaTokenizer
+    out = AnimaTokenizer()("word " * 1000, max_length=16)
+    assert out.qwen_ids.shape[1] <= 16
+    assert out.t5_ids.shape[1] <= 16
+
+
+@pytest.mark.parametrize(
+    "vendored,comfy_dir,cls,env",
+    [
+        ("qwen3_tokenizer.json", "qwen25_tokenizer", "Qwen2Tokenizer", "DIFFUCORE_QWEN2_TOKENIZER_DIR"),
+        ("t5_tokenizer.json", "t5_tokenizer", "T5TokenizerFast", "DIFFUCORE_T5_TOKENIZER_DIR"),
+    ],
+)
+def test_vendored_tokenizer_matches_transformers(vendored, comfy_dir, cls, env):
+    """Bit-identity of the vendored file against transformers loading the
+    upstream tokenizer. Skips unless transformers + a source dir are available."""
+    transformers = pytest.importorskip("transformers")
+    from tokenizers import Tokenizer
+    import diffucore.conditioning as cond
+
+    src = os.environ.get(
+        env,
+        f"/run/media/kayfa/a75ef841-da8c-45bc-9f54-ce6166f2c98a/comfy/ComfyUI/comfy/text_encoders/{comfy_dir}",
+    )
+    if not Path(src).exists():
+        pytest.skip(f"source tokenizer dir missing: {src}")
+
+    ref = getattr(transformers, cls).from_pretrained(src)
+    vend = Tokenizer.from_file(str(Path(cond.__file__).with_name(vendored)))
+    vend.enable_truncation(512)
+    for prompt in ["a cat sitting on a mat", "Café déjà vu 🤖 漢字", "", "word " * 600]:
+        expected = ref(prompt, padding=False, truncation=True, max_length=512)["input_ids"]
+        assert vend.encode(prompt).ids == expected, prompt[:30]
+
+
 @pytest.fixture(scope="module")
 def pipe():
     _require_files()
-    pytest.importorskip("transformers")  # tokenizer dep until vendoring lands
     from diffucore import TextToImage, load_anima_checkpoint
     cuda = torch.cuda.is_available()
     device = "cuda" if cuda else "cpu"

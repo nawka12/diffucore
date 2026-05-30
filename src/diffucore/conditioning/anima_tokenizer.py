@@ -6,39 +6,29 @@ separately consumes a T5-tokenized stream as its target IDs (which it embeds
 through its own 32128-row table) and cross-attends to the Qwen3 hidden states
 to produce the DiT's conditioning context.
 
-This module deliberately keeps a thin wrapping around the tokenizer files.
-For DT7 we load them via ``transformers`` from a directory that already exists
-on the user's disk (the ComfyUI install ships ``qwen25_tokenizer/`` and
-``t5_tokenizer/`` under ``comfy/text_encoders/``). Proper ``tokenizer.json``
-vendoring under ``conditioning/`` — to drop the runtime ``transformers``
-dependency on the Anima path — is a follow-up; the existing CLIP tokenizer
-under ``conditioning/clip_tokenizer.json`` is the template.
+Both tokenizers are vendored as ``tokenizer.json`` and driven through the
+``tokenizers`` library, exactly like the CLIP tokenizer under
+``conditioning/clip_tokenizer.json``. The Qwen vocab is Qwen3-0.6B's (Apache-2.0,
+the Qwen2 BPE shared across Qwen2.5/Qwen3); the T5 vocab is ``google-t5/t5-11b``'s
+(Apache-2.0), the same T5 Anima inherits from Cosmos-Predict2. Both vendored files
+are bit-identical to the ComfyUI ``qwen25_tokenizer/`` + ``t5_tokenizer/`` they
+replace (see ``tests/test_anima_pipeline.py``).
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import torch
+from tokenizers import Tokenizer
 
 # Anima's pad token in Qwen2.5 vocab (``<|endoftext|>``).
 QWEN_PAD_ID = 151643
 
-
-# Best-effort discovery so a user with ComfyUI in the default install location
-# doesn't have to wire paths through; explicit args always win.
-_COMFY_HINT = "/run/media/kayfa/a75ef841-da8c-45bc-9f54-ce6166f2c98a/comfy/ComfyUI/comfy/text_encoders"
-
-
-def _default_qwen_dir() -> str:
-    return os.environ.get("DIFFUCORE_QWEN2_TOKENIZER_DIR", f"{_COMFY_HINT}/qwen25_tokenizer")
-
-
-def _default_t5_dir() -> str:
-    return os.environ.get("DIFFUCORE_T5_TOKENIZER_DIR", f"{_COMFY_HINT}/t5_tokenizer")
+_QWEN_VOCAB = Path(__file__).with_name("qwen3_tokenizer.json")
+_T5_VOCAB = Path(__file__).with_name("t5_tokenizer.json")
 
 
 @dataclass
@@ -60,53 +50,30 @@ class AnimaTokenized:
 class AnimaTokenizer:
     """Lazy dual tokenizer for Anima.
 
-    Both directories must contain the files ``transformers`` expects for the
-    respective tokenizer class (``Qwen2Tokenizer`` and ``T5TokenizerFast``):
-    ``vocab.json`` + ``merges.txt`` + ``tokenizer_config.json`` for Qwen,
-    ``tokenizer.json`` (+ optional config) for T5.
-
-    No tokenizer is loaded until the first call — keeps construction cheap
-    and lets us fall back to env-driven paths only when needed.
+    Loads the two vendored ``tokenizer.json`` files on first call — keeps
+    construction cheap. ``qwen_path`` / ``t5_path`` override the vendored
+    defaults (mirrors :class:`CLIPTokenizer`'s ``vocab_path``).
     """
 
-    def __init__(self, qwen2_dir: Optional[str] = None, t5_dir: Optional[str] = None):
-        self.qwen2_dir = qwen2_dir or _default_qwen_dir()
-        self.t5_dir = t5_dir or _default_t5_dir()
+    def __init__(self, qwen_path: Optional[str] = None, t5_path: Optional[str] = None):
+        self.qwen_path = str(qwen_path or _QWEN_VOCAB)
+        self.t5_path = str(t5_path or _T5_VOCAB)
         self._qwen = None
         self._t5 = None
 
-    def _ensure_loaded(self):
+    def _ensure_loaded(self, max_length: int):
         if self._qwen is None or self._t5 is None:
-            try:
-                from transformers import Qwen2Tokenizer, T5TokenizerFast
-            except ImportError as e:
-                raise ImportError(
-                    "AnimaTokenizer currently uses transformers to load the Qwen2.5 "
-                    "and T5 tokenizers. Install with `pip install transformers` or "
-                    "wait for the planned vendored-tokenizer.json follow-up."
-                ) from e
-            for d in (self.qwen2_dir, self.t5_dir):
-                if not Path(d).exists():
-                    raise FileNotFoundError(
-                        f"tokenizer directory not found: {d!r}. Set "
-                        "DIFFUCORE_QWEN2_TOKENIZER_DIR / DIFFUCORE_T5_TOKENIZER_DIR "
-                        "or pass paths to AnimaTokenizer(...)."
-                    )
-            self._qwen = Qwen2Tokenizer.from_pretrained(self.qwen2_dir)
-            self._t5 = T5TokenizerFast.from_pretrained(self.t5_dir)
+            self._qwen = Tokenizer.from_file(self.qwen_path)
+            self._t5 = Tokenizer.from_file(self.t5_path)
+        self._qwen.enable_truncation(max_length)
+        self._t5.enable_truncation(max_length)
 
     def __call__(self, prompt: str, max_length: int = 512) -> AnimaTokenized:
-        self._ensure_loaded()
-        q = self._qwen(
-            prompt, return_tensors="pt",
-            padding=False, truncation=True, max_length=max_length,
-        )
-        t = self._t5(
-            prompt, return_tensors="pt",
-            padding=False, truncation=True, max_length=max_length,
-        )
+        self._ensure_loaded(max_length)
+        q = self._qwen.encode(prompt)
+        t = self._t5.encode(prompt)
         return AnimaTokenized(
-            qwen_ids=q["input_ids"].to(torch.long),
-            qwen_mask=q["attention_mask"].to(torch.long),
-            t5_ids=t["input_ids"].to(torch.long),
+            qwen_ids=torch.tensor([q.ids], dtype=torch.long),
+            qwen_mask=torch.tensor([q.attention_mask], dtype=torch.long),
+            t5_ids=torch.tensor([t.ids], dtype=torch.long),
         )
