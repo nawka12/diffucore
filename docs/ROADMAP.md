@@ -46,11 +46,13 @@ verified on the RTX 2060 (12 GB).
 ## After SDXL
 
 The remaining extensions (each its own slice): img2img / inpainting (alternate
-initial latents + masks), VRAM management for SDXL on smaller cards (sequential
-CPU offload + tiled VAE — currently 1024² SDXL peaks at ~10.7 GB, with the VAE
-decode as the worst spike; **planned and specced in
-[`RUNTIME_SPEC.md`](RUNTIME_SPEC.md), not yet built**), and a first DiT-style
-architecture to validate the §8 extensibility seams.
+initial latents + masks); **VRAM management for SDXL on smaller cards — R1–R3
+done** (sequential CPU offload + tiled VAE, specced in
+[`RUNTIME_SPEC.md`](RUNTIME_SPEC.md)): verified on the RTX 2060 against
+`AkashicPulse-v3.0` (SDXL, 1024²) — offload byte-identical to all-resident,
+tiled-VAE PSNR 37.55 dB, peak VRAM 9.97 GB → 6.6 GB; R4 (encoders-only offload,
+8 GB cap) still open. And a first DiT-style architecture to validate the §8
+extensibility seams.
 
 ## Verification notes
 

@@ -8,6 +8,7 @@ relies on are done and tested; only the model forwards remain. See
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,6 +16,7 @@ from PIL import Image
 
 from ..conditioning import Conditioner, SDXLConditioner
 from ..models.unet import timestep_embedding
+from ..runtime import DevicePolicy, on_device, tiled_vae_decode
 from ..sampling import (
     CFGDenoiser,
     EpsScaling,
@@ -33,6 +35,20 @@ _SCHEDULERS = {
     "exponential": exponential_schedule,
     "polyexponential": polyexponential_schedule,
 }
+
+
+@contextmanager
+def _staged(modules, device, offload):
+    """Bring ``modules`` onto ``device`` for the duration when ``offload`` is on,
+    parking them back on CPU afterward. A no-op when offload is off (modules are
+    already resident — never touch them)."""
+    if not offload:
+        yield
+        return
+    with ExitStack() as stack:
+        for module in modules:
+            stack.enter_context(on_device(module, device))
+        yield
 
 
 class TextToImage:
@@ -55,8 +71,8 @@ class TextToImage:
         """Return a ``PIL.Image`` for ``prompt``. ``width``/``height`` default to
         the model's native resolution (512 for SD1.5, 1024 for SDXL)."""
         model = self.model
-        param = next(model.backbone.parameters())
-        device, compute_dtype = param.device, param.dtype
+        policy = model.policy or self._fallback_policy(model)
+        device, compute_dtype = policy.device, policy.compute_dtype
         if width is None:
             width = model.spec.image_size
         if height is None:
@@ -65,7 +81,8 @@ class TextToImage:
         scaling = EpsScaling()
         denoiser = ModelDenoiser(model.backbone, scaling, model.schedule)
 
-        cond, uncond = self._conditioning(prompt, negative_prompt, width, height, device)
+        with _staged(self._text_modules(model), device, policy.offload):
+            cond, uncond = self._conditioning(prompt, negative_prompt, width, height, device)
         cfg = CFGDenoiser(denoiser, cond, uncond, scale=cfg_scale)
 
         try:
@@ -88,14 +105,37 @@ class TextToImage:
             generator=generator, device=device, dtype=compute_dtype,
         ) * sigmas[0]
 
-        vae_dtype = next(model.vae.parameters()).dtype
         with torch.no_grad():
-            x0 = get_sampler(sampler)(cfg, x, sigmas)
-            image = model.vae.decode(x0.to(vae_dtype))
+            with _staged([model.backbone], device, policy.offload):
+                x0 = get_sampler(sampler)(cfg, x, sigmas)
+            latent = x0.to(policy.vae_dtype)
+            tile = policy.vae_tile or max(width, height) >= policy.vae_tile_threshold
+            with _staged([model.vae], device, policy.offload):
+                image = tiled_vae_decode(model.vae, latent) if tile else model.vae.decode(latent)
 
         image = ((image.clamp(-1, 1) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
         array = image[0].permute(1, 2, 0).cpu().numpy()
         return Image.fromarray(array)
+
+    @staticmethod
+    def _text_modules(model):
+        """The text encoder(s) resident during the conditioning stage."""
+        mods = [model.text_encoder]
+        if model.text_encoder_2 is not None:
+            mods.append(model.text_encoder_2)
+        return mods
+
+    @staticmethod
+    def _fallback_policy(model):
+        """Policy for a bundle built without one (e.g. direct construction):
+        read current placement off the modules, offload/tiling off."""
+        backbone_param = next(model.backbone.parameters())
+        vae_param = next(model.vae.parameters())
+        return DevicePolicy(
+            device=backbone_param.device,
+            compute_dtype=backbone_param.dtype,
+            vae_dtype=vae_param.dtype,
+        )
 
     def _conditioning(self, prompt, negative_prompt, width, height, device):
         """Build the cond/uncond kwarg dicts forwarded to the backbone. SDXL adds

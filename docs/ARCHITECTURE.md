@@ -60,13 +60,13 @@ src/diffucore/
     vae.py               AutoencoderKL encode/decode.
   conditioning/          tokenizer(s) + text-encoder orchestration (incl. SDXL dual).
   loading/               safetensors IO, arch detection.
-  runtime/               device/dtype selection (offload, tiling: planned).
+  runtime/               device/dtype policy + CPU offload + tiled VAE decode.
   pipelines/             TextToImage — user-facing glue.
 ```
 
-The full SD1.5 (512²) and SDXL (1024²) text-to-image paths are implemented.
-`runtime/` offload + tiled VAE remain the main planned items (not needed for
-512² SD1.5 on 12 GB; would let SDXL run on smaller cards); see `ROADMAP.md`.
+The full SD1.5 (512²) and SDXL (1024²) text-to-image paths are implemented, as
+are `runtime/` sequential CPU offload and tiled VAE decode (opt-in; they let
+SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
 
 ## 4. Core abstractions
 
@@ -137,11 +137,13 @@ Targeting a 12 GB RTX 2060 shapes the defaults:
 - A single device/dtype policy object in `runtime/` decides placement; modules
   never hardcode `.cuda()`.
 
-Today placement is "everything resident": `load_checkpoint` eagerly moves all
-modules to the device, and offload/tiling are unimplemented (`DevicePolicy.offload`
-is a flag nothing reads). The plan to realize this strategy — with measured VRAM
-numbers, the design, integration points, and a verification plan — is the build
-sheet [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md).
+By default placement is "everything resident": `load_checkpoint` eagerly moves
+all modules to the device. Opting into `DevicePolicy(offload=True)` instead loads
+the modules on CPU and the pipeline shuttles each onto the GPU around its stage
+(`on_device`), and `tiled_vae_decode` bounds decode memory by tiling (auto ≥768 px).
+On the RTX 2060 this takes 1024² SDXL from a 9.97 GB resident/untiled peak down to
+6.6 GB, byte-identically. The measured breakdown, design, and verification are in
+the build sheet [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md).
 
 ## 8. Extensibility
 

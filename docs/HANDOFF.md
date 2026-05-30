@@ -134,14 +134,14 @@ src/diffucore/
   loading/       ✅ state_dict (safetensors), detect (ModelSpec)       (DONE, tested)
   models/        ✅ clip_text, open_clip_text, vae, unet               (M4–M6 + SDXL, verified)
   conditioning/  ✅ CLIPTokenizer (+clip_tokenizer.json), Conditioner, SDXLConditioner
-  runtime/       ⏳ DevicePolicy (auto() works; offload/tiling TODO)
+  runtime/       ✅ DevicePolicy + CPU offload (on_device) + tiled VAE (R1–R3)
   pipelines/     ✅ TextToImage (SD1.5 + SDXL)                         (M7 + SDXL, verified)
   bundle.py      ✅ load_checkpoint (detect + build + strict load; SD1.5 + SDXL)
 docs/
   ARCHITECTURE.md         design + rationale
   ROADMAP.md              milestones + status
   IMPLEMENTATION_SPEC.md  ← the build sheet for M4–M7 (read this first)
-  RUNTIME_SPEC.md         build sheet for the next slice: VRAM offload + tiled VAE
+  RUNTIME_SPEC.md         VRAM offload + tiled VAE (R1–R3 done; R4 open)
   HANDOFF.md              this file
 tests/                    CPU suite + opt-in pipeline smoke (SD1.5 + SDXL)
 ```

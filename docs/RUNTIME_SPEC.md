@@ -1,10 +1,14 @@
 # Runtime / VRAM Spec — sequential offload + tiled VAE
 
-> **Status: planned, not implemented.** This is the build sheet for the `runtime/`
-> work. It is written to be picked up cold: the problem is measured, the design is
-> concrete, and each step has a verification. Nothing here is built yet —
-> `runtime/DevicePolicy` exists as a skeleton (an `offload` flag that nothing
-> reads). Implement on the RTX 2060 and verify per the plan at the bottom.
+> **Status: R1–R3 implemented and verified on the RTX 2060.** `DevicePolicy` now
+> plumbs through `load_checkpoint` → `ModelBundle` → `TextToImage` (R1);
+> `tiled_vae_decode` is built and auto-triggers ≥768 px (R2); sequential CPU
+> offload (`offload=True`, via the `on_device` ctx manager) is built (R3).
+> Verified against `AkashicPulse-v3.0` (SDXL) at 1024²: offload is **byte-identical**
+> to all-resident; tiled vs untiled decode is **PSNR 37.55 dB**; peak VRAM drops
+> from **9.97 GB (resident, untiled) → 6.6 GB (offload + tiled)**. The ~6 GB
+> stretch target needs R4 (encoders-only offload) or attention slicing — both
+> out of scope here. The design notes below are kept as the build record.
 
 ## Why this exists
 
@@ -232,12 +236,12 @@ A natural home for 1–4 is an opt-in test (skipped without a checkpoint, like
 
 Each is independently shippable and verifiable; do them in order.
 
-| # | Slice | Verify |
-|---|---|---|
-| R1 | Plumb `DevicePolicy` through bundle + pipeline (no behavior change; offload still off) | All tests green; SD1.5 + SDXL images byte-identical to today |
-| R2 | Tiled VAE decode (auto at ≥768 px) | Tiled vs untiled PSNR > 35 dB; SDXL decode peak drops; seed-deterministic |
-| R3 | Sequential CPU offload (`offload=True`) | offload vs no-offload **byte-identical**; SDXL peak ≤ ~6 GB |
-| R4 | (optional) `offload="encoders"` cheap mode + 8 GB emulation test | 1024² SDXL completes under an 8 GB cap |
+| # | Slice | Verify | Status |
+|---|---|---|---|
+| R1 | Plumb `DevicePolicy` through bundle + pipeline (no behavior change; offload still off) | All tests green; SD1.5 + SDXL images byte-identical to today | ✅ |
+| R2 | Tiled VAE decode (auto at ≥768 px) | Tiled vs untiled PSNR > 35 dB; SDXL decode peak drops; seed-deterministic | ✅ PSNR 37.55 dB |
+| R3 | Sequential CPU offload (`offload=True`) | offload vs no-offload **byte-identical**; SDXL peak ≤ ~6 GB | ✅ byte-identical; peak 6.6 GB (UNet-floor bound) |
+| R4 | (optional) `offload="encoders"` cheap mode + 8 GB emulation test | 1024² SDXL completes under an 8 GB cap | ☐ open |
 
 ## Pointers
 

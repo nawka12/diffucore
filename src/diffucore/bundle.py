@@ -15,6 +15,7 @@ from .conditioning import CLIPTokenizer
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header
 from .models import AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig
 from .models.unet import sdxl_unet_config
+from .runtime import DevicePolicy
 from .sampling import DiscreteSchedule, make_betas
 
 # On-disk prefixes (minus the top-level architecture prefix). SDXL keeps CLIP-L
@@ -43,28 +44,46 @@ class ModelBundle:
     backbone: object                # models.UNetModel
     vae: object                     # models.AutoencoderKL
     text_encoder_2: object = None   # SDXL only: OpenCLIPTextEncoder (bigG)
+    policy: DevicePolicy = None      # placement authority; None -> all-resident
 
 
-def load_checkpoint(path: str, device: str = "cpu", dtype: torch.dtype = torch.float16) -> ModelBundle:
+def load_checkpoint(
+    path: str,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float16,
+    policy: DevicePolicy | None = None,
+) -> ModelBundle:
     """Detect, build, and weight-load a checkpoint into a :class:`ModelBundle`.
 
     Supports SD1.5 and SDXL. Text encoder(s) and UNet run in ``dtype`` (fp16 on
     CUDA); the VAE stays fp32 (fp16 decode produces artifacts/NaNs).
+
+    ``policy`` is the single placement authority. When omitted, one is built from
+    ``device``/``dtype`` with offload off (current all-resident behavior). When
+    ``policy.offload`` is set, modules are left on CPU; the pipeline shuttles each
+    onto the GPU around its stage. The sigma schedule always lives on the compute
+    device — it is never offloaded.
     """
+    if policy is None:
+        policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
+
     spec = detect_architecture(read_header(path))
     if spec.architecture not in ("sd15", "sdxl"):
         raise NotImplementedError(f"unsupported architecture {spec.architecture!r}")
 
     # The training schedule is fully determined by the spec; keep its sigma table
-    # (fp32) on `device` so sigma<->t stays on the same device as the latents.
+    # (fp32) on the compute device so sigma<->t stays with the latents.
     schedule = DiscreteSchedule(make_betas(spec.beta_schedule, spec.num_train_timesteps))
-    schedule.sigmas = schedule.sigmas.to(device)
-    schedule.log_sigmas = schedule.log_sigmas.to(device)
+    schedule.sigmas = schedule.sigmas.to(policy.device)
+    schedule.log_sigmas = schedule.log_sigmas.to(policy.device)
 
     state_dict = load_state_dict(path, device="cpu")
 
+    # With offload, modules wait on CPU and the pipeline moves them per stage.
+    target = policy.offload_device if policy.offload else policy.device
+
     vae = _load_sub(AutoencoderKL(VAEConfig(scale_factor=spec.latent_scale)), state_dict, _VAE_PREFIX)
-    vae = vae.to(device, torch.float32).eval()
+    vae = vae.to(target, policy.vae_dtype).eval()
 
     text_encoder_2 = None
     if spec.architecture == "sd15":
@@ -73,11 +92,11 @@ def load_checkpoint(path: str, device: str = "cpu", dtype: torch.dtype = torch.f
     else:  # sdxl
         text_encoder = _load_sub(CLIPTextEncoder(), state_dict, _SDXL_CLIP_L)
         text_encoder_2 = _load_sub(OpenCLIPTextEncoder(), state_dict, _SDXL_CLIP_G)
-        text_encoder_2 = text_encoder_2.to(device, dtype).eval()
+        text_encoder_2 = text_encoder_2.to(target, policy.compute_dtype).eval()
         backbone = _load_sub(UNetModel(sdxl_unet_config()), state_dict, _UNET_PREFIX)
 
-    text_encoder = text_encoder.to(device, dtype).eval()
-    backbone = backbone.to(device, dtype).eval()
+    text_encoder = text_encoder.to(target, policy.compute_dtype).eval()
+    backbone = backbone.to(target, policy.compute_dtype).eval()
 
     return ModelBundle(
         spec=spec,
@@ -87,6 +106,7 @@ def load_checkpoint(path: str, device: str = "cpu", dtype: torch.dtype = torch.f
         backbone=backbone,
         vae=vae,
         text_encoder_2=text_encoder_2,
+        policy=policy,
     )
 
 

@@ -46,7 +46,9 @@ one thing — diffusion inference — and is easy to embed behind a custom UI.
 
 The first targets are **Stable Diffusion 1.5** and **SDXL** text-to-image. CPU is
 supported for testing; real generation targets CUDA (developed against an RTX
-2060 12 GB — SDXL at 1024² needs ~11 GB resident).
+2060 12 GB). SDXL at 1024² needs ~10 GB resident, or ~6.6 GB with the opt-in
+`DevicePolicy(offload=True)` sequential CPU offload + tiled VAE decode (see
+[`docs/RUNTIME_SPEC.md`](docs/RUNTIME_SPEC.md)).
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
