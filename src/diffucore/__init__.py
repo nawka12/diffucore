@@ -9,10 +9,12 @@ see ``docs/IMPLEMENTATION_SPEC.md`` and ``docs/HANDOFF.md``.
 __version__ = "0.0.1"
 
 from .bundle import ModelBundle, load_anima_checkpoint, load_checkpoint
+from .lora import LoraReport, apply_lora
 from .pipelines import ImageToImage, Inpaint, TextToImage
 
 __all__ = [
     "__version__", "ModelBundle",
     "load_checkpoint", "load_anima_checkpoint",
+    "apply_lora", "LoraReport",
     "ImageToImage", "Inpaint", "TextToImage",
 ]

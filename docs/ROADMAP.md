@@ -125,6 +125,21 @@ The remaining extensions (each its own slice):
     `comfy_aimdo` native dep), so DT4 (adapter) and DT5 (DiT) rely on
     strict-load + behavioral tests; correctness is confirmed end-to-end at
     DT7 by visual inspection vs the same prompt/seed in ComfyUI.
+- **LoRA / LoKr application — done.** `apply_lora(bundle, path, multiplier)`
+  fuses adapter weight deltas into the loaded modules in place (no forward
+  wrapping, so offload and the sampling path are untouched). Covers two
+  factorizations — **LoRA** (`ΔW = (alpha/rank)·up@down`) and **LoKr**
+  (`ΔW = kron(w1, w2)`, full matrices or low-rank `a@b` factors with
+  ComfyUI-matching `alpha/dim` scaling) — and three naming families:
+  kohya/A1111 (`lora_unet_`/`lora_te_`/`lora_te1_`/`lora_te2_`, mangled paths),
+  PEFT `lora_A`/`lora_B`, and Anima's `diffusion_model.`-dotted form. bigG's
+  fused `in_proj_weight` is the one special case (split q/k/v deltas land in
+  row-slices). Verified on the RTX 2060 against real files: SDXL LoKr
+  (1052/1052 modules), Anima LoRA (448/448) and Anima LoKr (280/280) — all
+  0 unmatched, coherent output, fused ΔW matching an independent reference to
+  fp16 precision. CPU unit tests run on tiny real-structure models
+  (`tests/test_lora.py`). Diffusers-format SD LoRAs and the LoHa variant are
+  not supported (their keys are reported in `LoraReport.unmatched`).
 
 ## Verification notes
 

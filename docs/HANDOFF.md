@@ -218,6 +218,32 @@ Learned while adding img2img / inpainting and v-prediction:
   unchanged but ZTSNR's huge σ no longer overflows. (This is the concrete bite of
   the "σ math stays fp32" rule — it had been latent because normal σ_max≈14.6.)
 
+Learned while adding LoRA/LoKr (`lora.py`):
+
+- **Fuse, don't wrap.** `apply_lora` adds the adapter's ΔW straight into the
+  module weights. Since the engine already moves *modules* around for offload,
+  the fused weights travel with them for free — no forward hooks, no change to
+  the sampling loop. Compute ΔW in fp32 and cast back (the up/down matmul is
+  precision-sensitive and CPU fp16 matmul is patchy).
+- **Map keys by walking `named_modules()`, not by un-mangling.** kohya keys are
+  the dotted module path with `.`→`_`, which is ambiguous to reverse (names
+  contain underscores). Building `{mangled_name: module}` from the live module
+  tree sidesteps it entirely.
+- **bigG is the SD special case.** SDXL `te2` kohya keys are split q/k/v, but our
+  OpenCLIP stores a fused `in_proj_weight`; the q/k/v deltas are added to its
+  row-slices. (Algo-agnostic — works for LoRA and LoKr alike.)
+- **LoKr full-matrix scale is 1.** `ΔW = kron(w1, w2)`. The `alpha/dim` scaling
+  only applies when a low-rank `_b` factor supplies `dim` (matching ComfyUI);
+  full `lokr_w1`/`lokr_w2` fuse unscaled. Conv layers carry the kernel in `w2`
+  (4-D), so lift `w1` to 4-D before the Kronecker product.
+- **Anima ships LoRAs in two conventions.** Native ComfyUI/musubi uses dotted
+  `diffusion_model.<path>` + `lora_A`/`lora_B`; LyCORIS/kohya uses mangled
+  `lora_unet_<path>` + `lokr_w1`/`lokr_w2`. The Anima target map registers the
+  DiT under *both* so either file type maps.
+- **The Anima runtime tokenizer needs `transformers>=4.37`.** `Qwen2Tokenizer`
+  didn't exist in older releases; the pinned dev range (`>=4.44,<5`) covers it.
+  (Unrelated to LoRA, but surfaced while running the Anima LoRA end-to-end.)
+
 ## Project map
 
 ```
@@ -233,6 +259,7 @@ src/diffucore/
   pipelines/     ✅ TextToImage / ImageToImage / Inpaint (SD1.5 + SDXL; eps + v-pred)
                  ✅ TextToImage (Anima, via _anima.anima_text_to_image dispatch)
   bundle.py      ✅ load_checkpoint (SD1.5 + SDXL) + load_anima_checkpoint (Anima)
+  lora.py        ✅ apply_lora: fuse LoRA/LoKr adapters (SD1.5 + SDXL + Anima)
 docs/
   ARCHITECTURE.md         design + rationale (incl. DiT seams)
   ROADMAP.md              milestones + status (M0–SX, DT0–DT7)
