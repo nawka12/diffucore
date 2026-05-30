@@ -241,7 +241,22 @@ Each is independently shippable and verifiable; do them in order.
 | R1 | Plumb `DevicePolicy` through bundle + pipeline (no behavior change; offload still off) | All tests green; SD1.5 + SDXL images byte-identical to today | ✅ |
 | R2 | Tiled VAE decode (auto at ≥768 px) | Tiled vs untiled PSNR > 35 dB; SDXL decode peak drops; seed-deterministic | ✅ PSNR 37.55 dB |
 | R3 | Sequential CPU offload (`offload=True`) | offload vs no-offload **byte-identical**; SDXL peak ≤ ~6 GB | ✅ byte-identical; peak 6.6 GB (UNet-floor bound) |
-| R4 | (optional) `offload="encoders"` cheap mode + 8 GB emulation test | 1024² SDXL completes under an 8 GB cap | ☐ open |
+| R4 | `offload="encoders"` cheap mode + 8 GB emulation test | 1024² SDXL completes under an 8 GB cap | ✅ byte-identical (both modes); fits 8 GB cap |
+
+**R4 notes.** `offload` now accepts `"encoders"` alongside `False`/`True` (`True`
+== `"full"`). `DevicePolicy` splits placement into two groups via `offload_idle`
+(text encoders + VAE — parked in every mode) and `offload_unet` (the ~5 GB UNet —
+parked only in full offload); `bundle.py` and the pipeline read those per stage.
+`"encoders"` keeps the UNet resident (saving the ~5 GB copy each image) and only
+shuttles the ~2 GB of encoders + VAE — 1024² peak ~7 GB (UNet resident + tiled
+decode), which clears the 8 GB cap. **Verified on the RTX 2060** against
+`AkashicPulse-v3.0`: `test_offload_is_byte_identical` (parametrized over `True`
+and `"encoders"`) — both byte-identical to resident; full-offload peak ≤ 7 GB;
+`test_encoders_offload_fits_8gb_cap` completes a 1024² generation under an 8 GB
+allocator cap (`set_per_process_memory_fraction`). Mode-flag + invalid-mode unit
+tests run on CPU. Each SDXL test loads **one** pipeline at a time and frees it
+(`del` + `gc` + `empty_cache`) before the next — holding two resident copies
+overflows the 12 GB card.
 
 ## Pointers
 

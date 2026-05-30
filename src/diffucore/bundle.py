@@ -79,11 +79,14 @@ def load_checkpoint(
 
     state_dict = load_state_dict(path, device="cpu")
 
-    # With offload, modules wait on CPU and the pipeline moves them per stage.
-    target = policy.offload_device if policy.offload else policy.device
+    # With offload, modules wait on CPU and the pipeline moves them per stage. The
+    # "idle" group (text encoders + VAE) offloads in every mode; the UNet only in
+    # full offload ("encoders" mode keeps it resident — see RUNTIME_SPEC.md R4).
+    idle_target = policy.offload_device if policy.offload_idle else policy.device
+    unet_target = policy.offload_device if policy.offload_unet else policy.device
 
     vae = _load_sub(AutoencoderKL(VAEConfig(scale_factor=spec.latent_scale)), state_dict, _VAE_PREFIX)
-    vae = vae.to(target, policy.vae_dtype).eval()
+    vae = vae.to(idle_target, policy.vae_dtype).eval()
 
     text_encoder_2 = None
     if spec.architecture == "sd15":
@@ -92,11 +95,11 @@ def load_checkpoint(
     else:  # sdxl
         text_encoder = _load_sub(CLIPTextEncoder(), state_dict, _SDXL_CLIP_L)
         text_encoder_2 = _load_sub(OpenCLIPTextEncoder(), state_dict, _SDXL_CLIP_G)
-        text_encoder_2 = text_encoder_2.to(target, policy.compute_dtype).eval()
+        text_encoder_2 = text_encoder_2.to(idle_target, policy.compute_dtype).eval()
         backbone = _load_sub(UNetModel(sdxl_unet_config()), state_dict, _UNET_PREFIX)
 
-    text_encoder = text_encoder.to(target, policy.compute_dtype).eval()
-    backbone = backbone.to(target, policy.compute_dtype).eval()
+    text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+    backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
     return ModelBundle(
         spec=spec,

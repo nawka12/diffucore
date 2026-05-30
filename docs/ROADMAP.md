@@ -45,14 +45,22 @@ verified on the RTX 2060 (12 GB).
 
 ## After SDXL
 
-The remaining extensions (each its own slice): img2img / inpainting (alternate
-initial latents + masks); **VRAM management for SDXL on smaller cards — R1–R3
-done** (sequential CPU offload + tiled VAE, specced in
-[`RUNTIME_SPEC.md`](RUNTIME_SPEC.md)): verified on the RTX 2060 against
-`AkashicPulse-v3.0` (SDXL, 1024²) — offload byte-identical to all-resident,
-tiled-VAE PSNR 37.55 dB, peak VRAM 9.97 GB → 6.6 GB; R4 (encoders-only offload,
-8 GB cap) still open. And a first DiT-style architecture to validate the §8
-extensibility seams.
+The remaining extensions (each its own slice):
+
+- **img2img (latent-init) — done.** `ImageToImage` encodes an init image, adds
+  noise at a `strength`-chosen point on the schedule, denoises the rest, and
+  decodes (reuses the shared pipeline base, so offload + tiled VAE apply). Verified
+  end-to-end on **SD1.5 and SDXL** (`AkashicPulse-v3.0` on the RTX 2060): RGB
+  output, seed-reproducible, strength changes the result. Inpainting (masks) is
+  the next slice — it needs a per-step masked-blend hook the current sampler
+  signature doesn't expose.
+- **VRAM management for SDXL on smaller cards — R1–R4 done.** Sequential CPU
+  offload + tiled VAE, specced in [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md). Verified on
+  the RTX 2060 against `AkashicPulse-v3.0` (SDXL, 1024²): R1–R3 — offload
+  byte-identical to all-resident, tiled-VAE PSNR 37.55 dB, peak VRAM 9.97 GB →
+  6.6 GB; R4 — `offload="encoders"` cheap mode (UNet stays resident) is also
+  byte-identical, and a 1024² generation completes under an emulated 8 GB cap.
+- A first DiT-style architecture to validate the §8 extensibility seams.
 
 ## Verification notes
 

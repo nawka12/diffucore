@@ -24,18 +24,45 @@ class DevicePolicy:
     sigma math. ``offload`` moves idle submodules to CPU RAM between stages;
     ``vae_tile`` decodes the VAE in tiles (also auto-triggered above
     ``vae_tile_threshold`` px). All knobs default off → unchanged behavior.
+
+    ``offload`` modes:
+      * ``False`` — everything resident (no offload).
+      * ``True`` / ``"full"`` — shuttle every weight-heavy module (encoders, UNet,
+        VAE) on/off the GPU around its stage. Lowest peak (~UNet stage), at the
+        cost of moving the 5 GB UNet each image.
+      * ``"encoders"`` — keep the UNet resident; only park the ~2 GB of text
+        encoders + VAE between stages. Frees most of the headroom for ~0 copy cost
+        (the cheap 80/20 — see ``docs/RUNTIME_SPEC.md`` R4).
     """
 
     device: torch.device
     compute_dtype: torch.dtype = torch.float16
     vae_dtype: torch.dtype = torch.float32
-    offload: bool = False
+    offload: bool | str = False
     vae_tile: bool = False
     vae_tile_threshold: int = 768
+
+    def __post_init__(self):
+        if self.offload not in (False, True, "full", "encoders"):
+            raise ValueError(
+                f"offload must be False, True/'full', or 'encoders'; got {self.offload!r}"
+            )
 
     @property
     def offload_device(self) -> torch.device:
         return _CPU
+
+    @property
+    def offload_idle(self) -> bool:
+        """Park the text encoders + VAE on CPU between stages. On in every offload
+        mode (``True``/``"full"`` and ``"encoders"``)."""
+        return self.offload is not False
+
+    @property
+    def offload_unet(self) -> bool:
+        """Also shuttle the UNet (the ~5 GB module) per image — full offload only.
+        ``"encoders"`` keeps it resident; the copy each way isn't worth the ~2 GB."""
+        return self.offload is True or self.offload == "full"
 
     @classmethod
     def auto(cls) -> "DevicePolicy":
