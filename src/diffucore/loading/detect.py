@@ -28,13 +28,14 @@ Shape = Sequence[int]
 class ModelSpec:
     """Everything the engine needs to know about a checkpoint before building it."""
 
-    architecture: str          # e.g. "sd15"
+    architecture: str          # e.g. "sd15", "sdxl"
     prediction: str            # "eps" | "v"
     latent_channels: int       # VAE latent channel count
     context_dim: int           # text-encoder hidden size seen by cross-attention
     image_size: int = 512      # native training resolution
     num_train_timesteps: int = 1000
     beta_schedule: str = "scaled_linear"
+    latent_scale: float = 0.18215   # VAE latent scale factor (SDXL uses 0.13025)
 
 
 def _context_dim(shapes: Mapping[str, Shape]) -> int | None:
@@ -64,9 +65,20 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
             latent_channels=4,
             context_dim=768,
             image_size=512,
+            latent_scale=0.18215,
+        )
+
+    if context_dim == 2048:
+        return ModelSpec(
+            architecture="sdxl",
+            prediction="eps",
+            latent_channels=4,
+            context_dim=2048,
+            image_size=1024,
+            latent_scale=0.13025,
         )
 
     raise NotImplementedError(
         f"recognized a diffusion checkpoint with context_dim={context_dim}, but only "
-        "SD1.5 (context_dim=768) is implemented so far"
+        "SD1.5 (768) and SDXL (2048) are implemented so far"
     )

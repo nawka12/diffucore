@@ -33,9 +33,21 @@ def test_detect_no_context_dim_raises():
         detect_architecture({"model.diffusion_model.input_blocks.0.0.weight": (320, 4, 3, 3)})
 
 
-def test_detect_unsupported_family_raises():
+def test_detect_sdxl():
     shapes = dict(sd15_shapes())
     shapes["model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight"] = (640, 2048)
+    spec = detect_architecture(shapes)
+    assert spec.architecture == "sdxl"
+    assert spec.prediction == "eps"
+    assert spec.context_dim == 2048
+    assert spec.image_size == 1024
+    assert spec.latent_scale == 0.13025
+
+
+def test_detect_unsupported_family_raises():
+    # SD2.x (context_dim 1024, OpenCLIP ViT-H) is recognized but not implemented.
+    shapes = dict(sd15_shapes())
+    shapes["model.diffusion_model.input_blocks.1.1.transformer_blocks.0.attn2.to_k.weight"] = (640, 1024)
     with pytest.raises(NotImplementedError):
         detect_architecture(shapes)
 
