@@ -141,21 +141,24 @@ def anima_text_to_image(
     backbone = model.backbone
     with torch.no_grad(), _staged([backbone], device, policy.offload_unet):
         if sampler == "euler":
-            for i in range(len(sigmas) - 1):
-                sigma, sigma_next = sigmas[i], sigmas[i + 1]
-                x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
-                t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
+            total = len(sigmas) - 1
+            with _step_progress(total) as on_step:
+                for i in range(total):
+                    sigma, sigma_next = sigmas[i], sigmas[i + 1]
+                    x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
+                    t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
-                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
-                if cfg_scale == 1.0:
-                    v = v_cond
-                else:
-                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
-                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                    v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                    if cfg_scale == 1.0:
+                        v = v_cond
+                    else:
+                        v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                        v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
-                # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
-                # (closed-form exact for any constant x0 estimate).
-                x = x + (sigma_next - sigma).to(dtype) * v
+                    # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
+                    # (closed-form exact for any constant x0 estimate).
+                    x = x + (sigma_next - sigma).to(dtype) * v
+                    on_step(i, sigma, x, None)
         else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
             def denoise(x_in, sigma_b):
                 """``model(x, σ) -> x0``: predict velocity (with CFG), return the
