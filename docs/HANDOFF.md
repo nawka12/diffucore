@@ -141,6 +141,7 @@ docs/
   ARCHITECTURE.md         design + rationale
   ROADMAP.md              milestones + status
   IMPLEMENTATION_SPEC.md  ← the build sheet for M4–M7 (read this first)
+  RUNTIME_SPEC.md         build sheet for the next slice: VRAM offload + tiled VAE
   HANDOFF.md              this file
 tests/                    CPU suite + opt-in pipeline smoke (SD1.5 + SDXL)
 ```

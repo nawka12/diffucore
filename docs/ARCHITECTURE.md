@@ -137,6 +137,12 @@ Targeting a 12 GB RTX 2060 shapes the defaults:
 - A single device/dtype policy object in `runtime/` decides placement; modules
   never hardcode `.cuda()`.
 
+Today placement is "everything resident": `load_checkpoint` eagerly moves all
+modules to the device, and offload/tiling are unimplemented (`DevicePolicy.offload`
+is a flag nothing reads). The plan to realize this strategy — with measured VRAM
+numbers, the design, integration points, and a verification plan — is the build
+sheet [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md).
+
 ## 8. Extensibility
 
 New work plugs in at the seams, without touching the loop:
