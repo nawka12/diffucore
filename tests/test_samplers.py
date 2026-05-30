@@ -57,6 +57,45 @@ def test_euler_ancestral_ends_at_clean_sample():
     assert torch.isfinite(out).all()
 
 
+def test_er_sde_ve_ends_at_clean_sample():
+    # Multi-stage stochastic solver, but σ_next == 0 on the final step lands on
+    # the constant prediction.
+    target = torch.zeros(1, 3, 4, 4)
+    sigmas = S.karras_schedule(20, 0.03, 14.6)
+    x_init = torch.randn(1, 3, 4, 4) * sigmas[0]
+    g = torch.Generator().manual_seed(0)
+    out = K.sample_er_sde(const_denoiser(target), x_init, sigmas, generator=g, model_type="ve")
+    assert torch.allclose(out, target, atol=1e-4)
+    assert torch.isfinite(out).all()
+
+
+def test_er_sde_flow_is_finite_and_ends_clean():
+    # Flow mode offsets the first sigma off 1.0 (alpha would be 0 there); the
+    # whole trajectory must stay finite and still land on the prediction.
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    assert sigmas[0].item() == 1.0
+    x_init = torch.randn(1, 16, 4, 4)
+    g = torch.Generator().manual_seed(0)
+    out = K.sample_er_sde(
+        const_denoiser(target), x_init, sigmas,
+        generator=g, model_type="flow", shift=3.0,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_er_sde_seed_reproducible():
+    target = torch.zeros(1, 3, 4, 4)
+    sigmas = S.karras_schedule(10, 0.03, 14.6)
+    x_init = torch.randn(1, 3, 4, 4) * sigmas[0]
+    a = K.sample_er_sde(const_denoiser(target), x_init.clone(), sigmas,
+                        generator=torch.Generator().manual_seed(7), model_type="ve")
+    b = K.sample_er_sde(const_denoiser(target), x_init.clone(), sigmas,
+                        generator=torch.Generator().manual_seed(7), model_type="ve")
+    assert torch.equal(a, b)
+
+
 def test_ancestral_step_eta_zero_is_deterministic():
     sigma_from = torch.tensor(5.0)
     sigma_to = torch.tensor(2.0)

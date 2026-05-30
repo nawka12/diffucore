@@ -26,7 +26,21 @@ import torch
 from PIL import Image
 
 from ..runtime import on_device
-from ..sampling import flow_matching_schedule
+from ..sampling import (
+    FlowSamplingView,
+    flow_matching_schedule,
+    get_sampler,
+    sgm_uniform_schedule,
+    simple_schedule,
+)
+
+# Samplers Anima can drive (all routed through a CONST x0 denoiser closure).
+# The stochastic, flow-aware ones additionally take ``model_type``/``shift``.
+_ANIMA_SAMPLERS = {
+    "euler", "er_sde", "dpm_2", "dpm_2_ancestral",
+    "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde",
+}
+_FLOW_AWARE_SAMPLERS = {"er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde"}
 
 if TYPE_CHECKING:
     from ..bundle import ModelBundle
@@ -70,13 +84,25 @@ def anima_text_to_image(
     width: int = 1024,
     height: int = 1024,
     seed: int | None = None,
+    sampler: str = "euler",
+    scheduler: str = "flow",
 ) -> Image.Image:
     """Drive Anima's text-to-image path end-to-end.
 
     ``shift`` controls the SD3-style rectified-flow schedule (Anima's training
     default is 3.0). ``cfg_scale`` is the CFG strength; the Anima ComfyUI
     workflow defaults to ~4.0.
+
+    ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
+    closed-form rectified-flow step; the rest run through the shared sampler
+    registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
+    ``"flow"`` (the rectified-flow t-uniform default), ``"sgm_uniform"`` or
+    ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
     """
+    if sampler not in _ANIMA_SAMPLERS:
+        raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
+    if scheduler not in ("flow", "sgm_uniform", "simple"):
+        raise ValueError(f"Anima scheduler must be 'flow', 'sgm_uniform' or 'simple'; got {scheduler!r}")
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -99,30 +125,55 @@ def anima_text_to_image(
     uncond_t5 = uncond_tok.t5_ids.to(device)
 
     # ---- 3. σ schedule, init noise
-    sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+    if scheduler == "flow":
+        sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+    else:
+        view = FlowSamplingView(shift, device=device, dtype=torch.float32)
+        schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
+        sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
     h_lat, w_lat = height // 8, width // 8
     gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
     x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
     # With σ_max == 1 the initial state is exactly pure noise (no rescale).
 
-    # ---- 4. Euler integration of the rectified-flow ODE
+    # ---- 4. integrate the rectified-flow ODE/SDE
     backbone = model.backbone
     with torch.no_grad(), _staged([backbone], device, policy.offload_unet):
-        for i in range(len(sigmas) - 1):
-            sigma, sigma_next = sigmas[i], sigmas[i + 1]
-            x_5d = x.unsqueeze(2)                         # (B, C, 1, H, W)
-            t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
+        if sampler == "euler":
+            for i in range(len(sigmas) - 1):
+                sigma, sigma_next = sigmas[i], sigmas[i + 1]
+                x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
+                t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
-            v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
-            if cfg_scale == 1.0:
-                v = v_cond
-            else:
-                v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
-                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                if cfg_scale == 1.0:
+                    v = v_cond
+                else:
+                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
-            # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
-            # (closed-form exact for any constant x0 estimate).
-            x = x + (sigma_next - sigma).to(dtype) * v
+                # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
+                # (closed-form exact for any constant x0 estimate).
+                x = x + (sigma_next - sigma).to(dtype) * v
+        else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
+            def denoise(x_in, sigma_b):
+                """``model(x, σ) -> x0``: predict velocity (with CFG), return the
+                CONST x0 estimate ``x − σ·v`` in fp32 for the solver math."""
+                x_5d = x_in.to(dtype).unsqueeze(2)
+                t = sigma_b.to(dtype)
+                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                if cfg_scale == 1.0:
+                    v = v_cond
+                else:
+                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                sig = sigma_b.float().view(-1, 1, 1, 1)
+                return x_in.float() - sig * v.float()
+
+            kwargs = {}
+            if sampler in _FLOW_AWARE_SAMPLERS:
+                kwargs = dict(generator=gen, model_type="flow", shift=shift)
+            x = get_sampler(sampler)(denoise, x.float(), sigmas, **kwargs)
 
     # ---- 5. process_out then decode
     with torch.no_grad(), _staged([model.vae], device, policy.offload_idle):

@@ -1,8 +1,9 @@
-"""Neural-network backbones (skeletons).
+"""Neural-network backbones, implemented from their original publications.
 
-These are interface placeholders for milestones M4–M6. Each ``forward`` raises
-``NotImplementedError``; implement the bodies on a CUDA box and verify with real
-SD1.5 weights, following ``docs/IMPLEMENTATION_SPEC.md``.
+Text encoders (CLIP ViT-L/14, OpenCLIP bigG, Qwen3), the SD1.5/SDXL UNet, the
+AutoencoderKL and Qwen-Image VAEs, and the Anima DiT (+ its LLM-Adapter). Each
+is strict-loadable from real checkpoints and verified on CUDA against HF
+oracles — see ``docs/ROADMAP.md``.
 """
 
 from .clip_text import CLIPTextConfig, CLIPTextEncoder

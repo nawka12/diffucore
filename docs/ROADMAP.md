@@ -109,8 +109,10 @@ The remaining extensions (each its own slice):
   - **Flow-matching parameterization + schedule** —
     `FlowMatchingConstScaling` (`c_skip=1, c_out=−σ, c_in=1`; model predicts
     velocity v = ε − x0) + `flow_matching_schedule(steps, shift)` (SD3-style
-    shift; Anima uses 3.0). The existing σ-space Euler sampler integrates
-    rectified-flow ODE *exactly*; no sampler changes needed.
+    shift; Anima uses 3.0). The existing σ-space Euler sampler integrates the
+    rectified-flow ODE *exactly*; no sampler changes were needed to land Anima.
+    (Flow-aware DPM++ / ER-SDE samplers were added later — see the sampler /
+    scheduler entry below.)
   - **fp16 stability fix** — Cosmos's residual stream accumulates past
     fp16's ±65504 ceiling over 28 blocks → NaN. The DiT now promotes the
     residual to fp32 inside `_forward` while keeping attention/MLP in
@@ -140,6 +142,20 @@ The remaining extensions (each its own slice):
   fp16 precision. CPU unit tests run on tiny real-structure models
   (`tests/test_lora.py`). Diffusers-format SD LoRAs and the LoHa variant are
   not supported (their keys are reported in `LoraReport.unmatched`).
+- **Sampler / scheduler set — done.** Beyond the original Euler/Heun/ancestral,
+  the registry now carries **DPM2** (+ancestral), **DPM++** (`2m`, `sde`,
+  `2m_sde`, `3m_sde`) and **ER-SDE-Solver-3**, plus the **`sgm_uniform`** and
+  **`simple`** schedulers. The DPM++ and ER-SDE family are flow-aware: they run
+  off the half-logSNR mapping (with a first-σ offset for flow) so the same
+  function drives both VE (SD/SDXL) and rectified-flow (Anima) models, matching
+  ComfyUI's `model_sampling`-aware k-diffusion. The Anima path routes any
+  non-Euler sampler through the shared registry against a CONST x0 denoiser
+  closure, and accepts `scheduler ∈ {flow, sgm_uniform, simple}` (built off a
+  `FlowSamplingView` of the model). The SDE samplers re-inject **seeded Gaussian
+  noise** (a standard Euler–Maruyama discretization) rather than ComfyUI's
+  Brownian-tree noise — correct and seed-reproducible, but not bit-identical to
+  a ComfyUI render, and avoiding a `torchsde` dependency. Sampler convergence
+  (VE + flow) and the new schedules are unit-tested on CPU.
 
 ## Verification notes
 

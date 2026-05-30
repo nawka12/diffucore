@@ -28,6 +28,8 @@ from ..sampling import (
     get_sampler,
     karras_schedule,
     polyexponential_schedule,
+    sgm_uniform_schedule,
+    simple_schedule,
 )
 
 if TYPE_CHECKING:  # avoid importing the bundle (and torch-heavy models) eagerly
@@ -37,6 +39,13 @@ _SCHEDULERS = {
     "karras": karras_schedule,
     "exponential": exponential_schedule,
     "polyexponential": polyexponential_schedule,
+}
+
+# Schedulers that read the model's discrete sigma table / timestep map rather
+# than just (sigma_min, sigma_max); called with the schedule object.
+_SCHEDULE_FROM_MODEL = {
+    "simple": simple_schedule,
+    "sgm_uniform": sgm_uniform_schedule,
 }
 
 
@@ -142,10 +151,15 @@ class _Pipeline:
 
     def _sigmas(self, scheduler, steps, device, dtype):
         """The full descending sigma schedule ([steps + 1] values, ending at 0)."""
+        if scheduler in _SCHEDULE_FROM_MODEL:
+            return _SCHEDULE_FROM_MODEL[scheduler](
+                self.model.schedule, steps, device=device, dtype=dtype
+            )
         try:
             schedule_fn = _SCHEDULERS[scheduler]
         except KeyError:
-            raise ValueError(f"unknown scheduler {scheduler!r}; available: {sorted(_SCHEDULERS)}") from None
+            available = sorted([*_SCHEDULERS, *_SCHEDULE_FROM_MODEL])
+            raise ValueError(f"unknown scheduler {scheduler!r}; available: {available}") from None
         return schedule_fn(
             steps,
             self.model.schedule.sigma_min.item(),

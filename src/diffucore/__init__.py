@@ -1,12 +1,14 @@
 """Diffucore: a clean, from-scratch diffusion inference engine.
 
-The sampling foundation (``diffucore.sampling``) and checkpoint detection
-(``diffucore.loading``) are implemented and tested. The model backbones behind
-``load_checkpoint`` / ``TextToImage`` are skeletons pending milestones M4–M6 —
-see ``docs/IMPLEMENTATION_SPEC.md`` and ``docs/HANDOFF.md``.
+End-to-end text-to-image, image-to-image, and inpainting for Stable Diffusion
+1.5 and SDXL (epsilon / v-prediction, optional zero-terminal-SNR), plus Anima
+(the first DiT family) via flow matching. ``load_checkpoint`` /
+``load_anima_checkpoint`` build a ``ModelBundle``; ``TextToImage`` /
+``ImageToImage`` / ``Inpaint`` drive generation; ``apply_lora`` fuses
+LoRA / LoKr adapters. See ``docs/ARCHITECTURE.md`` and ``docs/ROADMAP.md``.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 from .bundle import ModelBundle, load_anima_checkpoint, load_checkpoint
 from .lora import LoraReport, apply_lora

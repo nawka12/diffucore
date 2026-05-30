@@ -22,6 +22,9 @@ __all__ = [
     "exponential_schedule",
     "polyexponential_schedule",
     "flow_matching_schedule",
+    "simple_schedule",
+    "sgm_uniform_schedule",
+    "FlowSamplingView",
 ]
 
 
@@ -115,4 +118,68 @@ def flow_matching_schedule(
     # descending uniform t in (0, 1]
     t = torch.arange(steps, 0, -1, device=device, dtype=dtype) / steps
     sigmas = shift * t / (1.0 + (shift - 1.0) * t)
+    return append_zero(sigmas)
+
+
+class FlowSamplingView:
+    """Minimal :class:`~diffucore.sampling.parameterization.DiscreteSchedule`-like
+    view of a rectified-flow model, so the table/timestep-based schedulers
+    (:func:`simple_schedule`, :func:`sgm_uniform_schedule`) work on Anima.
+
+    Mirrors ComfyUI's ``ModelSamplingDiscreteFlow``: a ``multiplier``-entry
+    ascending sigma table from ``sigma(t) = shift·t/(1+(shift-1)·t)``, with
+    ``sigma_to_t``/``t_to_sigma`` as the (invertible) timestep map ``t·multiplier``.
+    """
+
+    def __init__(self, shift: float, *, multiplier: int = 1000,
+                 device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32):
+        self.shift = shift
+        self.multiplier = multiplier
+        t = torch.arange(1, multiplier + 1, device=device, dtype=dtype) / multiplier
+        self.sigmas = shift * t / (1.0 + (shift - 1.0) * t)  # ascending
+
+    @property
+    def sigma_min(self) -> torch.Tensor:
+        return self.sigmas[0]
+
+    @property
+    def sigma_max(self) -> torch.Tensor:
+        return self.sigmas[-1]
+
+    def sigma_to_t(self, sigma) -> torch.Tensor:
+        sigma = torch.as_tensor(sigma, dtype=self.sigmas.dtype, device=self.sigmas.device)
+        t = sigma / (self.shift - (self.shift - 1.0) * sigma)
+        return t * self.multiplier
+
+    def t_to_sigma(self, ts) -> torch.Tensor:
+        ts = torch.as_tensor(ts, dtype=self.sigmas.dtype, device=self.sigmas.device)
+        t = ts / self.multiplier
+        return self.shift * t / (1.0 + (self.shift - 1.0) * t)
+
+
+def simple_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                    dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """ComfyUI ``simple``: pick ``steps`` sigmas from the model's (ascending)
+    training sigma table at evenly spaced strides from the high-noise end."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    table = schedule.sigmas
+    n = len(table)
+    ss = n / steps
+    idx = torch.tensor([n - 1 - int(x * ss) for x in range(steps)], device=table.device)
+    sigmas = table[idx].to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
+def sgm_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """ComfyUI ``sgm_uniform``: ``steps`` sigmas uniform in timestep between
+    ``sigma_max`` and ``sigma_min`` (``normal_scheduler`` with ``sgm=True`` —
+    ``steps + 1`` timesteps with the last dropped)."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    start = float(schedule.sigma_to_t(schedule.sigma_max))
+    end = float(schedule.sigma_to_t(schedule.sigma_min))
+    ts = torch.linspace(start, end, steps + 1, device=device, dtype=torch.float32)[:-1]
+    sigmas = schedule.t_to_sigma(ts).to(device=device, dtype=dtype)
     return append_zero(sigmas)

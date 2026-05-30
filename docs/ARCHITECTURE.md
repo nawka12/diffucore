@@ -51,9 +51,12 @@ each other beyond the data they pass.
 src/diffucore/
   __init__.py            Public API re-exports.
   sampling/              Noise schedules, parameterizations, samplers, the loop.
-    schedules.py         σ schedules: karras, exponential, polyexponential, …
+    schedules.py         σ schedules: karras, exponential, polyexponential,
+                         sgm_uniform, simple, flow-matching.
     parameterization.py  betas -> σ table; σ<->t; eps / v prediction scalings.
-    samplers.py          Euler, Heun, ancestral — pure σ-space steppers.
+    samplers.py          Euler/Heun/ancestral, DPM2(+ancestral), DPM++ (2M, SDE,
+                         2M-SDE, 3M-SDE), ER-SDE — pure σ-space steppers, the
+                         DPM++/ER-SDE family flow-aware (half-logSNR).
     denoiser.py          wraps a backbone: applies scalings + CFG.
   models/                nn.Module backbones, implemented from papers.
     clip_text.py         CLIP ViT-L/14 text encoder (SD1.5 + SDXL encoder 1).
@@ -92,7 +95,9 @@ SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
   rectified-flow models (Anima / Cosmos-Predict2 / Flux / SD3 CONST convention)
   where the model receives the raw noisy latent and predicts a velocity
   `v = ε − x0`. For flow, σ plays the role of the rectified-flow time
-  ``t ∈ (0, 1]``; the same σ-space Euler/Heun samplers integrate the ODE.
+  ``t ∈ (0, 1]``; the same σ-space samplers integrate the ODE/SDE. Euler is
+  exact for the rectified-flow ODE; the DPM++ / ER-SDE samplers switch to the
+  flow half-logSNR mapping (`model_type="flow"`) so they apply too.
 
 - **Schedule** (`schedules.py`) — a sampling-time function
   `(steps, σ_min, σ_max) -> σ[0..steps]` (descending, trailing 0).
@@ -213,7 +218,7 @@ design — see §9 in [`ROADMAP.md`](ROADMAP.md) for the DT0–DT7 build sheet.
 ## 9. Provenance and licensing
 
 Diffucore is licensed Apache-2.0. Algorithms and architectures are implemented
-from their original publications (DDPM, EDM/Karras schedules, DPM-Solver, the
-LDM/Stable Diffusion and CLIP papers). Permissively licensed libraries (PyTorch,
+from their original publications (DDPM, EDM/Karras schedules, DPM-Solver and
+DPM-Solver++, ER-SDE-Solver, the LDM/Stable Diffusion and CLIP papers). Permissively licensed libraries (PyTorch,
 safetensors, HF `tokenizers`, einops, Pillow) are used as dependencies, not
 vendored.

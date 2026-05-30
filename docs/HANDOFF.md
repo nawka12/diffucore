@@ -244,12 +244,39 @@ Learned while adding LoRA/LoKr (`lora.py`):
   didn't exist in older releases; the pinned dev range (`>=4.44,<5`) covers it.
   (Unrelated to LoRA, but surfaced while running the Anima LoRA end-to-end.)
 
+Learned while expanding the sampler / scheduler set (`samplers.py`, `schedules.py`):
+
+- **One sampler, two model families, via the half-logSNR mapping.** ComfyUI's
+  modern k-diffusion samplers (DPM++ SDE family, ER-SDE) are flow-aware by going
+  through `er_lambda = sigma/alpha` (`alpha = 1` for VE, `alpha = 1 − sigma` for
+  flow/CONST). Reproducing that one mapping (`_half_log_snr` + a first-σ offset
+  off 1.0, where `alpha` is 0 and the logSNR is infinite) lets a single function
+  serve SD/SDXL and Anima. `dpmpp_2m` and `dpm_2` are the exception: ComfyUI runs
+  them in the plain VE form on flow too, so they're left model-agnostic to match.
+- **The Anima path routes non-Euler samplers through the registry.** It builds a
+  CONST x0 denoiser closure (`x − σ·v`, with CFG, the 4D↔5D reshape, fp16→fp32)
+  and calls `get_sampler(name)(...)`. Euler keeps its exact closed form. The
+  solver math runs in fp32 (like ComfyUI), with the closure casting to the DiT's
+  compute dtype at the backbone boundary.
+- **Seeded Gaussian, not Brownian tree.** ComfyUI's SDE samplers default to a
+  `torchsde` Brownian-tree noise sampler. Per-step independent Gaussians are a
+  correct Euler–Maruyama realization (Brownian increments over disjoint intervals
+  *are* independent), so quality/convergence are unaffected — what's lost is
+  grid-consistency across step counts and exact ComfyUI parity. Chosen to avoid
+  the dependency; revisit behind a flag if parity is ever wanted.
+- **`simple` / `sgm_uniform` need the model's schedule, not just σ_min/σ_max.**
+  They index the discrete σ table / timestep map, so they take the schedule
+  object. For Anima (no discrete table) a `FlowSamplingView` mirrors ComfyUI's
+  `ModelSamplingDiscreteFlow` (a 1000-entry flow σ table + invertible timestep
+  map). `_base._sigmas` dispatches these via `_SCHEDULE_FROM_MODEL`.
+
 ## Project map
 
 ```
 src/diffucore/
   sampling/      ✅ schedules, parameterization, samplers, denoiser
-                   (incl. flow_matching_schedule + FlowMatchingConstScaling)
+                   (incl. flow_matching_schedule + FlowMatchingConstScaling;
+                    Euler/Heun/ancestral/DPM2/DPM++/ER-SDE + sgm_uniform/simple)
   loading/       ✅ state_dict (safetensors), detect (SD1.5 + SDXL + Anima)
   models/        ✅ clip_text, open_clip_text, vae, unet (SD1.5 + SDXL)
                  ✅ qwen_image_vae, qwen3_text, llm_adapter, anima_dit (Anima)

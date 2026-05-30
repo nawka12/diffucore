@@ -41,12 +41,15 @@ class TextToImage(_Pipeline):
         shift: float = 3.0,
     ) -> Image.Image:
         if self.model.spec.architecture == "anima":
+            # The default scheduler ("karras") and other SD-only schedules don't
+            # apply to a flow model; fall back to the rectified-flow schedule.
+            anima_scheduler = scheduler if scheduler in ("flow", "sgm_uniform", "simple") else "flow"
             return anima_text_to_image(
                 self.model, prompt, negative_prompt,
                 steps=steps, cfg_scale=cfg_scale, shift=shift,
                 width=width if width is not None else self.model.spec.image_size,
                 height=height if height is not None else self.model.spec.image_size,
-                seed=seed,
+                seed=seed, sampler=sampler, scheduler=anima_scheduler,
             )
         """Return a ``PIL.Image`` for ``prompt``. ``width``/``height`` default to
         the model's native resolution (512 for SD1.5, 1024 for SDXL). ``cfg_rescale``
