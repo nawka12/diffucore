@@ -3,6 +3,12 @@
 This is the pickup point for moving from the laptop (no CUDA) to the RTX 2060
 12 GB PC, where the model components can finally be run and verified.
 
+> **Update: M4–M7 are complete and verified on the RTX 2060.** The end-to-end
+> SD1.5 text-to-image path works (`load_checkpoint` → `TextToImage`). The
+> "What's left" and setup sections below are kept as the historical pickup
+> record; current status lives in [`ROADMAP.md`](ROADMAP.md), and the
+> implementation learnings are folded into "Gotchas" at the bottom.
+
 ## What's done and verified (laptop, CPU)
 
 | Milestone | What | Verified |
@@ -15,21 +21,18 @@ This is the pickup point for moving from the laptop (no CUDA) to the RTX 2060
 **32 tests pass.** The entire sampling/denoising path is real and tested against
 analytic solutions — you should not need to touch it.
 
-## What's left (this PC)
+## What was left — now done (this PC)
 
-Skeletons exist (importable, `forward` raises `NotImplementedError`); fill them in
-following [`IMPLEMENTATION_SPEC.md`](IMPLEMENTATION_SPEC.md), then run the
-per-module verification there.
+Built in the recommended order (**VAE → CLIP → UNet → pipeline**), each mirroring
+the on-disk key names so a `strict=True` load is the architecture check, then
+verified numerically per [`IMPLEMENTATION_SPEC.md`](IMPLEMENTATION_SPEC.md).
 
-| Milestone | File | Builds |
+| Milestone | File | Verified |
 |---|---|---|
-| M4 | `models/clip_text.py`, `conditioning/__init__.py` | CLIP text encoder + tokenizer |
-| M5 | `models/vae.py` | AutoencoderKL |
-| M6 | `models/unet.py` | SD1.5 UNet; then finish `bundle.py` weight loading |
-| M7 | `pipelines/text_to_image.py` | end-to-end (wiring is already spec'd) |
-
-Recommended order: **VAE → CLIP → UNet → pipeline** (VAE is the most
-self-contained and gives you `decode` to eyeball latents early).
+| M4 | `models/clip_text.py`, `conditioning/__init__.py` | strict load; bit-identical to `transformers.CLIPTextModel` (max\|Δ\|=0) |
+| M5 | `models/vae.py` | strict load; `decode(encode(img))` PSNR 35.1 dB; O(1) latent stats |
+| M6 | `models/unet.py`, `bundle.py` | strict load; bit-identical to diffusers `UNet2DConditionModel`; fp16 fwd ~1.8 GB |
+| M7 | `pipelines/text_to_image.py` | coherent 512² image; fixed seed → bit-identical; ~3.6 s/20 steps, ~3.2 GB |
 
 ## Environment setup on the PC
 
@@ -74,17 +77,37 @@ reference checkpoint, reproducible for a fixed seed.
 - **Python 3.14 has no torch wheels** — use 3.11 (or whatever the current torch
   supports), which is why the venv is pinned.
 
+Learned while implementing M4–M7:
+
+- **GroupNorm in fp32 needs fp32 weights too.** The UNet's `GroupNorm32` casts
+  the *input* to fp32; with fp16 weights that mismatches. Cast the weight/bias to
+  fp32 in the norm forward (`F.group_norm(x.float(), …, weight.float(), …)`).
+- **VAE and UNet downsample differently.** The VAE `Downsample` uses asymmetric
+  `F.pad(x, (0,1,0,1))` then stride-2 conv with padding 0; the UNet `Downsample`
+  uses a stride-2 conv with symmetric `padding=1`. Both match their checkpoints.
+- **Tokenizer is vendored.** `conditioning/clip_tokenizer.json` is the OpenAI CLIP
+  BPE (MIT), loaded via the `tokenizers` dep. Its post-processor already adds
+  BOS/EOS; `CLIPTokenizer.encode` only truncates and pads to 77 with EOS.
+- **Keep the schedule on-device.** `bundle.load_checkpoint` moves the
+  `DiscreteSchedule` sigma table (fp32) onto the run device so `sigma_to_t`
+  returns timesteps on the same device as the latents (avoids a CPU/GPU mismatch
+  in the UNet's time embedding).
+- **Verification oracles are dev-only.** HF `transformers`/`diffusers` are used to
+  numerically check CLIP/UNet/VAE; they are **not** runtime deps. CLIP and the
+  UNet match bit-for-bit; diffusers `UNet2DConditionModel.from_single_file` loads
+  the same checkpoint for the UNet oracle.
+
 ## Project map
 
 ```
 src/diffucore/
   sampling/      ✅ schedules, parameterization, samplers, denoiser   (DONE, tested)
   loading/       ✅ state_dict (safetensors), detect (ModelSpec)       (DONE, tested)
-  models/        ⏳ clip_text, vae, unet                               (SKELETON → M4–M6)
-  conditioning/  ⏳ CLIPTokenizer, Conditioner                         (SKELETON → M4)
+  models/        ✅ clip_text, vae, unet                               (M4–M6, verified)
+  conditioning/  ✅ CLIPTokenizer (+clip_tokenizer.json), Conditioner  (M4, verified)
   runtime/       ⏳ DevicePolicy (auto() works; offload/tiling TODO)
-  pipelines/     ⏳ TextToImage (wiring spec'd in IMPLEMENTATION_SPEC)  (SKELETON → M7)
-  bundle.py      ⏳ load_checkpoint (detection done; module build TODO)
+  pipelines/     ✅ TextToImage                                        (M7, verified)
+  bundle.py      ✅ load_checkpoint (detect + build + strict load)
 docs/
   ARCHITECTURE.md         design + rationale
   ROADMAP.md              milestones + status

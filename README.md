@@ -8,21 +8,27 @@ loop, and VAE decoding — and exposes a small Python API that a separate UI can
 drive. It is **not** a node-graph editor; there is no workflow JSON and no node
 system.
 
-> **Status: pre-alpha.** The sampling/denoising core and checkpoint detection are
-> implemented and tested (32 CPU tests). The model components (CLIP, VAE, UNet)
-> and pipeline are specced with skeletons in place — see
+> **Status: pre-alpha, but end-to-end working.** Stable Diffusion 1.5
+> text-to-image runs: `load_checkpoint` → `TextToImage` produces a coherent,
+> seed-reproducible 512² image. The sampling core + checkpoint detection are unit
+> tested (32 CPU tests); the model components (CLIP, VAE, UNet) are verified on an
+> RTX 2060 against HF `transformers`/`diffusers` as numerical oracles (CLIP and
+> UNet match bit-for-bit; VAE round-trip 35 dB PSNR). See
 > [`docs/ROADMAP.md`](docs/ROADMAP.md), [`docs/IMPLEMENTATION_SPEC.md`](docs/IMPLEMENTATION_SPEC.md),
 > and [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 ## Design at a glance
 
 ```python
-from diffucore import load_checkpoint, TextToImage   # planned public API
+import torch
+from diffucore import load_checkpoint, TextToImage
 
-model = load_checkpoint("models/sd15.safetensors")
+model = load_checkpoint("models/v1-5-pruned-emaonly.safetensors",
+                        device="cuda", dtype=torch.float16)
 pipe = TextToImage(model)
 image = pipe(prompt="a photo of an astronaut riding a horse",
-             steps=20, cfg_scale=7.0, seed=0)
+             negative_prompt="blurry, low quality",
+             steps=20, cfg_scale=7.5, seed=0)
 image.save("out.png")
 ```
 
@@ -41,10 +47,15 @@ The first target is **Stable Diffusion 1.5** text-to-image. CPU is supported for
 testing; real generation targets CUDA (developed against an RTX 2060 12 GB).
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"          # add torch from the appropriate index for your platform
-pytest                            # runs the CPU-only test suite
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"          # numpy/safetensors/tokenizers/Pillow/einops/pytest
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA build for your GPU
+pytest                            # runs the CPU-only test suite (32 tests)
 ```
+
+For real generation, fetch an SD1.5 checkpoint (e.g. `v1-5-pruned-emaonly.safetensors`)
+into `models/` (gitignored). Numerical verification additionally uses HF
+`transformers`/`diffusers` as oracles — they are dev-only and not runtime deps.
 
 ## License
 

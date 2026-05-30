@@ -51,20 +51,20 @@ src/diffucore/
   sampling/              Noise schedules, parameterizations, samplers, the loop.
     schedules.py         σ schedules: karras, exponential, polyexponential, …
     parameterization.py  betas -> σ table; σ<->t; eps / v prediction scalings.
-    samplers.py          (planned) Euler, Heun, DPM++…  pure σ-space steppers.
-    denoiser.py          (planned) wraps a backbone: applies scalings + CFG.
+    samplers.py          Euler, Heun, ancestral — pure σ-space steppers.
+    denoiser.py          wraps a backbone: applies scalings + CFG.
   models/                nn.Module backbones, implemented from papers.
-    text_encoder/        (planned) CLIP ViT-L/14 text encoder.
-    unet/                (planned) SD1.5 UNet (eps).
-    vae/                 (planned) AutoencoderKL encode/decode.
-  conditioning/          (planned) tokenizer + text-encoder orchestration.
-  loading/               (planned) safetensors IO, key remap, arch detection.
-  runtime/               (planned) device/dtype selection, offload, tiling.
-  pipelines/             (planned) TextToImage and friends — user-facing glue.
+    clip_text.py         CLIP ViT-L/14 text encoder.
+    unet.py              SD1.5 UNet (eps).
+    vae.py               AutoencoderKL encode/decode.
+  conditioning/          tokenizer + text-encoder orchestration.
+  loading/               safetensors IO, arch detection.
+  runtime/               device/dtype selection (offload, tiling: planned).
+  pipelines/             TextToImage — user-facing glue.
 ```
 
-Implemented today: `sampling/schedules.py`, `sampling/parameterization.py`.
-Everything marked *(planned)* has a roadmap milestone (see `ROADMAP.md`).
+The full SD1.5 text-to-image path is implemented. `runtime/` offload + tiled VAE
+remain the only planned items (not needed for 512² on 12 GB); see `ROADMAP.md`.
 
 ## 4. Core abstractions
 
@@ -86,11 +86,11 @@ Everything marked *(planned)* has a roadmap milestone (see `ROADMAP.md`).
 - **Schedule** (`schedules.py`) — a sampling-time function
   `(steps, σ_min, σ_max) -> σ[0..steps]` (descending, trailing 0).
 
-- **Denoiser** *(planned)* — composes a backbone + `Scaling` + `DiscreteSchedule`
+- **Denoiser** — composes a backbone + `Scaling` + `DiscreteSchedule`
   into the single callable the loop wants: `x, σ -> denoised`. CFG is applied
-  here by batching cond/uncond.
+  here (`CFGDenoiser`) by evaluating cond/uncond.
 
-- **Sampler** *(planned)* — a pure function of σ-space: consumes `Denoiser`, an
+- **Sampler** — a pure function of σ-space: consumes `Denoiser`, an
   initial latent, and a σ schedule; returns the final latent. Knows nothing
   about text, models, or VAEs.
 

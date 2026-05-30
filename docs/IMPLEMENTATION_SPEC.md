@@ -1,5 +1,10 @@
 # Implementation Spec — M4–M7 (SD1.5 model components + pipeline)
 
+> **Status: implemented and verified** (see [`ROADMAP.md`](ROADMAP.md)). This
+> remains the authoritative description of *what was built*; the code in
+> `src/diffucore/` follows it. Implementation learnings/deviations are recorded
+> in [`HANDOFF.md`](HANDOFF.md) "Gotchas".
+
 This is the build sheet for the parts that can only be verified on the RTX 2060
 with real weights. The sampling core they plug into (schedules, samplers, the
 denoising loop, CFG, eps/v parameterization, sigma⇄t) is **already implemented
