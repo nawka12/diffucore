@@ -11,9 +11,6 @@ can `import` or embed behind your own UI.
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![license](https://img.shields.io/badge/license-Apache--2.0-green)
 
-It's a focused library, not a node-graph app: no workflow JSON, no node system,
-and no runtime dependency on `diffusers` or ComfyUI.
-
 ```python
 import torch
 from diffucore import load_checkpoint, TextToImage
