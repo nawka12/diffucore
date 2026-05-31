@@ -47,6 +47,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._norm import RMSNorm, _rotate_half
+
 
 @dataclass
 class LLMAdapterConfig:
@@ -60,25 +62,6 @@ class LLMAdapterConfig:
     mlp_ratio: float = 4.0
     rope_theta: float = 10_000.0
     rms_norm_eps: float = 1e-6
-
-
-class _RMSNorm(nn.Module):
-    """RMSNorm: ``x · rsqrt(mean(x²) + ε) · γ`` computed in fp32."""
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(in_dtype)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -120,8 +103,8 @@ class _Attention(nn.Module):
         self.k_proj = nn.Linear(context_dim, inner, bias=False)
         self.v_proj = nn.Linear(context_dim, inner, bias=False)
         self.o_proj = nn.Linear(inner, query_dim, bias=False)
-        self.q_norm = _RMSNorm(head_dim, eps=eps)
-        self.k_norm = _RMSNorm(head_dim, eps=eps)
+        self.q_norm = RMSNorm(head_dim, eps=eps)
+        self.k_norm = RMSNorm(head_dim, eps=eps)
 
     def forward(self, x, context, q_pe, k_pe, key_mask):
         ctx = x if context is None else context
@@ -153,11 +136,11 @@ class _Block(nn.Module):
 
     def __init__(self, cfg: LLMAdapterConfig):
         super().__init__()
-        self.norm_self_attn = _RMSNorm(cfg.model_dim, eps=cfg.rms_norm_eps)
+        self.norm_self_attn = RMSNorm(cfg.model_dim, eps=cfg.rms_norm_eps)
         self.self_attn = _Attention(cfg.model_dim, cfg.model_dim, cfg.num_heads, cfg.head_dim, cfg.rms_norm_eps)
-        self.norm_cross_attn = _RMSNorm(cfg.model_dim, eps=cfg.rms_norm_eps)
+        self.norm_cross_attn = RMSNorm(cfg.model_dim, eps=cfg.rms_norm_eps)
         self.cross_attn = _Attention(cfg.model_dim, cfg.source_dim, cfg.num_heads, cfg.head_dim, cfg.rms_norm_eps)
-        self.norm_mlp = _RMSNorm(cfg.model_dim, eps=cfg.rms_norm_eps)
+        self.norm_mlp = RMSNorm(cfg.model_dim, eps=cfg.rms_norm_eps)
         intermediate = int(cfg.model_dim * cfg.mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(cfg.model_dim, intermediate),
@@ -193,7 +176,7 @@ class LLMAdapter(nn.Module):
         self.rotary_emb = _RotaryEmbedding(cfg.head_dim, base=cfg.rope_theta)
         self.blocks = nn.ModuleList([_Block(cfg) for _ in range(cfg.num_layers)])
         self.out_proj = nn.Linear(cfg.model_dim, cfg.target_dim)
-        self.norm = _RMSNorm(cfg.target_dim, eps=cfg.rms_norm_eps)
+        self.norm = RMSNorm(cfg.target_dim, eps=cfg.rms_norm_eps)
 
     def forward(
         self,

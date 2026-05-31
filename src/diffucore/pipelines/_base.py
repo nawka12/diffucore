@@ -9,7 +9,7 @@ stays a thin wrapper. Placement (offload / tiling) is read from the bundle's
 
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 from ..conditioning import Conditioner, SDXLConditioner
 from ..models.unet import timestep_embedding
-from ..runtime import DevicePolicy, on_device, tiled_vae_decode
+from ..runtime import DevicePolicy, staged, tiled_vae_decode
 from ..sampling import (
     CFGDenoiser,
     EpsScaling,
@@ -68,20 +68,6 @@ def preprocess_image(image: Image.Image, width: int, height: int) -> torch.Tenso
 
 
 @contextmanager
-def _staged(modules, device, offload):
-    """Bring ``modules`` onto ``device`` for the duration when ``offload`` is on,
-    parking them back on CPU afterward. A no-op when offload is off (modules are
-    already resident — never touch them)."""
-    if not offload:
-        yield
-        return
-    with ExitStack() as stack:
-        for module in modules:
-            stack.enter_context(on_device(module, device))
-        yield
-
-
-@contextmanager
 def _step_progress(total: int):
     """A tqdm bar over the ``total`` sampling steps, advanced through the
     sampler's ``callback`` hook. Yields the callback; closes the bar on exit."""
@@ -118,7 +104,7 @@ class _Pipeline:
     def _encode_prompts(self, prompt, negative_prompt, width, height, policy):
         """Cond/uncond kwarg dicts for the backbone, with the text encoder(s)
         staged onto the GPU for the duration when offloading."""
-        with _staged(self._text_modules(), policy.device, policy.offload_idle):
+        with staged(self._text_modules(), policy.device, policy.offload_idle):
             return self._conditioning(prompt, negative_prompt, width, height, policy.device)
 
     def _text_modules(self):
@@ -182,7 +168,7 @@ class _Pipeline:
 
     def _sample(self, sampler, cfg, x, sigmas, policy):
         with torch.no_grad():
-            with _staged([self.model.backbone], policy.device, policy.offload_unet):
+            with staged([self.model.backbone], policy.device, policy.offload_unet):
                 with _step_progress(len(sigmas) - 1) as on_step:
                     return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
 
@@ -191,7 +177,7 @@ class _Pipeline:
         with torch.no_grad():
             latent = x0.to(policy.vae_dtype)
             tile = policy.vae_tile or max(width, height) >= policy.vae_tile_threshold
-            with _staged([self.model.vae], policy.device, policy.offload_idle):
+            with staged([self.model.vae], policy.device, policy.offload_idle):
                 image = tiled_vae_decode(self.model.vae, latent) if tile else self.model.vae.decode(latent)
         image = ((image.clamp(-1, 1) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
         return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy())
@@ -202,6 +188,6 @@ class _Pipeline:
         (fp32) VAE staged onto the GPU when offloading."""
         image = preprocess_image(init_image, width, height).to(policy.device, policy.vae_dtype)
         with torch.no_grad():
-            with _staged([self.model.vae], policy.device, policy.offload_idle):
+            with staged([self.model.vae], policy.device, policy.offload_idle):
                 z = self.model.vae.encode(image, generator=generator)
         return z.to(policy.compute_dtype)

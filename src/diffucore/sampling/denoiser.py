@@ -49,8 +49,8 @@ class CFGDenoiser:
     blended back by ``rescale``, which counteracts the over-exposure high guidance
     causes (especially on zero-terminal-SNR models). ``0`` is plain CFG.
 
-    Note: this evaluates the backbone twice per step. Batching the two passes is
-    a throughput optimization left for the model-integration milestone.
+    Cond and uncond are batched into a single backbone forward (tensors stacked
+    along the batch axis) so the model sees half as many invocations per step.
     """
 
     def __init__(self, denoiser: ModelDenoiser, cond: dict, uncond: dict, scale: float, rescale: float = 0.0):
@@ -61,10 +61,21 @@ class CFGDenoiser:
         self.rescale = rescale
 
     def __call__(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        x0_cond = self.denoiser(x, sigma, **self.cond)
         if self.scale == 1.0:
-            return x0_cond
-        x0_uncond = self.denoiser(x, sigma, **self.uncond)
+            return self.denoiser(x, sigma, **self.cond)
+        # Batch cond+uncond into one forward when values are tensors (the common
+        # production case). Fall back to separate forwards for non-tensor values
+        # (e.g. test backbones that take scalar kwargs).
+        if all(isinstance(v, torch.Tensor) for v in (*self.cond.values(), *self.uncond.values())):
+            x0_2 = self.denoiser(
+                torch.cat([x, x]),
+                torch.cat([sigma, sigma]),
+                **{k: torch.cat([self.cond[k], self.uncond[k]]) for k in self.cond},
+            )
+            x0_cond, x0_uncond = x0_2.chunk(2)
+        else:
+            x0_cond = self.denoiser(x, sigma, **self.cond)
+            x0_uncond = self.denoiser(x, sigma, **self.uncond)
         x0_cfg = x0_uncond + self.scale * (x0_cond - x0_uncond)
         if self.rescale == 0.0:
             return x0_cfg

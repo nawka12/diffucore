@@ -34,6 +34,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._norm import RMSNorm, _rotate_half
+
 
 @dataclass
 class Qwen3Config:
@@ -47,29 +49,6 @@ class Qwen3Config:
     max_position_embeddings: int = 32768
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1_000_000.0
-
-
-class Qwen3RMSNorm(nn.Module):
-    """Standard RMSNorm: ``x · rsqrt(mean(x²) + ε) · γ``.
-
-    Computed in fp32 to match HF's ``Qwen3RMSNorm``; output is cast back.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.variance_epsilon = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-        return (self.weight * x).to(in_dtype)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
 
 
 def _apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
@@ -115,8 +94,8 @@ class Qwen3Attention(nn.Module):
         self.k_proj = nn.Linear(cfg.hidden_size, kv_inner, bias=False)
         self.v_proj = nn.Linear(cfg.hidden_size, kv_inner, bias=False)
         self.o_proj = nn.Linear(q_inner, cfg.hidden_size, bias=False)
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=cfg.rms_norm_eps)
 
     def forward(self, x, position_embeddings, attention_mask):
         B, T, _ = x.shape
@@ -173,9 +152,9 @@ class Qwen3DecoderLayer(nn.Module):
 
     def __init__(self, cfg: Qwen3Config):
         super().__init__()
-        self.input_layernorm = Qwen3RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.self_attn = Qwen3Attention(cfg)
-        self.post_attention_layernorm = Qwen3RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.mlp = Qwen3MLP(cfg)
 
     def forward(self, x, position_embeddings, attention_mask):
@@ -196,7 +175,7 @@ class _Qwen3Inner(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(cfg) for _ in range(cfg.num_hidden_layers)])
-        self.norm = Qwen3RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
 
 class Qwen3TextEncoder(nn.Module):

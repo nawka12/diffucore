@@ -192,6 +192,17 @@ Learned while integrating Anima (the first DiT family — Cosmos-Predict2 / 2 B)
   `tokenizers` library, matching the `clip_tokenizer.json` pattern. Both files
   are bit-identical to the ComfyUI `qwen25_tokenizer/` + `t5_tokenizer/` dirs
   they replace (parity test in `tests/test_anima_pipeline.py`).
+- **3D RoPE is cached per generation.** `_VideoRoPE3D.forward` is a pure
+  function of `(H, W, T, fps)` — all fixed across a single run — so the rotation
+  tensor is computed once, stored on CPU, and moved to device on hit. Avoids
+  recomputing freqs + `einops` expansions every step.
+- **Anima CFG can't batch cond+uncond into one forward.** Unlike the SDXL
+  `CFGDenoiser` (fixed 77-token context), Anima's Qwen3 hidden states and
+  `t5xxl_ids` are variable-length per prompt, and there is no cross-attention
+  mask — `torch.cat([cond, uncond])` fails on the seq axis. Padding to a common
+  length before the LLM adapter would change adapter numerics vs. the separate
+  path, so the Euler loop and `denoise` closure keep two forwards. Don't re-attempt
+  batching here without real padding + masking support.
 
 Learned while adding img2img / inpainting and v-prediction:
 

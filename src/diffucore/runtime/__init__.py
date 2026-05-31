@@ -8,7 +8,7 @@ tiled VAE decode (``tiled_vae_decode``). See ``docs/RUNTIME_SPEC.md``.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -70,6 +70,20 @@ class DevicePolicy:
             return cls(device=torch.device("cuda"), compute_dtype=torch.float16)
         # CPU fallback (testing only): fp16 is unsupported on most CPUs.
         return cls(device=torch.device("cpu"), compute_dtype=torch.float32)
+
+
+@contextmanager
+def staged(modules, device, offload):
+    """Bring ``modules`` onto ``device`` for the duration when ``offload`` is on,
+    parking them back on CPU afterward. A no-op when offload is off (modules are
+    already resident — never touch them)."""
+    if not offload:
+        yield
+        return
+    with ExitStack() as stack:
+        for module in modules:
+            stack.enter_context(on_device(module, device))
+        yield
 
 
 @contextmanager
@@ -151,4 +165,4 @@ def _tile_starts(size: int, tile: int, step: int) -> list[int]:
     return starts
 
 
-__all__ = ["DevicePolicy", "on_device", "tiled_vae_decode"]
+__all__ = ["DevicePolicy", "on_device", "staged", "tiled_vae_decode"]

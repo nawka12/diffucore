@@ -6,6 +6,7 @@ is strict-loadable from real checkpoints and verified on CUDA against HF
 oracles — see ``docs/ROADMAP.md``.
 """
 
+from ._norm import RMSNorm
 from .clip_text import CLIPTextConfig, CLIPTextEncoder
 from .open_clip_text import OpenCLIPTextConfig, OpenCLIPTextEncoder
 from .vae import VAEConfig, AutoencoderKL
@@ -16,6 +17,7 @@ from .llm_adapter import LLMAdapter, LLMAdapterConfig
 from .anima_dit import AnimaDiT, CosmosDiT, CosmosDiTConfig
 
 __all__ = [
+    "RMSNorm",
     "CLIPTextConfig",
     "CLIPTextEncoder",
     "OpenCLIPTextConfig",

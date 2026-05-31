@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
+from ._norm import RMSNorm
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
 
 
@@ -93,20 +94,6 @@ def _pad_to_patch_size(x: torch.Tensor, patch: Tuple[int, int, int]) -> torch.Te
         p = patch[i]
         pads = [0, (p - n % p) % p] + pads
     return F.pad(x, pads, mode="reflect") if any(pads) else x
-
-
-class _RMSNorm(nn.Module):
-    """RMSNorm; fp32 reduction (matches the DT3/DT4 convention)."""
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        in_dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(in_dtype)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +199,11 @@ class _VideoRoPE3D(nn.Module):
     def forward(self, x_B_T_H_W_D: torch.Tensor, fps: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T, H, W, _ = x_B_T_H_W_D.shape
         device = x_B_T_H_W_D.device
+        fps_key = fps.item() if fps is not None else None
+        cache_key = (H, W, T, fps_key)
+        cached = getattr(self, "_rope_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1].to(device)
         h_theta = 10_000.0 * self.h_ntk
         w_theta = 10_000.0 * self.w_ntk
         t_theta = 10_000.0 * self.t_ntk
@@ -242,7 +234,9 @@ class _VideoRoPE3D(nn.Module):
             ],
             dim=-2,
         )
-        return rearrange(em, "t h w d (i j) -> (t h w) d i j", i=2, j=2).float()
+        result = rearrange(em, "t h w d (i j) -> (t h w) d i j", i=2, j=2).float()
+        self._rope_cache = (cache_key, result.cpu())
+        return result.to(device)
 
 
 def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -276,8 +270,8 @@ class _Attention(nn.Module):
         self.v_proj = nn.Linear(ctx, inner, bias=False)
         self.v_norm = nn.Identity()       # carried for state-dict parity
         self.output_proj = nn.Linear(inner, query_dim, bias=False)
-        self.q_norm = _RMSNorm(head_dim, eps=eps)
-        self.k_norm = _RMSNorm(head_dim, eps=eps)
+        self.q_norm = RMSNorm(head_dim, eps=eps)
+        self.k_norm = RMSNorm(head_dim, eps=eps)
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor], rope_emb: Optional[torch.Tensor]) -> torch.Tensor:
         ctx = x if context is None else context
@@ -450,7 +444,7 @@ class CosmosDiT(nn.Module):
             _Timesteps(cfg.model_channels),
             _TimestepEmbedding(cfg.model_channels),
         )
-        self.t_embedding_norm = _RMSNorm(cfg.model_channels, eps=cfg.rms_norm_eps)
+        self.t_embedding_norm = RMSNorm(cfg.model_channels, eps=cfg.rms_norm_eps)
         self.blocks = nn.ModuleList([_Block(cfg) for _ in range(cfg.num_blocks)])
         self.final_layer = _FinalLayer(cfg)
         self.pos_embedder = _VideoRoPE3D(cfg)
