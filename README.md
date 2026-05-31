@@ -30,6 +30,8 @@ image.save("fox.png")
   (a 2 B DiT built on Cosmos-Predict2 with Qwen3-0.6B + Qwen-Image VAE). Load any
   of them, drive them all the same way.
 - **Text-to-image, image-to-image, and inpainting** out of the box.
+- **Long prompt weighting (LPW) on SDXL** — A1111-style attention syntax
+  (`(word:1.3)`, `(word)`, `[word]`) and prompts beyond CLIP's 77-token limit.
 - **Checkpoint types auto-detected** — epsilon and v-prediction, with
   zero-terminal-SNR (ZTSNR) + CFG-rescale handled for you.
 - **LoRA & LoKr** adapters fuse into the weights at load time (kohya/A1111,

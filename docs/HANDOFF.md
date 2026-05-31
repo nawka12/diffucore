@@ -104,12 +104,19 @@ Learned while implementing SDXL:
   `CLIPTextModel.text_model`, which transformers 5.x removed. Pin `transformers>=4.44,<5`
   in the dev env for the oracle scripts. (The engine itself doesn't use either.)
 - **The two SDXL tokenizers pad differently.** CLIP-L pads to 77 with EOS (49407);
-  OpenCLIP bigG pads with **0**. `CLIPTokenizer.encode(text, pad_token=...)` takes
-  the fill; `SDXLConditioner` calls it twice. Pooled is unaffected (argmax finds
+  OpenCLIP bigG pads with **0**. LPW's `_chunk(..., pad_token=...)` takes the fill
+  and builds the L/G token windows separately. Pooled is unaffected (argmax finds
   the real EOS) but the penultimate hidden differs at pad positions if you get
   this wrong.
 - **SDXL uses clip_skip=2** (penultimate hidden, no final LN) for *both* encoders;
   the 2048-d context is `cat([clip_l_hidden(768), big_g_hidden(1280)], dim=-1)`.
+- **`SDXLConditioner` does LPW (long prompt weighting).** It parses A1111 attention
+  syntax (`(word:1.3)`, `(word)`=1.1, `[word]`=1/1.1, `\(` escapes), splits the
+  prompt into 75-token chunks (each a BOS…EOS 77-token window), encodes each chunk
+  through both encoders, applies A1111 mean-preserving per-token weights to the
+  2048-d context, and concatenates the chunk contexts along the sequence axis (so
+  prompts can exceed 77 tokens). Pooled comes from the final chunk. A short,
+  unweighted prompt collapses to one chunk and reproduces the plain encoding exactly.
 - **SpatialTransformer proj differs by arch.** SD1.5 uses a 1×1 **conv**
   `proj_in/out` (applied before flattening); SDXL uses a **Linear** (after
   flattening). Same math, different param shapes — `use_linear_in_transformer`

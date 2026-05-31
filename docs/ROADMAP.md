@@ -38,7 +38,8 @@ verified on the RTX 2060 (12 GB).
   - bigG (OpenCLIP) — strict load; penultimate hidden bit-identical to diffusers
     `text_encoder_2` (max|Δ|=0), pooled max|Δ|~1e-6.
   - Dual conditioner — 2048-d context bit-identical to diffusers `encode_prompt`
-    (max|Δ|=0).
+    (max|Δ|=0) for a short, unweighted prompt. The conditioner also does LPW (long
+    prompt weighting), which intentionally diverges for weighted / >77-token prompts.
   - UNet — generalized `UNetModel` strict-loads SDXL and matches diffusers
     (fp16 relative ~1e-3); **SD1.5 stays bit-exact** (max|Δ|=0, smoke test green).
   - t2i — coherent 1024² image, seed-reproducible; ~19 s / 20 steps at ~10.7 GB.
