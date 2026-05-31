@@ -147,6 +147,11 @@ policy = DevicePolicy(
 (`offload=True` / `"full"`) — pair it with `offload=False` or `"encoders"`.
 `cuda_graphs=True` requires `compile=True` and assumes stable input shapes
 (same resolution + LPW chunk count); each new shape triggers one re-record.
+**On Anima above 1024² (e.g. 1024×1536), skip `cuda_graphs` on 12 GB cards** —
+Anima's CFG runs cond/uncond as two different-shape forwards, so each step
+captures two graph pools, and DiT self-attention activations scale as
+O(tokens²). Above 1024² the two resident pools blow the VRAM budget. Use
+`compile=True` alone instead (eager activations are transient and still fit).
 `channels_last` and `compile` are most effective on Ampere+ (RTX 30/40-series);
 on Turing (RTX 20-series) the cuDNN NCHW path is already near-optimal and
 `channels_last` may regress. See [Performance](#performance).

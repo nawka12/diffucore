@@ -166,9 +166,12 @@ The remaining extensions (each its own slice):
   `anima-base-v1.0`: Anima 52.2 s → **35.6 s (1.47×)** with `cudnn_benchmark +
   compile + cuda_graphs` (and *higher* PSNR than compile alone — 54.7 dB vs
   29.0 dB — because static shapes pick consistent kernels), SDXL 19.8 s →
-  16.9 s (1.17×) with `cudnn_benchmark` alone (bit-exact). See
-  `docs/RUNTIME_SPEC.md` §Perf flags for the full results and per-architecture
-  recommendations.
+  16.9 s (1.17×) with `cudnn_benchmark` alone (bit-exact). Anima + cuda_graphs
+  is 1024²-only on 12 GB cards: CFG runs cond/uncond as two different-shape
+  forwards, so each step holds two captured graph pools whose per-pool
+  activation memory scales as O(tokens²); above 1024² the pools blow the
+  budget — use `compile=True` alone there. See `docs/RUNTIME_SPEC.md` §Perf
+  flags for the full results and per-architecture recommendations.
 - **Sampler / scheduler set — done.** Beyond the original Euler/Heun/ancestral,
   the registry now carries **DPM2** (+ancestral), **DPM++** (`2m`, `sde`,
   `2m_sde`, `3m_sde`) and **ER-SDE-Solver-3**, plus the **`sgm_uniform`** and

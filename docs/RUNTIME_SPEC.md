@@ -321,6 +321,15 @@ each new shape.
 - `cuda_graphs=True` + LPW prompts of varying token chunk counts → graph
   re-records per chunk count. Acceptable: first image at each length pays the
   warmup, subsequent images at the same length replay fast.
+- `cuda_graphs=True` on **Anima above 1024²** → **VRAM blow-up on 12 GB cards**.
+  Anima's CFG runs cond/uncond as two separate forwards with different
+  conditioning shapes, so each step captures two graph pools. Per-pool
+  activation memory scales as O(tokens²) (DiT self-attention), and the Anima
+  tokenizer doesn't pad — so at 1024×1536 each pool is roughly 2× the size of
+  the 1024² pool. The two resident pools + ~4 GB resident DiT exceed 12 GB.
+  At 1024² the combo fits and gives the 1.47× speedup (see benchmark below);
+  above that, use `compile=True` alone (no `cuda_graphs`) — eager activations
+  are transient, so the higher resolution still fits.
 
 ### Measured on RTX 2060 (Turing sm_75), fp16, 20 steps
 
@@ -353,8 +362,9 @@ Findings:
 
 | Stack | Recommended |
 |---|---|
-| Anima, fixed resolution | `cudnn_benchmark=True, compile=True, cuda_graphs=True` |
-| Anima, varying resolutions / heavy LPW | `cudnn_benchmark=True, compile=True` (skip cuda_graphs to avoid re-records) |
+| Anima at 1024² on 12 GB | `cudnn_benchmark=True, compile=True, cuda_graphs=True` |
+| Anima above 1024² (e.g. 1024×1536) on 12 GB | `cudnn_benchmark=True, compile=True` (skip `cuda_graphs` — two cond/uncond pools × O(tokens²) per pool OOMs above 1024², see Compose rules) |
+| Anima, varying resolutions / heavy LPW | `cudnn_benchmark=True, compile=True` (skip `cuda_graphs` to avoid per-shape re-records and pool growth) |
 | SDXL on Turing (RTX 20-series) | `cudnn_benchmark=True` only |
 | SDXL on Ampere+ (RTX 30/40-series) | `cudnn_benchmark=True, channels_last=True, compile=True` (validate locally; try cuda_graphs=True if shapes are stable) |
 | SD1.5, any GPU | flags optional — small absolute speedup |
