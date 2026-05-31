@@ -43,6 +43,13 @@ from .loading import load_state_dict
 
 _CPU = torch.device("cpu")
 
+
+def _eager(module):
+    """Unwrap ``torch.compile``'s ``OptimizedModule`` so ``named_modules()`` yields
+    the original kohya/dotted paths instead of ``_orig_mod.<name>``. A no-op for
+    eager modules (anything not produced by ``torch.compile``)."""
+    return getattr(module, "_orig_mod", module)
+
 # Tensor-name suffixes -> the role we file them under. A module's keys share a
 # base (the kohya module name); the suffix says which factor each tensor is.
 _SUFFIXES = [
@@ -246,17 +253,18 @@ def _build_targets(bundle) -> dict[str, tuple[torch.Tensor, int | None, int | No
     ``in_proj_weight``."""
     targets: dict[str, tuple[torch.Tensor, int | None, int | None]] = {}
 
+    backbone = _eager(bundle.backbone)
     if getattr(bundle.spec, "architecture", None) == "anima":
         # Anima LoRAs come in two conventions, both targeting the DiT blocks:
         #   - native ComfyUI/musubi: dotted paths under ``diffusion_model.``
         #     (e.g. diffusion_model.blocks.0.self_attn.q_proj), lora_A/lora_B;
         #   - LyCORIS/kohya: underscore-mangled ``lora_unet_blocks_0_self_attn_q_proj``.
         # Register the DiT under both so either file type maps.
-        _add_dotted_targets(targets, bundle.backbone, "diffusion_model.")
-        _add_module_targets(targets, bundle.backbone, ["lora_unet_"])
+        _add_dotted_targets(targets, backbone, "diffusion_model.")
+        _add_module_targets(targets, backbone, ["lora_unet_"])
         return targets
 
-    _add_module_targets(targets, bundle.backbone, ["lora_unet_"])
+    _add_module_targets(targets, backbone, ["lora_unet_"])
     if bundle.text_encoder is not None:
         # lora_te_ is SD1.5's prefix, lora_te1_ is SDXL's CLIP-L prefix; both name
         # the same module structure, so register the CLIP-L encoder under both.

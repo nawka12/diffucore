@@ -23,7 +23,7 @@ from .models import (
     AnimaDiT, QwenImageVAE, Qwen3TextEncoder,
 )
 from .models.unet import sdxl_unet_config
-from .runtime import DevicePolicy
+from .runtime import DevicePolicy, maybe_compile_backbone, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
 
 # On-disk prefixes (minus the top-level architecture prefix). SDXL keeps CLIP-L
@@ -115,6 +115,16 @@ def load_checkpoint(
     text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
     backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
+    # NHWC for the conv backbones when opted in. cuDNN picks faster channels-last
+    # kernels on Ampere+ fp16. Text encoders and 1D-attention modules stay default.
+    if policy.channels_last:
+        backbone = to_channels_last(backbone)
+        vae = to_channels_last(vae)
+
+    # torch.compile wraps the backbone after channels_last so Inductor's first
+    # specialize sees the final layout. Raises if the policy offloads the UNet.
+    backbone = maybe_compile_backbone(backbone, policy)
+
     return ModelBundle(
         spec=spec,
         schedule=schedule,
@@ -179,6 +189,8 @@ def load_anima_checkpoint(
     backbone = AnimaDiT()
     backbone.load_state_dict(sd_dit, strict=True)
     backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+
+    backbone = maybe_compile_backbone(backbone, policy)
 
     tokenizer = AnimaTokenizer()
 

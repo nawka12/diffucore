@@ -126,6 +126,31 @@ policy = DevicePolicy(device=torch.device("cuda"), offload=True, vae_tile=True)
 model = load_checkpoint("models/sdxl.safetensors", policy=policy)
 ```
 
+### Going faster
+
+Five perf flags on `DevicePolicy`. `cudnn_benchmark` defaults **on** (bit-exact,
+3-17 % free win); the rest default off and opt in only when you accept their
+tradeoffs:
+
+```python
+policy = DevicePolicy(
+    device=torch.device("cuda"),
+    # cudnn_benchmark=True,  # default on; set False to disable
+    tf32=True,              # TF32 for fp32 matmul/cuDNN on Ampere+
+    channels_last=True,     # NHWC for the SD/SDXL UNet + AutoencoderKL
+    compile=True,           # torch.compile the backbone (~30-60s warmup)
+    cuda_graphs=True,       # capture per-step graph via reduce-overhead mode
+)
+```
+
+`compile=True` is incompatible with offload modes that move the backbone
+(`offload=True` / `"full"`) — pair it with `offload=False` or `"encoders"`.
+`cuda_graphs=True` requires `compile=True` and assumes stable input shapes
+(same resolution + LPW chunk count); each new shape triggers one re-record.
+`channels_last` and `compile` are most effective on Ampere+ (RTX 30/40-series);
+on Turing (RTX 20-series) the cuDNN NCHW path is already near-optimal and
+`channels_last` may regress. See [Performance](#performance).
+
 ## Supported models
 
 | Family | Native res | Modes | Notes |
@@ -138,13 +163,50 @@ LoRA / LoKr adapters are supported on all three.
 
 ## Performance
 
-Measured on an RTX 2060 (12 GB), fp16, 20 steps:
+Measured on an RTX 2060 (12 GB, Turing sm_75), fp16, 20 steps.
+
+**Default behavior** (`cudnn_benchmark=True`, the rest off):
 
 | Model | Resolution | Time | Peak VRAM |
 |---|---|---|---|
-| SD 1.5 | 512² | ~3.6 s | ~3.2 GB |
-| SDXL | 1024² | ~19 s | ~10.7 GB (≈6.6 GB with offload) |
-| Anima | 1024² | ~46 s | ~8.6 GB |
+| SD 1.5 | 512² | ~2.83 s | ~3.2 GB |
+| SDXL | 1024² | ~16.89 s | ~10.7 GB (≈6.6 GB with offload) |
+| Anima | 1024² | ~46.33 s | ~8.6 GB |
+
+**Pre-PR-A baseline** (all flags off, for comparison only):
+
+| Model | Time | Default speedup |
+|---|---|---|
+| SD 1.5 | ~3.01 s | 1.06× |
+| SDXL | ~19.84 s | 1.17× |
+| Anima | ~52.20 s | 1.13× |
+
+**With additional opt-in flags** stacked on top (same card, same prompt/seed):
+
+| Model | Best time | Speedup vs pre-PR-A | Winning flags (over the default) |
+|---|---|---|---|
+| SD 1.5 | ~2.78 s | 1.08× | `+ channels_last` |
+| SDXL | ~16.89 s | 1.17× | (none — default is the winner) |
+| Anima | ~35.55 s | **1.47×** | `+ compile + cuda_graphs` |
+
+Findings:
+
+- `cudnn_benchmark=True` is a free, bit-exact win on every model (3-17 %).
+  **It's the default** as of PR-A; the pre-PR-A numbers above are baselines you
+  no longer have to opt in to. Set `cudnn_benchmark=False` to restore the old
+  path (e.g. for diffusers byte-equivalence comparisons).
+- `compile=True` is the headline win on Anima (~33-41 % on Turing; expect more
+  on Ampere+). Its one-time warmup is ~30-180 s depending on model size, paid
+  at load.
+- `cuda_graphs=True` (requires `compile=True`) adds a small extra speedup on
+  top of compile (~5 % on Anima Turing) and produces *more deterministic*
+  output (PSNR 54.7 dB vs 29.0 dB for compile-alone), because
+  `mode="reduce-overhead", dynamic=False` selects kernels consistently.
+- `channels_last=True` and `compile=True` are hardware-sensitive: on Turing
+  they help SD1.5 marginally and slightly regress on SDXL. On Ampere+ both
+  typically help more.
+- `tf32=True` is a no-op for diffucore's fp16 backbones; only the fp32 VAE
+  benefits, and that's one call per image.
 
 ## Status
 

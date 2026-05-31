@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 from PIL import Image
 
+from ..runtime import perf_context
 # ``img2img_start`` / ``preprocess_image`` live in ``._base`` (shared with inpaint);
 # re-exported here so they stay importable from this module.
 from ._base import _Pipeline, img2img_start, preprocess_image  # noqa: F401
@@ -48,18 +49,19 @@ class ImageToImage(_Pipeline):
         if height is None:
             height = model.spec.image_size
 
-        cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
-        cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
+        with perf_context(policy):
+            cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
+            cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
 
-        sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
-        sigmas = sigmas[img2img_start(steps, strength):]
+            sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
+            sigmas = sigmas[img2img_start(steps, strength):]
 
-        generator = torch.Generator(device=device)
-        if seed is not None:
-            generator.manual_seed(seed)
-        z0 = self._encode_image(init_image, width, height, policy, generator)
-        noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
-        x = z0 + noise * sigmas[0]
+            generator = torch.Generator(device=device)
+            if seed is not None:
+                generator.manual_seed(seed)
+            z0 = self._encode_image(init_image, width, height, policy, generator)
+            noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
+            x = z0 + noise * sigmas[0]
 
-        x0 = self._sample(sampler, cfg, x, sigmas, policy)
-        return self._decode(x0, policy, width, height)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy)
+            return self._decode(x0, policy, width, height)

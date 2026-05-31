@@ -16,6 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from ..runtime import perf_context
 from ..sampling import MaskedDenoiser
 from ._base import _Pipeline, img2img_start, preprocess_image  # noqa: F401  (re-export)
 
@@ -62,25 +63,26 @@ class Inpaint(_Pipeline):
         if height is None:
             height = model.spec.image_size
 
-        cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
-        cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
+        with perf_context(policy):
+            cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
+            cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
 
-        sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
-        sigmas = sigmas[img2img_start(steps, strength):]
+            sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
+            sigmas = sigmas[img2img_start(steps, strength):]
 
-        generator = torch.Generator(device=device)
-        if seed is not None:
-            generator.manual_seed(seed)
-        z0 = self._encode_image(init_image, width, height, policy, generator)
-        noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
-        x = z0 + noise * sigmas[0]
+            generator = torch.Generator(device=device)
+            if seed is not None:
+                generator.manual_seed(seed)
+            z0 = self._encode_image(init_image, width, height, policy, generator)
+            noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
+            x = z0 + noise * sigmas[0]
 
-        mask = preprocess_mask(mask_image, width, height).to(device, compute_dtype)
-        masked = MaskedDenoiser(cfg, z0, mask)
+            mask = preprocess_mask(mask_image, width, height).to(device, compute_dtype)
+            masked = MaskedDenoiser(cfg, z0, mask)
 
-        x0 = self._sample(sampler, masked, x, sigmas, policy)
-        image = self._decode(x0, policy, width, height)
-        return self._composite(image, init_image, mask_image, width, height)
+            x0 = self._sample(sampler, masked, x, sigmas, policy)
+            image = self._decode(x0, policy, width, height)
+            return self._composite(image, init_image, mask_image, width, height)
 
     @staticmethod
     def _composite(generated, init_image, mask_image, width, height) -> Image.Image:

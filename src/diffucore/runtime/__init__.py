@@ -41,6 +41,30 @@ class DevicePolicy:
     offload: bool | str = False
     vae_tile: bool = False
     vae_tile_threshold: int = 768
+    # --- opt-in perf flags (PR-A). ``cudnn_benchmark`` defaults **on** because
+    # it's bit-exact and gives 3-17 % across SD1.5/SDXL/Anima (measured RTX 2060)
+    # for the cost of one autotune step on first call; set False to disable.
+    # ``tf32`` and ``channels_last`` default off — they're hardware-sensitive
+    # (Ampere+) and not bit-exact, so opt-in only. ``channels_last`` converts
+    # conv backbones (SD UNet, AutoencoderKL) to NHWC; transformer-only modules
+    # (Anima DiT) and 3D-conv modules (Qwen-Image VAE) are unaffected.
+    cudnn_benchmark: bool = True
+    tf32: bool = False
+    channels_last: bool = False
+    # --- opt-in compile (PR-B). When True, the backbone (SD/SDXL UNet or Anima
+    # DiT) is wrapped with ``torch.compile(dynamic=True)`` at load. Pays a one-
+    # time warmup on the first call (10-60s depending on platform), persisted
+    # for the rest of the process. Incompatible with offload modes that move
+    # the UNet on/off the GPU each image (the compiled artifact specializes on
+    # the resident device); rejected with a clear error at load.
+    compile: bool = False
+    # --- opt-in CUDA Graphs (PR-C). When True (requires compile=True), the
+    # backbone is compiled with ``mode="reduce-overhead"`` so Inductor captures
+    # the per-step forward into a CUDA Graph and replays it each step. Near-zero
+    # Python/dispatcher overhead on top of PR-B. Recompiles on any input shape
+    # change (resolution, LPW chunk count), so the first image at each new
+    # shape pays a warmup; subsequent images at the same shape are fast.
+    cuda_graphs: bool = False
 
     def __post_init__(self):
         if self.offload not in (False, True, "full", "encoders"):
@@ -70,6 +94,84 @@ class DevicePolicy:
             return cls(device=torch.device("cuda"), compute_dtype=torch.float16)
         # CPU fallback (testing only): fp16 is unsupported on most CPUs.
         return cls(device=torch.device("cpu"), compute_dtype=torch.float32)
+
+
+def maybe_compile_backbone(backbone: torch.nn.Module, policy: "DevicePolicy") -> torch.nn.Module:
+    """Wrap a backbone with ``torch.compile`` when ``policy.compile`` is on.
+
+    Returns the module unchanged when the flag is off (default). When on, raises
+    if the policy also offloads the backbone (the compiled artifact specializes
+    on the resident device — round-tripping it through CPU each image defeats
+    the point and can crash).
+
+    Two compile modes:
+      * ``compile=True`` alone — ``torch.compile(dynamic=True)``. Inductor codegen
+        with shape-flexible graphs (LPW, varying resolutions just re-trace
+        cheaply). One warmup at load, fast steps thereafter.
+      * ``compile=True, cuda_graphs=True`` — ``torch.compile(mode="reduce-overhead",
+        dynamic=False)``. Inductor + CUDA Graphs: the per-step forward is
+        captured once and replayed, removing nearly all Python/dispatcher
+        overhead. Re-records on any input shape change, so the first image at
+        each new resolution / LPW chunk count pays a warmup.
+    """
+    if not policy.compile:
+        if policy.cuda_graphs:
+            raise ValueError(
+                "policy.cuda_graphs=True requires policy.compile=True (CUDA Graphs "
+                "are captured by torch.compile's reduce-overhead mode)."
+            )
+        return backbone
+    if policy.offload_unet:
+        raise ValueError(
+            "policy.compile=True is incompatible with offload modes that move the "
+            "backbone on/off the GPU (True/'full'); use offload='encoders' or False."
+        )
+    if policy.cuda_graphs:
+        return torch.compile(backbone, mode="reduce-overhead", dynamic=False)
+    return torch.compile(backbone, dynamic=True)
+
+
+def to_channels_last(module: torch.nn.Module) -> torch.nn.Module:
+    """Convert a conv-heavy module's parameters to NHWC memory format in place.
+    Intended for the SD UNet and AutoencoderKL — on Ampere+ fp16, cuDNN picks
+    faster NHWC conv kernels and skips the implicit layout transpose. No-op
+    semantically (output values unchanged within fp16 tolerance); skip for
+    transformer-only modules (Anima DiT) where there's no conv to benefit.
+    """
+    return module.to(memory_format=torch.channels_last)
+
+
+@contextmanager
+def perf_context(policy: "DevicePolicy"):
+    """Flip cuDNN / matmul backend flags for the duration of a pipeline call.
+
+    Reads ``policy.cudnn_benchmark`` and ``policy.tf32`` and toggles the
+    corresponding ``torch.backends`` flags, restoring the previous values on
+    exit. A no-op when both flags are False (the default) — the global state
+    is read but not written, so the existing bit-exact path is unchanged.
+
+    ``cudnn_benchmark`` lets cuDNN pick the fastest conv kernel for each input
+    shape; helpful for the SD/SDXL UNet (fixed shapes per run, so the autotune
+    cost is paid once). ``tf32`` enables TF32 on Ampere+ for fp32 matmul and
+    cuDNN — affects only fp32 paths (the VAE), fp16 weights are unchanged.
+    """
+    if not (policy.cudnn_benchmark or policy.tf32):
+        yield
+        return
+    prev_bench = torch.backends.cudnn.benchmark
+    prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        if policy.cudnn_benchmark:
+            torch.backends.cudnn.benchmark = True
+        if policy.tf32:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = prev_bench
+        torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
+        torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
 
 @contextmanager
@@ -165,4 +267,4 @@ def _tile_starts(size: int, tile: int, step: int) -> list[int]:
     return starts
 
 
-__all__ = ["DevicePolicy", "on_device", "staged", "tiled_vae_decode"]
+__all__ = ["DevicePolicy", "maybe_compile_backbone", "on_device", "perf_context", "staged", "tiled_vae_decode", "to_channels_last"]

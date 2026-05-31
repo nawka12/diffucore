@@ -167,6 +167,11 @@ class _Pipeline:
         )
 
     def _sample(self, sampler, cfg, x, sigmas, policy):
+        # Match the input layout to the (NHWC) UNet weights when channels_last is
+        # on, so cuDNN runs entirely in channels-last instead of transposing each
+        # step. Cheap one-shot reorder; semantically a no-op.
+        if policy.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
         with torch.no_grad():
             with staged([self.model.backbone], policy.device, policy.offload_unet):
                 with _step_progress(len(sigmas) - 1) as on_step:
@@ -176,6 +181,8 @@ class _Pipeline:
     def _decode(self, x0, policy, width, height) -> Image.Image:
         with torch.no_grad():
             latent = x0.to(policy.vae_dtype)
+            if policy.channels_last:
+                latent = latent.contiguous(memory_format=torch.channels_last)
             tile = policy.vae_tile or max(width, height) >= policy.vae_tile_threshold
             with staged([self.model.vae], policy.device, policy.offload_idle):
                 image = tiled_vae_decode(self.model.vae, latent) if tile else self.model.vae.decode(latent)
@@ -187,6 +194,8 @@ class _Pipeline:
         """Encode ``init_image`` to a scaled latent on the compute device, with the
         (fp32) VAE staged onto the GPU when offloading."""
         image = preprocess_image(init_image, width, height).to(policy.device, policy.vae_dtype)
+        if policy.channels_last:
+            image = image.contiguous(memory_format=torch.channels_last)
         with torch.no_grad():
             with staged([self.model.vae], policy.device, policy.offload_idle):
                 z = self.model.vae.encode(image, generator=generator)

@@ -258,6 +258,110 @@ tests run on CPU. Each SDXL test loads **one** pipeline at a time and frees it
 (`del` + `gc` + `empty_cache`) before the next — holding two resident copies
 overflows the 12 GB card.
 
+## Perf flags (PR-A + PR-B + PR-C)
+
+> **Status:** PR-A (cuDNN benchmark + TF32 + channels_last), PR-B (torch.compile),
+> and PR-C (CUDA Graphs via `mode="reduce-overhead"`) implemented and validated
+> on the RTX 2060 against SD1.5, SDXL (AkashicPulse-v3.0), and Anima
+> (anima-base-v1.0). Headline: Anima 52.2 s → 35.6 s (**1.47×**) with
+> `cudnn_benchmark + compile + cuda_graphs`; SDXL 19.8 s → 16.9 s (1.17×) with
+> `cudnn_benchmark` alone (bit-exact).
+
+Five flags on `DevicePolicy`. `cudnn_benchmark` defaults **on** (bit-exact,
+free win, measured 3-17 % across the lineup). The other four default off and
+opt in only:
+
+| Flag | Default | What it does | Cost | Bit-exact? |
+|---|---|---|---|---|
+| `cudnn_benchmark` | **True** | Enables cuDNN's per-shape kernel autotune for the run | one-step autotune on first call | yes (kernel choice doesn't change values) |
+| `tf32` | False | TF32 matmul + cuDNN on Ampere+ for **fp32 paths only** | tiny precision loss in fp32 ops | no (~1e-3 relative) |
+| `channels_last` | False | Converts SD UNet + AutoencoderKL to NHWC | one layout reorder at load + per-step input reorder | within fp16 tolerance (different kernel paths) |
+| `compile` | False | Wraps the backbone with `torch.compile(dynamic=True)` | one-time warmup ~30-180 s, paid at load | within fp16 tolerance (Inductor codegen) |
+| `cuda_graphs` | False | Switches compile to `mode="reduce-overhead", dynamic=False` — Inductor captures a CUDA Graph and replays it each step | re-records on any shape change (resolution, LPW chunk count) | within fp16 tolerance — *more* deterministic than compile alone (54.7 dB vs 29 dB on Anima) |
+
+### Mechanism
+
+`runtime.perf_context(policy)` is a context manager wrapping each pipeline call;
+it flips `torch.backends.cudnn.benchmark` / `cuda.matmul.allow_tf32` /
+`cudnn.allow_tf32` for the run and restores the previous values on exit. A
+**no-op** when both flags are off — the global state is read but never written,
+so the bit-exact path is preserved.
+
+`runtime.to_channels_last(module)` calls `.to(memory_format=torch.channels_last)`
+on the module. Applied to the SD/SDXL UNet and AutoencoderKL at bundle load.
+Latents passed into the conv backbones are reordered to NHWC in
+`_base._sample` / `_decode` / `_encode_image`.
+
+`runtime.maybe_compile_backbone(backbone, policy)` returns the eager module
+when `compile=False`. With `compile=True` alone it returns
+`torch.compile(backbone, dynamic=True)`. With `compile=True, cuda_graphs=True`
+it returns `torch.compile(backbone, mode="reduce-overhead", dynamic=False)` —
+Inductor captures the per-step forward into a CUDA Graph that the sampling
+loop replays each step, eliminating nearly all Python/dispatcher overhead.
+The **Anima DiT** and **SD/SDXL UNet** are the targets; the VAE is
+intentionally not compiled (single decode call per image — not worth the
+warmup). `dynamic=True` (compile-only mode) lets LPW-produced variable-length
+contexts share one graph; `dynamic=False` (CUDA-Graphs mode) re-records on
+each new shape.
+
+### Compose rules
+
+- `compile=True` + `offload=True/"full"` → **raises `ValueError` at load**. The
+  compiled artifact specializes on the resident device; round-tripping it
+  through CPU each image defeats the point and can crash.
+- `compile=True` + `offload="encoders"` → **allowed**. The UNet stays resident
+  in encoders mode; only the text encoders + VAE move.
+- `compile=True` + `apply_lora(...)` → **works**. The LoRA fuse path unwraps
+  `torch.compile`'s `OptimizedModule._orig_mod` to walk the original kohya
+  paths; weight values are mutated in place and the compiled graph picks them
+  up at the next call (Inductor specializes on shape, not value).
+- `cuda_graphs=True` without `compile=True` → **raises `ValueError` at load**.
+  CUDA Graphs are captured by `torch.compile`'s reduce-overhead mode, not
+  separately.
+- `cuda_graphs=True` + LPW prompts of varying token chunk counts → graph
+  re-records per chunk count. Acceptable: first image at each length pays the
+  warmup, subsequent images at the same length replay fast.
+
+### Measured on RTX 2060 (Turing sm_75), fp16, 20 steps
+
+```
+SD 1.5 (512²)               SDXL (1024²)                Anima (1024², er_sde)
+case            time speedup case            time speedup case            time speedup
+baseline       3.01s 1.00x   baseline      19.84s 1.00x   baseline      52.20s 1.00x
++cudnn         2.83s 1.06x   +cudnn        16.89s 1.17x   +cudnn        46.33s 1.13x
++tf32          2.96s 1.02x   +tf32         16.91s 1.17x   +tf32         47.72s 1.09x
++channels_last 2.79s 1.08x   +channels_last 18.77s 1.06x  (skip – DiT)
++compile       2.78s 1.08x   +compile      18.02s 1.10x   +compile      36.99s 1.41x
+                                                          +cuda_graphs  35.55s 1.47x
+```
+
+Findings:
+
+- **`cudnn_benchmark` is the universal win** — 3-17 %, bit-exact, free.
+- **`compile` lands big on Anima** (33 %), modest on SD1.5 (8 %), and slightly
+  *regresses* on SDXL on Turing. The Anima DiT is 28 transformer blocks where
+  Inductor has the most room to fuse; the SDXL UNet's conv-heavy path already
+  hits cuDNN's tuned kernels.
+- **`channels_last` is hardware-sensitive.** On Turing, NHWC fp16 conv kernels
+  aren't always faster than NCHW (cuDNN's autotune already picks well). On
+  Ampere+ (RTX 30/40-series, A100) NHWC + tensor cores typically give a clear
+  win. Recommend gating in docs by GPU generation.
+- **`tf32` is a no-op for fp16 backbones.** Only the fp32 VAE benefits, and
+  that's one call per image — buried in noise.
+
+### Recommendations by model + GPU
+
+| Stack | Recommended |
+|---|---|
+| Anima, fixed resolution | `cudnn_benchmark=True, compile=True, cuda_graphs=True` |
+| Anima, varying resolutions / heavy LPW | `cudnn_benchmark=True, compile=True` (skip cuda_graphs to avoid re-records) |
+| SDXL on Turing (RTX 20-series) | `cudnn_benchmark=True` only |
+| SDXL on Ampere+ (RTX 30/40-series) | `cudnn_benchmark=True, channels_last=True, compile=True` (validate locally; try cuda_graphs=True if shapes are stable) |
+| SD1.5, any GPU | flags optional — small absolute speedup |
+
+A power-user `offload="encoders" + compile=True` combo fits SDXL on 8 GB with
+the UNet compiled and resident.
+
 ## Pointers
 
 - Current peaks/footprints were measured on the RTX 2060 (see the table above);

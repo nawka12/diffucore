@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..runtime import staged
+from ..runtime import perf_context, staged
 from ._base import _step_progress
 from ..sampling import (
     FlowSamplingView,
@@ -98,77 +98,78 @@ def anima_text_to_image(
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
 
-    # ---- 1. tokenize cond + uncond
-    cond_tok = model.tokenizer(prompt)
-    uncond_tok = model.tokenizer(negative_prompt)
+    with perf_context(policy):
+        # ---- 1. tokenize cond + uncond
+        cond_tok = model.tokenizer(prompt)
+        uncond_tok = model.tokenizer(negative_prompt)
 
-    # ---- 2. encode with Qwen3 (staged onto device when offloading)
-    with staged([model.text_encoder], device, policy.offload_idle):
-        qwen_dtype = next(model.text_encoder.parameters()).dtype
-        cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
-        uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
-        del qwen_dtype  # silence unused warning if the Qwen3 dtype probe ever shifts
+        # ---- 2. encode with Qwen3 (staged onto device when offloading)
+        with staged([model.text_encoder], device, policy.offload_idle):
+            qwen_dtype = next(model.text_encoder.parameters()).dtype
+            cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
+            uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
+            del qwen_dtype  # silence unused warning if the Qwen3 dtype probe ever shifts
 
-    cond_t5 = cond_tok.t5_ids.to(device)
-    uncond_t5 = uncond_tok.t5_ids.to(device)
+        cond_t5 = cond_tok.t5_ids.to(device)
+        uncond_t5 = uncond_tok.t5_ids.to(device)
 
-    # ---- 3. σ schedule, init noise
-    if scheduler == "flow":
-        sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
-    else:
-        view = FlowSamplingView(shift, device=device, dtype=torch.float32)
-        schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
-        sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
-    h_lat, w_lat = height // 8, width // 8
-    gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
-    x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
-    # With σ_max == 1 the initial state is exactly pure noise (no rescale).
+        # ---- 3. σ schedule, init noise
+        if scheduler == "flow":
+            sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        else:
+            view = FlowSamplingView(shift, device=device, dtype=torch.float32)
+            schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
+            sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
+        h_lat, w_lat = height // 8, width // 8
+        gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+        x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
+        # With σ_max == 1 the initial state is exactly pure noise (no rescale).
 
-    # ---- 4. integrate the rectified-flow ODE/SDE
-    backbone = model.backbone
-    with torch.no_grad(), staged([backbone], device, policy.offload_unet):
-        if sampler == "euler":
-            total = len(sigmas) - 1
-            with _step_progress(total) as on_step:
-                for i in range(total):
-                    sigma, sigma_next = sigmas[i], sigmas[i + 1]
-                    x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
-                    t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
+        # ---- 4. integrate the rectified-flow ODE/SDE
+        backbone = model.backbone
+        with torch.no_grad(), staged([backbone], device, policy.offload_unet):
+            if sampler == "euler":
+                total = len(sigmas) - 1
+                with _step_progress(total) as on_step:
+                    for i in range(total):
+                        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+                        x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
+                        t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
+                        v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                        if cfg_scale == 1.0:
+                            v = v_cond
+                        else:
+                            v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                            v = v_uncond + cfg_scale * (v_cond - v_uncond)
+
+                        # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
+                        # (closed-form exact for any constant x0 estimate).
+                        x = x + (sigma_next - sigma).to(dtype) * v
+                        on_step(i, sigma, x, None)
+            else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
+                def denoise(x_in, sigma_b):
+                    """``model(x, σ) -> x0``: predict velocity (with CFG), return the
+                    CONST x0 estimate ``x − σ·v`` in fp32 for the solver math."""
+                    x_5d = x_in.to(dtype).unsqueeze(2)
+                    t = sigma_b.to(dtype)
                     v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
                     if cfg_scale == 1.0:
                         v = v_cond
                     else:
                         v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                    sig = sigma_b.float().view(-1, 1, 1, 1)
+                    return x_in.float() - sig * v.float()
 
-                    # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
-                    # (closed-form exact for any constant x0 estimate).
-                    x = x + (sigma_next - sigma).to(dtype) * v
-                    on_step(i, sigma, x, None)
-        else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
-            def denoise(x_in, sigma_b):
-                """``model(x, σ) -> x0``: predict velocity (with CFG), return the
-                CONST x0 estimate ``x − σ·v`` in fp32 for the solver math."""
-                x_5d = x_in.to(dtype).unsqueeze(2)
-                t = sigma_b.to(dtype)
-                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
-                if cfg_scale == 1.0:
-                    v = v_cond
-                else:
-                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
-                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
-                sig = sigma_b.float().view(-1, 1, 1, 1)
-                return x_in.float() - sig * v.float()
+                kwargs = {}
+                if sampler in _FLOW_AWARE_SAMPLERS:
+                    kwargs = dict(generator=gen, model_type="flow", shift=shift)
+                with _step_progress(len(sigmas) - 1) as on_step:
+                    x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
-            kwargs = {}
-            if sampler in _FLOW_AWARE_SAMPLERS:
-                kwargs = dict(generator=gen, model_type="flow", shift=shift)
-            with _step_progress(len(sigmas) - 1) as on_step:
-                x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
-
-    # ---- 5. process_out then decode
-    with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
-        z = model.vae.process_out(x.to(policy.vae_dtype))
-        image = model.vae.decode(z)
-    return _to_pil(image)
+        # ---- 5. process_out then decode
+        with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
+            z = model.vae.process_out(x.to(policy.vae_dtype))
+            image = model.vae.decode(z)
+        return _to_pil(image)

@@ -97,6 +97,36 @@ def test_fuses_unet_and_clip_deltas(tmp_path):
         deltas["lora_te_text_model_encoder_layers_0_self_attn_q_proj"])
 
 
+def test_fuses_through_compile_wrapper(tmp_path):
+    """LoRA must find its targets even when the backbone is wrapped by
+    ``torch.compile`` (which yields an OptimizedModule whose ``named_modules``
+    prefixes everything with ``_orig_mod.``). We simulate the wrapper directly
+    so the test stays platform-independent (Inductor isn't required here)."""
+    class _OptimizedShim(torch.nn.Module):
+        def __init__(self, orig):
+            super().__init__()
+            self._orig_mod = orig
+
+    unet = _tiny_unet()
+    wrapped = _OptimizedShim(unet)
+    bundle = _bundle(wrapped, None)
+
+    unet_q = unet.input_blocks[1][1].transformer_blocks[0].attn1.to_q
+    before = unet_q.weight.detach().clone()
+    gen = torch.Generator().manual_seed(7)
+    path, deltas = _write_lora(
+        tmp_path,
+        {"lora_unet_input_blocks_1_1_transformer_blocks_0_attn1_to_q": tuple(before.shape)},
+        rank=4, gen=gen,
+    )
+    report = apply_lora(bundle, path)
+    assert report.applied == 1 and report.unmatched == []
+    torch.testing.assert_close(
+        unet_q.weight - before,
+        deltas["lora_unet_input_blocks_1_1_transformer_blocks_0_attn1_to_q"],
+    )
+
+
 def test_fuses_unet_conv_proj_in(tmp_path):
     unet = _tiny_unet()
     bundle = _bundle(unet, None)

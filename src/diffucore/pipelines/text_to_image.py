@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import torch
 from PIL import Image
 
+from ..runtime import perf_context
 from ._anima import anima_text_to_image
 from ._base import _Pipeline
 
@@ -62,17 +63,18 @@ class TextToImage(_Pipeline):
         if height is None:
             height = model.spec.image_size
 
-        cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
-        cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
-        sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
+        with perf_context(policy):
+            cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
+            cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
+            sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
 
-        generator = torch.Generator(device=device)
-        if seed is not None:
-            generator.manual_seed(seed)
-        x = torch.randn(
-            1, 4, height // 8, width // 8,
-            generator=generator, device=device, dtype=compute_dtype,
-        ) * sigmas[0]
+            generator = torch.Generator(device=device)
+            if seed is not None:
+                generator.manual_seed(seed)
+            x = torch.randn(
+                1, 4, height // 8, width // 8,
+                generator=generator, device=device, dtype=compute_dtype,
+            ) * sigmas[0]
 
-        x0 = self._sample(sampler, cfg, x, sigmas, policy)
-        return self._decode(x0, policy, width, height)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy)
+            return self._decode(x0, policy, width, height)

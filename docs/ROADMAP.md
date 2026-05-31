@@ -147,6 +147,28 @@ The remaining extensions (each its own slice):
   tiny real-structure models (`tests/test_lora.py`, `tests/test_lora_swap.py`).
   Diffusers-format SD LoRAs and the LoHa variant are not supported (their keys
   are reported in `LoraReport.unmatched`).
+- **Inference perf flags — PR-A + PR-B + PR-C done.** Five knobs on
+  `DevicePolicy` (`cudnn_benchmark`, `tf32`, `channels_last`, `compile`,
+  `cuda_graphs`); `cudnn_benchmark` defaults **on** (bit-exact, 3-17 % free
+  win), the rest default off and opt-in only.
+  PR-A wires the cuDNN/matmul backend flags through a `runtime.perf_context`
+  context manager that flips state for the duration of a pipeline call and
+  restores it on exit, and converts the SD/SDXL UNet + AutoencoderKL to
+  channels_last NHWC at load. PR-B adds `torch.compile(backbone, dynamic=True)`
+  at bundle finalize, gated on the offload mode (raises if compile would race
+  CPU↔GPU shuttling under `offload=True`); LoRA's target walker unwraps
+  `OptimizedModule._orig_mod` so `apply_lora`/`remove_lora` still find kohya
+  paths through the compile wrapper. PR-C switches compile to
+  `mode="reduce-overhead", dynamic=False` when `cuda_graphs=True` so Inductor
+  captures a CUDA Graph and replays it per step; requires `compile=True` and
+  re-records on any input-shape change. Validated on the RTX 2060 (Turing)
+  against `v1-5-pruned-emaonly`, `AkashicPulse-v3.0` (SDXL) and
+  `anima-base-v1.0`: Anima 52.2 s → **35.6 s (1.47×)** with `cudnn_benchmark +
+  compile + cuda_graphs` (and *higher* PSNR than compile alone — 54.7 dB vs
+  29.0 dB — because static shapes pick consistent kernels), SDXL 19.8 s →
+  16.9 s (1.17×) with `cudnn_benchmark` alone (bit-exact). See
+  `docs/RUNTIME_SPEC.md` §Perf flags for the full results and per-architecture
+  recommendations.
 - **Sampler / scheduler set — done.** Beyond the original Euler/Heun/ancestral,
   the registry now carries **DPM2** (+ancestral), **DPM++** (`2m`, `sde`,
   `2m_sde`, `3m_sde`) and **ER-SDE-Solver-3**, plus the **`sgm_uniform`** and
