@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..runtime import perf_context, staged
+from ..runtime import perf_context, staged, tiled_vae_decode
 from ._base import _step_progress
 from ..sampling import (
     FlowSamplingView,
@@ -168,8 +168,10 @@ def anima_text_to_image(
                 with _step_progress(len(sigmas) - 1) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
-        # ---- 5. process_out then decode
+        # ---- 5. process_out then decode (tiled when requested or above threshold —
+        # Qwen-Image VAE decode is whole-tensor and OOMs on 12 GB above 1024²).
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z = model.vae.process_out(x.to(policy.vae_dtype))
-            image = model.vae.decode(z)
+            tile = policy.vae_tile or max(width, height) >= policy.vae_tile_threshold
+            image = tiled_vae_decode(model.vae, z) if tile else model.vae.decode(z)
         return _to_pil(image)
