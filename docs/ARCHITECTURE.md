@@ -52,7 +52,7 @@ src/diffucore/
   __init__.py            Public API re-exports.
   sampling/              Noise schedules, parameterizations, samplers, the loop.
     schedules.py         σ schedules: karras, exponential, polyexponential,
-                         sgm_uniform, simple, flow-matching.
+                         sgm_uniform, simple, flow-matching, ACAS.
     parameterization.py  betas -> σ table; σ<->t; eps / v prediction scalings.
     samplers.py          Euler/Heun/ancestral, DPM2(+ancestral), DPM++ (2M, SDE,
                          2M-SDE, 3M-SDE), ER-SDE — pure σ-space steppers, the

@@ -22,6 +22,7 @@ __all__ = [
     "exponential_schedule",
     "polyexponential_schedule",
     "flow_matching_schedule",
+    "acas_flow_schedule",
     "simple_schedule",
     "sgm_uniform_schedule",
     "FlowSamplingView",
@@ -119,6 +120,67 @@ def flow_matching_schedule(
     t = torch.arange(steps, 0, -1, device=device, dtype=dtype) / steps
     sigmas = shift * t / (1.0 + (shift - 1.0) * t)
     return append_zero(sigmas)
+
+
+def _beta_pdf(t: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
+    log_norm = math.lgamma(alpha + beta) - math.lgamma(alpha) - math.lgamma(beta)
+    return (log_norm + (alpha - 1.0) * t.log() + (beta - 1.0) * (1.0 - t).log()).exp()
+
+
+def acas_flow_schedule(
+    steps: int,
+    shift: float = 3.0,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+    grid_size: int = 4096,
+) -> torch.Tensor:
+    """Anima Curvature-Aware Shifted flow schedule.
+
+    ACAS keeps Anima's shifted rectified-flow mapping from time to sigma, but
+    samples the flow-time grid from a hand-shaped density instead of uniformly.
+    The density allocates extra evaluations to mid-noise semantic correction and
+    late low-noise line/detail refinement while preserving the pure-noise start.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if shift < 1.0:
+        raise ValueError("shift must be >= 1")
+    if grid_size < 16:
+        raise ValueError("grid_size must be >= 16")
+    if steps == 1:
+        sigmas = torch.ones(1, device=device, dtype=dtype)
+        return append_zero(sigmas)
+
+    work_device = torch.device(device)
+    work_dtype = torch.float32
+    t_min = 1.0 / steps
+    eps = torch.finfo(work_dtype).eps
+    t_grid = torch.linspace(t_min, 1.0 - eps, grid_size, device=work_device, dtype=work_dtype)
+
+    mid = _beta_pdf(t_grid, 2.2, 2.8)
+    low = _beta_pdf(t_grid, 0.9, 4.5)
+    high = torch.sigmoid((t_grid - 0.72) / 0.08)
+    weight = 0.20 + 1.10 * mid + 0.55 * low + 0.25 * high
+
+    dt = t_grid[1:] - t_grid[:-1]
+    area = 0.5 * (weight[1:] + weight[:-1]) * dt
+    cdf = torch.cat([weight.new_zeros(1), area.cumsum(0)])
+    cdf = cdf / cdf[-1]
+
+    targets = torch.linspace(1.0, 0.0, steps, device=work_device, dtype=work_dtype)
+    idx = torch.searchsorted(cdf, targets).clamp(1, grid_size - 1)
+    lo = idx - 1
+    hi = idx
+    cdf_lo = cdf[lo]
+    cdf_hi = cdf[hi]
+    frac = (targets - cdf_lo) / (cdf_hi - cdf_lo).clamp_min(eps)
+    t = t_grid[lo] + frac * (t_grid[hi] - t_grid[lo])
+    t[0] = 1.0
+    t[-1] = t_min
+
+    sigmas = shift * t / (1.0 + (shift - 1.0) * t)
+    return append_zero(sigmas.to(dtype=dtype))
 
 
 class FlowSamplingView:

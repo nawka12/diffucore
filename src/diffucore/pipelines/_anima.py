@@ -29,6 +29,7 @@ from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
 from ._base import PipelineInfo, _step_progress
 from ..sampling import (
     FlowSamplingView,
+    acas_flow_schedule,
     flow_matching_schedule,
     get_sampler,
     sgm_uniform_schedule,
@@ -86,13 +87,14 @@ def anima_text_to_image(
     ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
     closed-form rectified-flow step; the rest run through the shared sampler
     registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
-    ``"flow"`` (the rectified-flow t-uniform default), ``"sgm_uniform"`` or
-    ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
+    ``"flow"`` (the rectified-flow t-uniform default), ``"acas"`` (Anima
+    curvature-aware shifted flow), ``"sgm_uniform"`` or ``"simple"`` (ComfyUI's,
+    evaluated against a flow sigma table).
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
-    if scheduler not in ("flow", "sgm_uniform", "simple"):
-        raise ValueError(f"Anima scheduler must be 'flow', 'sgm_uniform' or 'simple'; got {scheduler!r}")
+    if scheduler not in ("flow", "acas", "sgm_uniform", "simple"):
+        raise ValueError(f"Anima scheduler must be 'flow', 'acas', 'sgm_uniform' or 'simple'; got {scheduler!r}")
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -118,6 +120,8 @@ def anima_text_to_image(
         # ---- 3. σ schedule, init noise
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        elif scheduler == "acas":
+            sigmas = acas_flow_schedule(steps, shift=shift, device=device, dtype=torch.float32)
         else:
             view = FlowSamplingView(shift, device=device, dtype=torch.float32)
             schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
