@@ -131,6 +131,11 @@ image = pipe(
 )                                                       # -> PIL.Image
 ```
 
+The default return stays a plain `PIL.Image`. Callers that need UI integration
+can pass `progress_callback(step, total)` and `return_info=True`; in that mode
+the pipeline returns `(image, PipelineInfo)`, where `PipelineInfo.vae_decode_mode`
+reports whether the VAE decode path was `"tiled"` or `"untiled"`.
+
 Anima ships as three separate files (DiT + Qwen-Image VAE + Qwen3-0.6B TE) so
 the entry point takes the trio:
 
@@ -179,7 +184,9 @@ Targeting a 12 GB RTX 2060 shapes the defaults:
 By default placement is "everything resident": `load_checkpoint` eagerly moves
 all modules to the device. Opting into `DevicePolicy(offload=True)` instead loads
 the modules on CPU and the pipeline shuttles each onto the GPU around its stage
-(`on_device`), and `tiled_vae_decode` bounds decode memory by tiling (auto ≥768 px).
+(`on_device`), and `tiled_vae_decode` bounds decode memory by tiling. The tile-vs-
+untiled decision is made at decode time from the resolved policy and available
+VRAM, and is surfaced through `PipelineInfo` when `return_info=True`.
 On the RTX 2060 this takes 1024² SDXL from a 9.97 GB resident/untiled peak down to
 6.6 GB, byte-identically. The measured breakdown, design, and verification are in
 the build sheet [`RUNTIME_SPEC.md`](RUNTIME_SPEC.md).

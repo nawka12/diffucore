@@ -12,14 +12,14 @@ share enough machinery with SD/SDXL to ride on top of ``_Pipeline``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from PIL import Image
 
 from ..runtime import perf_context
 from ._anima import anima_text_to_image
-from ._base import _Pipeline
+from ._base import PipelineInfo, _Pipeline
 
 if TYPE_CHECKING:  # avoid importing the bundle (and torch-heavy models) eagerly
     from ..bundle import ModelBundle
@@ -40,6 +40,8 @@ class TextToImage(_Pipeline):
         scheduler: str = "karras",
         seed: int | None = None,
         shift: float = 3.0,
+        progress_callback: Callable[[int, int], None] | None = None,
+        return_info: bool = False,
     ) -> Image.Image:
         if self.model.spec.architecture == "anima":
             # The default scheduler ("karras") and other SD-only schedules don't
@@ -51,6 +53,8 @@ class TextToImage(_Pipeline):
                 width=width if width is not None else self.model.spec.image_size,
                 height=height if height is not None else self.model.spec.image_size,
                 seed=seed, sampler=sampler, scheduler=anima_scheduler,
+                progress_callback=progress_callback,
+                return_info=return_info,
             )
         """Return a ``PIL.Image`` for ``prompt``. ``width``/``height`` default to
         the model's native resolution (512 for SD1.5, 1024 for SDXL). ``cfg_rescale``
@@ -76,5 +80,7 @@ class TextToImage(_Pipeline):
                 generator=generator, device=device, dtype=compute_dtype,
             ) * sigmas[0]
 
-            x0 = self._sample(sampler, cfg, x, sigmas, policy)
-            return self._decode(x0, policy, width, height)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback)
+            image, vae_decode_mode = self._decode(x0, policy, width, height)
+            info = PipelineInfo(vae_decode_mode=vae_decode_mode)
+            return (image, info) if return_info else image

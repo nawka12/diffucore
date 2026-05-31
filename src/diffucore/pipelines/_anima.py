@@ -19,14 +19,14 @@ backbone in an adapter.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import torch
 from PIL import Image
 
 from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
-from ._base import _step_progress
+from ._base import PipelineInfo, _step_progress
 from ..sampling import (
     FlowSamplingView,
     flow_matching_schedule,
@@ -74,6 +74,8 @@ def anima_text_to_image(
     seed: int | None = None,
     sampler: str = "euler",
     scheduler: str = "flow",
+    progress_callback: Callable[[int, int], None] | None = None,
+    return_info: bool = False,
 ) -> Image.Image:
     """Drive Anima's text-to-image path end-to-end.
 
@@ -130,7 +132,7 @@ def anima_text_to_image(
         with torch.no_grad(), staged([backbone], device, policy.offload_unet):
             if sampler == "euler":
                 total = len(sigmas) - 1
-                with _step_progress(total) as on_step:
+                with _step_progress(total, progress_callback) as on_step:
                     for i in range(total):
                         sigma, sigma_next = sigmas[i], sigmas[i + 1]
                         x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
@@ -165,7 +167,7 @@ def anima_text_to_image(
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
                     kwargs = dict(generator=gen, model_type="flow", shift=shift)
-                with _step_progress(len(sigmas) - 1) as on_step:
+                with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         # ---- 5. process_out then decode (tiled when explicitly requested, or
@@ -176,4 +178,6 @@ def anima_text_to_image(
             z = model.vae.process_out(x.to(policy.vae_dtype))
             tile = policy.vae_tile or not can_decode_untiled(model.vae, z.shape, device)
             image = tiled_vae_decode(model.vae, z) if tile else model.vae.decode(z)
-        return _to_pil(image)
+        image = _to_pil(image)
+        info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
+        return (image, info) if return_info else image

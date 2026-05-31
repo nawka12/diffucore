@@ -243,6 +243,7 @@ Each is independently shippable and verifiable; do them in order.
 | R2 | Tiled VAE decode (auto from a free-VRAM check via `can_decode_untiled`; original 768 px threshold superseded) | Tiled vs untiled PSNR > 35 dB; SDXL decode peak drops; seed-deterministic | ✅ PSNR 37.55 dB |
 | R3 | Sequential CPU offload (`offload=True`) | offload vs no-offload **byte-identical**; SDXL peak ≤ ~6 GB | ✅ byte-identical; peak 6.6 GB (UNet-floor bound) |
 | R4 | `offload="encoders"` cheap mode + 8 GB emulation test | 1024² SDXL completes under an 8 GB cap | ✅ byte-identical (both modes); fits 8 GB cap |
+| R5 | UI-facing runtime reporting | Pipelines can report sampled steps and the actual VAE decode mode without monkey-patching internals | ✅ `progress_callback` + `PipelineInfo.vae_decode_mode` |
 
 **R4 notes.** `offload` now accepts `"encoders"` alongside `False`/`True` (`True`
 == `"full"`). `DevicePolicy` splits placement into two groups via `offload_idle`
@@ -258,6 +259,14 @@ allocator cap (`set_per_process_memory_fraction`). Mode-flag + invalid-mode unit
 tests run on CPU. Each SDXL test loads **one** pipeline at a time and frees it
 (`del` + `gc` + `empty_cache`) before the next — holding two resident copies
 overflows the 12 GB card.
+
+**R5 notes.** `TextToImage`, `ImageToImage`, and `Inpaint` keep returning a
+plain `PIL.Image` by default. UIs can pass `progress_callback(step, total)` to
+observe sampler progress and `return_info=True` to receive `(image, PipelineInfo)`.
+`PipelineInfo.vae_decode_mode` is set after the real decode decision, so it
+reports `"tiled"` when `policy.vae_tile` forced tiling or the free-VRAM check
+selected `tiled_vae_decode`, and `"untiled"` when the pipeline called
+`vae.decode` directly.
 
 ## Perf flags (PR-A + PR-B + PR-C)
 

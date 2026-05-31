@@ -10,7 +10,8 @@ stays a thin wrapper. Placement (offload / tiling) is read from the bundle's
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 import torch
@@ -50,6 +51,13 @@ _SCHEDULE_FROM_MODEL = {
 }
 
 
+@dataclass
+class PipelineInfo:
+    """Runtime details produced during generation."""
+
+    vae_decode_mode: str = "unknown"
+
+
 def img2img_start(steps: int, strength: float) -> int:
     """Index into the full ([steps + 1]) sigma schedule where a strength-based run
     starts. Runs ``int(strength * steps)`` denoising steps (the k-diffusion / A1111
@@ -68,12 +76,17 @@ def preprocess_image(image: Image.Image, width: int, height: int) -> torch.Tenso
 
 
 @contextmanager
-def _step_progress(total: int):
+def _step_progress(total: int, progress_callback: Callable[[int, int], None] | None = None):
     """A tqdm bar over the ``total`` sampling steps, advanced through the
     sampler's ``callback`` hook. Yields the callback; closes the bar on exit."""
     bar = tqdm(total=total, desc="sampling", leave=False)
     try:
-        yield lambda *_: bar.update(1)
+        def on_step(*_):
+            bar.update(1)
+            if progress_callback is not None:
+                progress_callback(bar.n, total)
+
+        yield on_step
     finally:
         bar.close()
 
@@ -166,7 +179,7 @@ class _Pipeline:
             dtype=dtype,
         )
 
-    def _sample(self, sampler, cfg, x, sigmas, policy):
+    def _sample(self, sampler, cfg, x, sigmas, policy, progress_callback=None):
         # Match the input layout to the (NHWC) UNet weights when channels_last is
         # on, so cuDNN runs entirely in channels-last instead of transposing each
         # step. Cheap one-shot reorder; semantically a no-op.
@@ -174,11 +187,11 @@ class _Pipeline:
             x = x.contiguous(memory_format=torch.channels_last)
         with torch.no_grad():
             with staged([self.model.backbone], policy.device, policy.offload_unet):
-                with _step_progress(len(sigmas) - 1) as on_step:
+                with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
                     return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
 
     # --- decode --------------------------------------------------------------
-    def _decode(self, x0, policy, width, height) -> Image.Image:
+    def _decode(self, x0, policy, width, height) -> tuple[Image.Image, str]:
         del width, height  # tile decision now reads free VRAM, not resolution
         with torch.no_grad():
             latent = x0.to(policy.vae_dtype)
@@ -193,7 +206,7 @@ class _Pipeline:
                 )
                 image = tiled_vae_decode(self.model.vae, latent) if tile else self.model.vae.decode(latent)
         image = ((image.clamp(-1, 1) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
-        return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy())
+        return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy()), ("tiled" if tile else "untiled")
 
     # --- encode (img2img / inpaint) ------------------------------------------
     def _encode_image(self, init_image, width, height, policy, generator):

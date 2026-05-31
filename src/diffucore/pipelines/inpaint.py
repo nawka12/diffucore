@@ -12,13 +12,15 @@ diffusers convention.
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
 import torch
 from PIL import Image
 
 from ..runtime import perf_context
 from ..sampling import MaskedDenoiser
-from ._base import _Pipeline, img2img_start, preprocess_image  # noqa: F401  (re-export)
+from ._base import PipelineInfo, _Pipeline, img2img_start, preprocess_image  # noqa: F401  (re-export)
 
 
 def preprocess_mask(mask: Image.Image, width: int, height: int) -> torch.Tensor:
@@ -47,6 +49,8 @@ class Inpaint(_Pipeline):
         sampler: str = "euler",
         scheduler: str = "karras",
         seed: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        return_info: bool = False,
     ) -> Image.Image:
         """Repaint the white region of ``mask_image`` in ``init_image`` to match
         ``prompt``; the black region is preserved exactly. ``width``/``height``
@@ -80,9 +84,11 @@ class Inpaint(_Pipeline):
             mask = preprocess_mask(mask_image, width, height).to(device, compute_dtype)
             masked = MaskedDenoiser(cfg, z0, mask)
 
-            x0 = self._sample(sampler, masked, x, sigmas, policy)
-            image = self._decode(x0, policy, width, height)
-            return self._composite(image, init_image, mask_image, width, height)
+            x0 = self._sample(sampler, masked, x, sigmas, policy, progress_callback)
+            image, vae_decode_mode = self._decode(x0, policy, width, height)
+            image = self._composite(image, init_image, mask_image, width, height)
+            info = PipelineInfo(vae_decode_mode=vae_decode_mode)
+            return (image, info) if return_info else image
 
     @staticmethod
     def _composite(generated, init_image, mask_image, width, height) -> Image.Image:

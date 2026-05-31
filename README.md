@@ -101,6 +101,25 @@ edit = ImageToImage(model)(prompt, Image.open("input.png"), strength=0.6, seed=0
 fill = Inpaint(model)(prompt, Image.open("input.png"), Image.open("mask.png"), seed=0)
 ```
 
+### Progress and runtime info
+
+Pipelines return a `PIL.Image` by default. UIs can opt into step callbacks and
+structured runtime info without changing the default API:
+
+```python
+from diffucore import PipelineInfo, TextToImage
+
+steps_seen = []
+image, info = TextToImage(model)(
+    prompt,
+    steps=25,
+    progress_callback=lambda step, total: steps_seen.append((step, total)),
+    return_info=True,
+)
+assert isinstance(info, PipelineInfo)
+print(info.vae_decode_mode)  # "tiled" or "untiled"
+```
+
 ### LoRA / LoKr
 
 ```python

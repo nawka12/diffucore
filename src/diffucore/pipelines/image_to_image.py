@@ -10,13 +10,15 @@ the shared :class:`._base._Pipeline` machinery, so offload + tiling apply here t
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from PIL import Image
 
 from ..runtime import perf_context
 # ``img2img_start`` / ``preprocess_image`` live in ``._base`` (shared with inpaint);
 # re-exported here so they stay importable from this module.
-from ._base import _Pipeline, img2img_start, preprocess_image  # noqa: F401
+from ._base import PipelineInfo, _Pipeline, img2img_start, preprocess_image  # noqa: F401
 
 
 class ImageToImage(_Pipeline):
@@ -35,6 +37,8 @@ class ImageToImage(_Pipeline):
         sampler: str = "euler",
         scheduler: str = "karras",
         seed: int | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        return_info: bool = False,
     ) -> Image.Image:
         """Return a ``PIL.Image`` derived from ``init_image``. ``width``/``height``
         default to the model's native resolution; ``init_image`` is resized to fit.
@@ -63,5 +67,7 @@ class ImageToImage(_Pipeline):
             noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
             x = z0 + noise * sigmas[0]
 
-            x0 = self._sample(sampler, cfg, x, sigmas, policy)
-            return self._decode(x0, policy, width, height)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback)
+            image, vae_decode_mode = self._decode(x0, policy, width, height)
+            info = PipelineInfo(vae_decode_mode=vae_decode_mode)
+            return (image, info) if return_info else image
