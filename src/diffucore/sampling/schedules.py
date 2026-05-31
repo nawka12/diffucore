@@ -134,13 +134,15 @@ def acas_flow_schedule(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
     grid_size: int = 4096,
+    curvature: float = 0.25,
 ) -> torch.Tensor:
     """Anima Curvature-Aware Shifted flow schedule.
 
     ACAS keeps Anima's shifted rectified-flow mapping from time to sigma, but
-    samples the flow-time grid from a hand-shaped density instead of uniformly.
-    The density allocates extra evaluations to mid-noise semantic correction and
-    late low-noise line/detail refinement while preserving the pure-noise start.
+    blends Anima's stable uniform flow-time grid with a hand-shaped density. The
+    density allocates extra evaluations to mid-noise semantic correction and late
+    low-noise line/detail refinement, while the blend preserves high-noise
+    stability for Euler and other large-step samplers.
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -148,6 +150,8 @@ def acas_flow_schedule(
         raise ValueError("shift must be >= 1")
     if grid_size < 16:
         raise ValueError("grid_size must be >= 16")
+    if not 0.0 <= curvature <= 1.0:
+        raise ValueError("curvature must be in [0, 1]")
     if steps == 1:
         sigmas = torch.ones(1, device=device, dtype=dtype)
         return append_zero(sigmas)
@@ -175,7 +179,9 @@ def acas_flow_schedule(
     cdf_lo = cdf[lo]
     cdf_hi = cdf[hi]
     frac = (targets - cdf_lo) / (cdf_hi - cdf_lo).clamp_min(eps)
-    t = t_grid[lo] + frac * (t_grid[hi] - t_grid[lo])
+    t_curved = t_grid[lo] + frac * (t_grid[hi] - t_grid[lo])
+    t_uniform = torch.linspace(1.0, t_min, steps, device=work_device, dtype=work_dtype)
+    t = (1.0 - curvature) * t_uniform + curvature * t_curved
     t[0] = 1.0
     t[-1] = t_min
 

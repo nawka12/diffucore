@@ -115,3 +115,11 @@ def test_acas_flow_invalid_args_raise():
         S.acas_flow_schedule(5, shift=0.5)
     with pytest.raises(ValueError):
         S.acas_flow_schedule(5, shift=3.0, grid_size=8)
+    with pytest.raises(ValueError):
+        S.acas_flow_schedule(5, shift=3.0, curvature=1.5)
+
+
+def test_acas_flow_curvature_zero_matches_uniform_flow():
+    acas = S.acas_flow_schedule(20, shift=3.0, curvature=0.0)
+    flow = S.flow_matching_schedule(20, shift=3.0)
+    assert torch.allclose(acas, flow, atol=1e-6)
