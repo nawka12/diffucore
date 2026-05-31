@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 from ..conditioning import Conditioner, SDXLConditioner
 from ..models.unet import timestep_embedding
-from ..runtime import DevicePolicy, staged, tiled_vae_decode
+from ..runtime import DevicePolicy, can_decode_untiled, staged, tiled_vae_decode
 from ..sampling import (
     CFGDenoiser,
     EpsScaling,
@@ -179,12 +179,18 @@ class _Pipeline:
 
     # --- decode --------------------------------------------------------------
     def _decode(self, x0, policy, width, height) -> Image.Image:
+        del width, height  # tile decision now reads free VRAM, not resolution
         with torch.no_grad():
             latent = x0.to(policy.vae_dtype)
             if policy.channels_last:
                 latent = latent.contiguous(memory_format=torch.channels_last)
-            tile = policy.vae_tile or max(width, height) >= policy.vae_tile_threshold
             with staged([self.model.vae], policy.device, policy.offload_idle):
+                # Decide tile-vs-untiled *after* staging so free VRAM reflects
+                # the actual decode-time state (VAE on device, UNet/encoders
+                # gone or resident per the policy).
+                tile = policy.vae_tile or not can_decode_untiled(
+                    self.model.vae, latent.shape, policy.device
+                )
                 image = tiled_vae_decode(self.model.vae, latent) if tile else self.model.vae.decode(latent)
         image = ((image.clamp(-1, 1) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
         return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy())

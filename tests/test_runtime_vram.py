@@ -16,6 +16,7 @@ import torch
 from diffucore.models import AutoencoderKL, VAEConfig
 from diffucore.runtime import (
     DevicePolicy,
+    can_decode_untiled,
     maybe_compile_backbone,
     on_device,
     perf_context,
@@ -66,6 +67,50 @@ def test_tiled_decode_is_deterministic(vae):
         a = tiled_vae_decode(vae, lat, tile=64, overlap=16)
         b = tiled_vae_decode(vae, lat, tile=64, overlap=16)
     assert torch.equal(a, b)
+
+
+# --- Smart tile-vs-untiled decision -----------------------------------------
+
+def test_can_decode_untiled_cpu_always_true(vae):
+    """CPU has no VRAM constraint — system RAM is plentiful, so the smart
+    check must always allow untiled regardless of resolution."""
+    cpu = torch.device("cpu")
+    # Use an absurd latent size that would never fit on a GPU.
+    assert can_decode_untiled(vae, (1, 4, 512, 512), cpu) is True
+
+
+def test_can_decode_untiled_tiles_when_short_on_vram(vae):
+    """Estimated decode cost > free * margin → False (tile). At 1024² SDXL the
+    decode needs ~6 MB/px = 6 GB with the safety constant; if the caller passes
+    only 2 GB free, the check must fall on the tile side."""
+    cuda = torch.device("cuda")
+    two_gb = 2 * 1024**3
+    assert can_decode_untiled(vae, (1, 4, 128, 128), cuda, free_bytes=two_gb) is False
+
+
+def test_can_decode_untiled_untiled_when_vram_is_ample(vae):
+    """With plenty of free VRAM the check must allow untiled — 24 GB free at
+    1024² leaves > 6 GB / 0.85 headroom."""
+    cuda = torch.device("cuda")
+    twenty_four_gb = 24 * 1024**3
+    assert can_decode_untiled(vae, (1, 4, 128, 128), cuda, free_bytes=twenty_four_gb) is True
+
+
+def test_can_decode_untiled_qwen_uses_lower_per_pixel_cost():
+    """The Qwen-Image VAE family has lower per-pixel decode cost than SDXL's
+    AutoencoderKL (3D-conv path but smaller activation peak — see f10771f).
+    At a free budget where SDXL would tile, Qwen must still go untiled. A stub
+    class with the right ``__name__`` is enough — the helper only reads
+    ``type(vae).__name__``."""
+    cuda = torch.device("cuda")
+    qwen_stub = type("QwenImageVAE", (torch.nn.Module,), {})()
+    sdxl_stub = type("AutoencoderKL", (torch.nn.Module,), {})()
+    # 1024² latent (128×128 latent → 1024×1024 px). SDXL needs 6 GB, Qwen 5 GB.
+    # Pick free = 6.5 GB so the 0.85 margin (≈5.5 GB) lands between the two.
+    free = (13 * 1024**3) // 2  # 6.5 GB
+    shape = (1, 16, 128, 128)
+    assert can_decode_untiled(sdxl_stub, shape, cuda, free_bytes=free) is False
+    assert can_decode_untiled(qwen_stub, shape, cuda, free_bytes=free) is True
 
 
 # --- on_device / DevicePolicy (R3) -- CPU-runnable ---------------------------

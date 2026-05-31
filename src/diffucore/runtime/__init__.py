@@ -22,8 +22,9 @@ class DevicePolicy:
 
     Defaults target the RTX 2060: fp16 weights on CUDA, fp32 for the VAE and the
     sigma math. ``offload`` moves idle submodules to CPU RAM between stages;
-    ``vae_tile`` decodes the VAE in tiles (also auto-triggered above
-    ``vae_tile_threshold`` px). All knobs default off → unchanged behavior.
+    ``vae_tile`` forces tiled VAE decode (otherwise the pipeline auto-decides
+    per call from free VRAM via :func:`can_decode_untiled` — see its docstring).
+    All knobs default off → unchanged behavior.
 
     ``offload`` modes:
       * ``False`` — everything resident (no offload).
@@ -40,7 +41,6 @@ class DevicePolicy:
     vae_dtype: torch.dtype = torch.float32
     offload: bool | str = False
     vae_tile: bool = False
-    vae_tile_threshold: int = 768
     # --- opt-in perf flags (PR-A). ``cudnn_benchmark`` defaults **on** because
     # it's bit-exact and gives 3-17 % across SD1.5/SDXL/Anima (measured RTX 2060)
     # for the cost of one autotune step on first call; set False to disable.
@@ -267,4 +267,56 @@ def _tile_starts(size: int, tile: int, step: int) -> list[int]:
     return starts
 
 
-__all__ = ["DevicePolicy", "maybe_compile_backbone", "on_device", "perf_context", "staged", "tiled_vae_decode", "to_channels_last"]
+# Per-VAE-family decode activation cost in **bytes per output pixel**, with
+# safety baked in. Calibrated from RTX 2060 measurements:
+#   - AutoencoderKL (SD/SDXL): ~3.5 GB at 1024² (docs/RUNTIME_SPEC.md) → 3.3 KB/px
+#     raw; rounded up to 6 KB/px to cover allocator fragmentation and reserved
+#     blocks that ``mem_get_info`` reports as free.
+#   - QwenImageVAE (Anima): ~2.25 GB activations at 1024×1536 (see commit
+#     f10771f) → 1.5 KB/px raw; rounded up to 5 KB/px so the check tiles at
+#     1024×1536 on a 12 GB card with the DiT resident (where the raw number
+#     OOMs once allocator overhead is accounted for) but still untiles at
+#     1024² where the f10771f scenario was known to fit.
+# Unknown VAE classes fall back to the SDXL constant (the more conservative one).
+_VAE_BYTES_PER_PX = {
+    "AutoencoderKL": 6 * 1024,
+    "QwenImageVAE": 5 * 1024,
+}
+_VAE_BYTES_PER_PX_DEFAULT = 6 * 1024
+_DECODE_FREE_VRAM_MARGIN = 0.85
+
+
+def can_decode_untiled(
+    vae: torch.nn.Module,
+    latent_shape: tuple[int, int, int, int],
+    device: torch.device,
+    *,
+    free_bytes: int | None = None,
+) -> bool:
+    """Whether ``vae.decode(latent)`` is expected to fit on ``device`` without OOM.
+
+    On CPU this is always ``True`` (system RAM is plentiful — tiling on CPU just
+    adds latency for no benefit). On CUDA, compares an estimated decode
+    activation cost (per-pixel constant, family-dependent — see
+    :data:`_VAE_BYTES_PER_PX`) against currently free VRAM
+    (``torch.cuda.mem_get_info``) with a safety margin so allocator
+    fragmentation and reserved-but-free blocks don't tip us into OOM.
+
+    Call this *after* the VAE has been staged onto the device so the free
+    figure reflects the actual decode-time state (UNet/encoders offloaded or
+    resident, VAE weights already taking their share).
+
+    ``free_bytes`` is an optional override for testing; production callers
+    leave it unset so the live free figure is read each call.
+    """
+    if free_bytes is None:
+        if device.type != "cuda":
+            return True
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    _, _, h_lat, w_lat = latent_shape
+    px = (w_lat * 8) * (h_lat * 8)
+    bytes_per_px = _VAE_BYTES_PER_PX.get(type(vae).__name__, _VAE_BYTES_PER_PX_DEFAULT)
+    return px * bytes_per_px < free_bytes * _DECODE_FREE_VRAM_MARGIN
+
+
+__all__ = ["DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "tiled_vae_decode", "to_channels_last"]

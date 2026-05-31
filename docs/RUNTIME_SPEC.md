@@ -99,8 +99,7 @@ class DevicePolicy:
     compute_dtype: torch.dtype = torch.float16
     vae_dtype: torch.dtype = torch.float32
     offload: bool = False            # sequential CPU offload of idle modules
-    vae_tile: bool = False           # force tiled VAE decode
-    vae_tile_threshold: int = 768    # auto-tile when latent H or W*8 exceeds this (px)
+    vae_tile: bool = False           # force tiled VAE decode (else auto via free-VRAM check)
 
     @property
     def offload_device(self) -> torch.device:
@@ -165,7 +164,9 @@ tile regardless of output resolution.
 - Decode each tile through `vae.decode`, producing `[B,3,8T,8T]` pixel tiles.
 - **Blend the overlaps** with a linear (or raised-cosine) ramp so seams vanish.
   A hard cut leaves visible grid lines; the ramp is what makes tiling acceptable.
-- Trigger automatically when `vae_tile` is set or output ≥ `vae_tile_threshold`.
+- Trigger automatically when `vae_tile` is set, or when `can_decode_untiled` (a
+  free-VRAM check using `torch.cuda.mem_get_info` against per-family activation
+  estimates) reports that an untiled decode won't fit at decode time.
 
 Put this as a function in `runtime/` (e.g. `tiled_vae_decode(vae, latent, tile,
 overlap)`) and have the pipeline call it instead of `vae.decode` when the policy
@@ -239,7 +240,7 @@ Each is independently shippable and verifiable; do them in order.
 | # | Slice | Verify | Status |
 |---|---|---|---|
 | R1 | Plumb `DevicePolicy` through bundle + pipeline (no behavior change; offload still off) | All tests green; SD1.5 + SDXL images byte-identical to today | ✅ |
-| R2 | Tiled VAE decode (auto at ≥768 px) | Tiled vs untiled PSNR > 35 dB; SDXL decode peak drops; seed-deterministic | ✅ PSNR 37.55 dB |
+| R2 | Tiled VAE decode (auto from a free-VRAM check via `can_decode_untiled`; original 768 px threshold superseded) | Tiled vs untiled PSNR > 35 dB; SDXL decode peak drops; seed-deterministic | ✅ PSNR 37.55 dB |
 | R3 | Sequential CPU offload (`offload=True`) | offload vs no-offload **byte-identical**; SDXL peak ≤ ~6 GB | ✅ byte-identical; peak 6.6 GB (UNet-floor bound) |
 | R4 | `offload="encoders"` cheap mode + 8 GB emulation test | 1024² SDXL completes under an 8 GB cap | ✅ byte-identical (both modes); fits 8 GB cap |
 
