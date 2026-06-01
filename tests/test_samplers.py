@@ -124,3 +124,91 @@ def test_get_sampler_dispatch_and_error():
     assert K.get_sampler("euler") is K.sample_euler
     with pytest.raises(ValueError):
         K.get_sampler("does_not_exist")
+
+
+# ── SECANT ────────────────────────────────────────────────────────────
+
+
+def test_secant_constant_x0_ends_clean():
+    # With a constant-x0 denoiser the rectified-flow ODE is exactly linear, so
+    # Euler is exact. SECANT's x0-secant slope is zero in that regime, so the
+    # corrected branch must match Euler and the trajectory must land on x0.
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 16, 4, 4)
+    out = K.sample_secant(const_denoiser(target), x_init.clone(), sigmas, curvature=1.0)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_secant_curvature_zero_equals_euler():
+    # curvature=0 ⇒ beta=0 everywhere ⇒ output must equal sample_euler.
+    target = torch.full((1, 8, 4, 4), -0.05)
+    sigmas = S.acas_flow_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 8, 4, 4)
+    euler_out = K.sample_euler(const_denoiser(target), x_init.clone(), sigmas)
+    secant_out = K.sample_secant(const_denoiser(target), x_init.clone(), sigmas, curvature=0.0)
+    assert torch.allclose(secant_out, euler_out, atol=1e-6)
+
+
+def test_secant_high_curvature_stays_finite_on_acas_schedule():
+    # Full correction (curvature=1) on the ACAS schedule must not NaN/Inf and
+    # must still converge to the constant prediction.
+    target = torch.full((1, 16, 8, 8), 0.0)
+    sigmas = S.acas_flow_schedule(20, shift=3.0, curvature=0.5)
+    x_init = torch.randn(1, 16, 8, 8)
+    out = K.sample_secant(const_denoiser(target), x_init, sigmas, curvature=1.0)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_secant_sigma_collision_falls_back_to_euler():
+    # Two consecutive identical sigmas would blow up the slope; the eps_sigma
+    # guard must catch it and fall back to Euler for that step.
+    target = torch.full((1, 4, 4, 4), 0.2)
+    sigmas = torch.tensor([1.0, 0.6, 0.6, 0.3, 0.0])
+    x_init = torch.randn(1, 4, 4, 4)
+    out = K.sample_secant(const_denoiser(target), x_init, sigmas, curvature=1.0)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_secant_s_noise_changes_output_and_is_seed_reproducible():
+    # SDE variant: noise injection must (a) change the trajectory and (b) be
+    # reproducible under the same generator seed. Capture the latent at the
+    # last non-zero sigma via the callback, since σ_next == 0 forces both runs
+    # onto the constant prediction at the very end.
+    target = torch.zeros(1, 8, 4, 4)
+    sigmas = S.acas_flow_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 8, 4, 4)
+
+    def run(seed):
+        last = {}
+        def cb(i, sigma, x, denoised):
+            last["x"] = x.clone()
+        K.sample_secant(
+            const_denoiser(target), x_init.clone(), sigmas,
+            curvature=0.5, s_noise=0.5,
+            generator=torch.Generator().manual_seed(seed), callback=cb,
+        )
+        return last["x"]
+
+    def run_det():
+        last = {}
+        def cb(i, sigma, x, denoised):
+            last["x"] = x.clone()
+        K.sample_secant(
+            const_denoiser(target), x_init.clone(), sigmas,
+            curvature=0.5, s_noise=0.0, callback=cb,
+        )
+        return last["x"]
+
+    sde_a, sde_b = run(11), run(11)
+    det = run_det()
+    assert torch.isfinite(sde_a).all()
+    assert torch.equal(sde_a, sde_b)
+    assert not torch.allclose(sde_a, det, atol=1e-5)
+
+
+def test_secant_registered_in_sampler_table():
+    assert K.get_sampler("secant") is K.sample_secant

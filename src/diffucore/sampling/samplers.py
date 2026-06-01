@@ -37,6 +37,7 @@ __all__ = [
     "sample_dpmpp_sde",
     "sample_dpmpp_2m_sde",
     "sample_dpmpp_3m_sde",
+    "sample_secant",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -509,6 +510,73 @@ def sample_dpmpp_3m_sde(
     return x
 
 
+def sample_secant(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    curvature: float = 0.25,
+    s_noise: float = 0.0,
+    eps_sigma: float = 1e-8,
+) -> torch.Tensor:
+    """SECANT: σ-space x0-secant multistep sampler.
+
+    A 2nd-order AB2-style multistep sampler that lives in σ space (no λ change
+    of variables). At each step it draws a secant line through the previous and
+    current ``x0`` estimates, projects it forward to ``σ_{i+1}``, recovers the
+    noise component ``ε`` from the current latent, and reconstructs
+    ``x_{i+1} = (1-σ_{i+1})·x0_pred + σ_{i+1}·ε`` — preserving the rectified-flow
+    identity exactly.
+
+    The correction is blended with plain Euler by ``beta = curvature·(1 − r)``
+    where ``r = |Δσ|/σ``, so dense-step regions (where the secant extrapolation
+    is reliable) trust the correction, and sparse-step regions fall back to
+    Euler. ``curvature=0`` recovers Euler exactly. Designed to pair with
+    :func:`acas_flow_schedule`, but works on any descending σ schedule.
+
+    ``s_noise > 0`` enables the SDE variant: noise of magnitude
+    ``s_noise·σ_next·sqrt(|Δσ|/σ)`` is injected per step.
+    """
+    s_in = x.new_ones([x.shape[0]])
+    old_x0 = None
+    old_sigma = None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        elif old_x0 is None or bool((sigma - old_sigma).abs() < eps_sigma):
+            # Warmup or σ-collision: plain Euler.
+            x = x + d * (sigma_next - sigma)
+        else:
+            # SECANT correction: linearly extrapolate x0(σ) along the secant
+            # through (σ_{i-1}, x0_{i-1}) and (σ_i, x0_i), hold ε fixed,
+            # reconstruct x at σ_next.
+            x0_slope = (denoised - old_x0) / (sigma - old_sigma)
+            x0_pred = denoised + x0_slope * (sigma_next - sigma)
+            # ε_i = x + (1 − σ_i)·v_i (equals (x − (1−σ)·x0)/σ but no /σ divide).
+            eps_i = x + (1.0 - sigma) * d
+            x_corrected = (1.0 - sigma_next) * x0_pred + sigma_next * eps_i
+
+            x_euler = x + d * (sigma_next - sigma)
+
+            r = ((sigma_next - sigma).abs() / sigma).clamp(0.0, 1.0)
+            beta = float(curvature) * (1.0 - r)
+            x = (1.0 - beta) * x_euler + beta * x_corrected
+
+            if s_noise > 0:
+                noise = _noise_like(x, generator)
+                x = x + s_noise * sigma_next * r.sqrt() * noise
+        old_x0 = denoised
+        old_sigma = sigma
+    return x
+
+
 SAMPLERS: dict[str, Denoiser] = {
     "euler": sample_euler,
     "heun": sample_heun,
@@ -520,6 +588,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "dpmpp_sde": sample_dpmpp_sde,
     "dpmpp_2m_sde": sample_dpmpp_2m_sde,
     "dpmpp_3m_sde": sample_dpmpp_3m_sde,
+    "secant": sample_secant,
 }
 
 

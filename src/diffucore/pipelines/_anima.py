@@ -41,6 +41,7 @@ from ..sampling import (
 _ANIMA_SAMPLERS = {
     "euler", "er_sde", "dpm_2", "dpm_2_ancestral",
     "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde",
+    "secant",
 }
 _FLOW_AWARE_SAMPLERS = {"er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde"}
 
@@ -75,6 +76,7 @@ def anima_text_to_image(
     seed: int | None = None,
     sampler: str = "euler",
     scheduler: str = "flow",
+    curvature: float = 0.25,
     progress_callback: Callable[[int, int], None] | None = None,
     return_info: bool = False,
 ) -> Image.Image:
@@ -121,7 +123,7 @@ def anima_text_to_image(
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
         elif scheduler == "acas":
-            sigmas = acas_flow_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+            sigmas = acas_flow_schedule(steps, shift=shift, device=device, dtype=torch.float32, curvature=curvature)
         else:
             view = FlowSamplingView(shift, device=device, dtype=torch.float32)
             schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
@@ -171,6 +173,9 @@ def anima_text_to_image(
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
                     kwargs = dict(generator=gen, model_type="flow", shift=shift)
+                if sampler == "secant":
+                    kwargs.setdefault("generator", gen)
+                    kwargs["curvature"] = curvature
                 with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 

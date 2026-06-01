@@ -35,6 +35,7 @@ from .samplers import (
     sample_dpmpp_sde,
     sample_dpmpp_2m_sde,
     sample_dpmpp_3m_sde,
+    sample_secant,
     get_sampler,
     SAMPLERS,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "sample_dpmpp_sde",
     "sample_dpmpp_2m_sde",
     "sample_dpmpp_3m_sde",
+    "sample_secant",
     "get_sampler",
     "SAMPLERS",
 ]
