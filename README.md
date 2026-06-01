@@ -36,10 +36,10 @@ image.save("fox.png")
   zero-terminal-SNR (ZTSNR) + CFG-rescale handled for you.
 - **LoRA & LoKr** adapters fuse into the weights at load time (kohya/A1111,
   PEFT, and Anima naming conventions).
-- **10 samplers, multiple schedulers** — Euler, Heun, ancestral, DPM2, the full
-  DPM++ family, and ER-SDE; Karras / exponential / sgm_uniform / simple / flow
-  / ACAS schedules. The DPM++ and ER-SDE samplers are flow-aware, so they drive
-  Anima too.
+- **11 samplers, multiple schedulers** — Euler, Heun, ancestral, DPM2, the full
+  DPM++ family, ER-SDE, and SECANT (σ-space x0-secant multistep, designed for
+  ACAS); Karras / exponential / sgm_uniform / simple / flow / ACAS schedules.
+  The DPM++, ER-SDE, and SECANT samplers are flow-aware, so they drive Anima too.
 - **Runs on modest GPUs** — optional sequential CPU offload + tiled VAE decode
   fit SDXL into ~6.6 GB.
 - **Seed-reproducible** — same seed, same image, every run.
@@ -72,7 +72,8 @@ image = TextToImage(model)(
 ```
 
 - **Samplers** — `euler`, `heun`, `euler_ancestral`, `dpm_2`, `dpm_2_ancestral`,
-  `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`.
+  `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`, `secant`
+  (the last is Anima-only; pair with `scheduler="acas"`).
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `sgm_uniform`,
   `simple` (SD/SDXL); `flow` (default), `acas`, `sgm_uniform`, `simple` (Anima).
 

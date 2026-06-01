@@ -55,8 +55,9 @@ src/diffucore/
                          sgm_uniform, simple, flow-matching, ACAS.
     parameterization.py  betas -> σ table; σ<->t; eps / v prediction scalings.
     samplers.py          Euler/Heun/ancestral, DPM2(+ancestral), DPM++ (2M, SDE,
-                         2M-SDE, 3M-SDE), ER-SDE — pure σ-space steppers, the
-                         DPM++/ER-SDE family flow-aware (half-logSNR).
+                         2M-SDE, 3M-SDE), ER-SDE, SECANT — pure σ-space steppers;
+                         the DPM++/ER-SDE family flow-aware in half-logSNR, SECANT
+                         native σ-space (x0-secant multistep, ACAS-paired).
     denoiser.py          wraps a backbone: applies scalings + CFG.
   models/                nn.Module backbones, implemented from papers.
     clip_text.py         CLIP ViT-L/14 text encoder (SD1.5 + SDXL encoder 1).

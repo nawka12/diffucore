@@ -298,6 +298,13 @@ Learned while expanding the sampler / scheduler set (`samplers.py`, `schedules.p
   object. For Anima (no discrete table) a `FlowSamplingView` mirrors ComfyUI's
   `ModelSamplingDiscreteFlow` (a 1000-entry flow σ table + invertible timestep
   map). `_base._sigmas` dispatches these via `_SCHEDULE_FROM_MODEL`.
+- **SECANT is σ-space native, no λ mapping needed.** Where DPM++/ER-SDE all need
+  the `_half_log_snr` + first-σ offset hack to handle Anima's bounded σ ∈ (0, 1],
+  `sample_secant` operates in σ directly: it linearly extrapolates `x0` along the
+  secant through the previous two denoised estimates, reconstructs
+  `x_{i+1} = (1−σ_{i+1})·x0_pred + σ_{i+1}·ε`, and blends with Euler by
+  `beta = curvature·(1 − |Δσ|/σ)`. Designed to pair with `acas_flow_schedule`
+  (same `curvature` knob feeds both); `curvature=0` recovers Euler exactly.
 
 ## Project map
 
@@ -305,7 +312,8 @@ Learned while expanding the sampler / scheduler set (`samplers.py`, `schedules.p
 src/diffucore/
   sampling/      ✅ schedules, parameterization, samplers, denoiser
                    (incl. flow_matching_schedule + FlowMatchingConstScaling;
-                    Euler/Heun/ancestral/DPM2/DPM++/ER-SDE + sgm_uniform/simple)
+                    Euler/Heun/ancestral/DPM2/DPM++/ER-SDE/SECANT
+                    + sgm_uniform/simple/ACAS)
   loading/       ✅ state_dict (safetensors), detect (SD1.5 + SDXL + Anima)
   models/        ✅ clip_text, open_clip_text, vae, unet (SD1.5 + SDXL)
                  ✅ qwen_image_vae, qwen3_text, llm_adapter, anima_dit (Anima)

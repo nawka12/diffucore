@@ -174,20 +174,20 @@ The remaining extensions (each its own slice):
   flags for the full results and per-architecture recommendations.
 - **Sampler / scheduler set — done.** Beyond the original Euler/Heun/ancestral,
   the registry now carries **DPM2** (+ancestral), **DPM++** (`2m`, `sde`,
-  `2m_sde`, `3m_sde`) and **ER-SDE-Solver-3**, plus the **`sgm_uniform`**,
-  **`simple`**, and **`acas`** schedulers. The DPM++ and ER-SDE family are
-  flow-aware: they run
-  off the half-logSNR mapping (with a first-σ offset for flow) so the same
-  function drives both VE (SD/SDXL) and rectified-flow (Anima) models, matching
-  ComfyUI's `model_sampling`-aware k-diffusion. The Anima path routes any
-  non-Euler sampler through the shared registry against a CONST x0 denoiser
-  closure, and accepts `scheduler ∈ {flow, acas, sgm_uniform, simple}` (`acas`
-  uses a curvature-aware shifted-flow grid; `sgm_uniform` and `simple` are built
-  off a `FlowSamplingView` of the model). The SDE samplers re-inject **seeded Gaussian
-  noise** (a standard Euler–Maruyama discretization) rather than ComfyUI's
-  Brownian-tree noise — correct and seed-reproducible, but not bit-identical to
-  a ComfyUI render, and avoiding a `torchsde` dependency. Sampler convergence
-  (VE + flow) and the new schedules are unit-tested on CPU.
+  `2m_sde`, `3m_sde`), **ER-SDE-Solver-3**, and **SECANT** (σ-space x0-secant
+  multistep, designed for ACAS), plus the **`sgm_uniform`**, **`simple`**, and
+  **`acas`** schedulers. The DPM++ and ER-SDE family are flow-aware via the
+  half-logSNR mapping (with a first-σ offset for flow) so the same function
+  drives both VE (SD/SDXL) and rectified-flow (Anima) models, matching ComfyUI's
+  `model_sampling`-aware k-diffusion. SECANT is σ-space native — no λ mapping,
+  no first-σ offset — and pairs with `acas_flow_schedule` through a shared
+  `curvature` knob. The Anima path routes any non-Euler sampler through the
+  shared registry against a CONST x0 denoiser closure, and accepts
+  `scheduler ∈ {flow, acas, sgm_uniform, simple}`. The SDE samplers re-inject
+  **seeded Gaussian noise** (a standard Euler–Maruyama discretization) rather
+  than ComfyUI's Brownian-tree noise — correct and seed-reproducible, but not
+  bit-identical to a ComfyUI render, and avoiding a `torchsde` dependency.
+  Sampler convergence (VE + flow) and the new schedules are unit-tested on CPU.
 
 ## Verification notes
 
