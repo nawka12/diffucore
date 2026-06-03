@@ -162,6 +162,44 @@ def test_secant_high_curvature_stays_finite_on_acas_schedule():
     assert torch.allclose(out, target, atol=1e-4)
 
 
+def test_secant_correction_gated_off_at_high_noise():
+    # The x0 estimate is unreliable at high σ, so SECANT must not apply its
+    # extrapolation there (beta → 0 as σ → 1); the correction ramps in only as
+    # σ → 0. Unlike the constant-x0 tests, this uses a σ-dependent denoiser so the
+    # secant slope is nonzero and the gate is actually exercised. Without the
+    # (1 − σ) gate the high-noise steps over-correct and drift far from Euler.
+    torch.manual_seed(0)
+    target = torch.randn(1, 4, 8, 8)
+
+    def model(x, sigma):
+        s = sigma.view(-1, 1, 1, 1)
+        g = 1.0 / (1.0 + (4.0 * s) ** 2)          # x0 settles toward target as σ→0
+        return g * target + (1.0 - g) * 3.0 * torch.sin(3.0 * x)
+
+    sigmas = S.acas_flow_schedule(20, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    secant_states, euler_states = {}, {}
+    euler_out = K.sample_euler(
+        model, x_init.clone(), sigmas,
+        callback=lambda i, s, x, d: euler_states.__setitem__(i, x.clone()),
+    )
+    secant_out = K.sample_secant(
+        model, x_init.clone(), sigmas, curvature=1.0,
+        callback=lambda i, s, x, d: secant_states.__setitem__(i, x.clone()),
+    )
+
+    assert torch.isfinite(secant_out).all()
+    # High-σ steps must track Euler (correction gated off there)...
+    high_dev = max(
+        (secant_states[i] - euler_states[i]).abs().max().item()
+        for i in secant_states if float(sigmas[i]) >= 0.9
+    )
+    final_dev = (secant_out - euler_out).abs().max().item()
+    assert high_dev < 0.1 * final_dev    # gate suppresses the high-noise correction
+    assert final_dev > 1e-3              # but the correction is still active overall
+
+
 def test_secant_sigma_collision_falls_back_to_euler():
     # Two consecutive identical sigmas would blow up the slope; the eps_sigma
     # guard must catch it and fall back to Euler for that step.
