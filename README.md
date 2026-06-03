@@ -129,6 +129,27 @@ model = load_flux_checkpoint(
 
 FLUX is text-to-image only in this build.
 
+**Fitting FLUX.1 on a 24 GB GPU.** The FLUX.1 transformer is ~23 GB in bf16, so
+keeping it resident leaves no room for activations (and `offload=True` can't even
+stage it — there's nothing left for the 9.8 GB T5). Use `offload="stream"`: the
+small modules stay resident and each DiT block is streamed onto the GPU just for
+its own forward. Peak VRAM drops to ~22 GB and a 1024² schnell image fits a
+24 GB card.
+
+```python
+from diffucore import load_flux_checkpoint, TextToImage
+from diffucore.runtime import DevicePolicy
+import torch
+
+policy = DevicePolicy(device=torch.device("cuda"), offload="stream", compute_dtype=torch.bfloat16)
+model = load_flux_checkpoint(
+    transformer_path="flux/flux1-schnell.safetensors", vae_path="flux/ae.safetensors",
+    t5_path="flux/t5xxl_fp16.safetensors", clip_path="flux/clip_l.safetensors",
+    dtype=torch.bfloat16, policy=policy,
+)
+image = TextToImage(model)("a watercolor fox", steps=4, width=1024, height=1024, seed=0)
+```
+
 ### Image-to-image & inpainting
 
 ```python
@@ -288,9 +309,13 @@ generation targets CUDA.
 **FLUX.1 and FLUX.2 are build-to-spec.** They're implemented from the published
 architecture and cross-checked against the Black Forest Labs / ComfyUI reference
 (structure, config detection, schedule, latent format), with strict checkpoint
-loading and tiny-model end-to-end + determinism checks as the gate — but they
-have **not** been run against real weights on a GPU yet, so numerical parity is
-unconfirmed. FLUX.2 leads with the **Klein** (Qwen3-4B/8B) path; the Dev
+loading and tiny-model end-to-end + determinism checks as the gate. **FLUX.1
+(schnell) now loads and runs on the official real weights** on a 24 GB GPU
+(RTX 4090, bf16, 4-step, 1024², via `offload="stream"`): the strict no-missing-keys
+load passes, it produces a coherent prompt-faithful image, and same-seed renders
+are byte-identical. A bit-exact comparison against the reference is still
+outstanding, and **FLUX.2 has not yet been run on real weights**. FLUX.2 leads
+with the **Klein** (Qwen3-4B/8B) path; the Dev
 (Mistral-3 24B) path is wired but secondary (its Tekken tokenizer isn't vendored
 — pass `mistral_tokenizer_path`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
 the per-component status and what to confirm on real weights.

@@ -34,6 +34,12 @@ class DevicePolicy:
       * ``"encoders"`` — keep the UNet resident; only park the ~2 GB of text
         encoders + VAE between stages. Frees most of the headroom for ~0 copy cost
         (the cheap 80/20 — see ``docs/RUNTIME_SPEC.md`` R4).
+      * ``"stream"`` — FLUX-only. Park the encoders + VAE like ``"encoders"``, and
+        additionally *stream the DiT blocks*: keep the small modules
+        (embedders / final layer) resident and shuttle each transformer block onto
+        the GPU just for its own forward. The only mode that fits the ~23 GB FLUX.1
+        transformer on a 24 GB card (whole-module staging OOMs — there's no room
+        for activations once the backbone is resident). See ``stream_blocks``.
     """
 
     device: torch.device
@@ -67,9 +73,10 @@ class DevicePolicy:
     cuda_graphs: bool = False
 
     def __post_init__(self):
-        if self.offload not in (False, True, "full", "encoders"):
+        if self.offload not in (False, True, "full", "encoders", "stream"):
             raise ValueError(
-                f"offload must be False, True/'full', or 'encoders'; got {self.offload!r}"
+                f"offload must be False, True/'full', 'encoders', or 'stream'; "
+                f"got {self.offload!r}"
             )
 
     @property
@@ -85,8 +92,15 @@ class DevicePolicy:
     @property
     def offload_unet(self) -> bool:
         """Also shuttle the UNet (the ~5 GB module) per image — full offload only.
-        ``"encoders"`` keeps it resident; the copy each way isn't worth the ~2 GB."""
+        ``"encoders"``/``"stream"`` keep it resident (``"stream"`` streams its
+        blocks instead); the whole-module copy each way isn't worth the ~2 GB."""
         return self.offload is True or self.offload == "full"
+
+    @property
+    def offload_stream(self) -> bool:
+        """Stream the FLUX DiT blocks per-forward (see ``stream_blocks``). Distinct
+        from ``offload_unet``: the backbone is never moved as one ~23 GB blob."""
+        return self.offload == "stream"
 
     @classmethod
     def auto(cls) -> "DevicePolicy":
@@ -121,10 +135,11 @@ def maybe_compile_backbone(backbone: torch.nn.Module, policy: "DevicePolicy") ->
                 "are captured by torch.compile's reduce-overhead mode)."
             )
         return backbone
-    if policy.offload_unet:
+    if policy.offload_unet or policy.offload_stream:
         raise ValueError(
             "policy.compile=True is incompatible with offload modes that move the "
-            "backbone on/off the GPU (True/'full'); use offload='encoders' or False."
+            "backbone on/off the GPU (True/'full'/'stream'); use offload='encoders' "
+            "or False."
         )
     if policy.cuda_graphs:
         return torch.compile(backbone, mode="reduce-overhead", dynamic=False)
@@ -205,6 +220,42 @@ def on_device(module, device):
         module.to(_CPU)
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+
+def stream_blocks(backbone, block_attrs, device, offload_device=_CPU):
+    """Per-block sequential offload for a block-list backbone (the FLUX DiT).
+
+    Keeps every *non-block* submodule (img/txt projections, time/vector/guidance
+    embedders, the final layer, shared modulators) resident on ``device``, parks
+    the heavy transformer blocks on ``offload_device``, and registers forward
+    hooks that bring each block onto ``device`` only for its own forward, then
+    move it back. Resident VRAM is the small modules plus at most one block —
+    enough to fit FLUX.1's ~23 GB transformer (57 blocks) on a 24 GB GPU, where
+    moving the whole module at once leaves no room for activations.
+
+    Numerically transparent: relocating weights doesn't change results, and the
+    blocks run in the same order. ``block_attrs`` names the ``nn.ModuleList``
+    attributes to stream (``("double_blocks", "single_blocks")`` for FLUX).
+    Returns the number of streamed blocks.
+    """
+    for name, child in backbone.named_children():
+        if name not in block_attrs:
+            child.to(device)
+
+    def pre(mod, _inp):
+        mod.to(device, non_blocking=True)
+
+    def post(mod, _inp, _out):
+        mod.to(offload_device, non_blocking=True)
+
+    n = 0
+    for attr in block_attrs:
+        for block in getattr(backbone, attr):
+            block.to(offload_device)
+            block.register_forward_pre_hook(pre)
+            block.register_forward_hook(post)
+            n += 1
+    return n
 
 
 def _ramp(n: int, edge: int) -> torch.Tensor:
@@ -312,11 +363,14 @@ def can_decode_untiled(
     if free_bytes is None:
         if device.type != "cuda":
             return True
-        free_bytes, _ = torch.cuda.mem_get_info(device)
+        # mem_get_info needs an explicit index or int; a bare torch.device("cuda")
+        # (no index) raises, so fall back to the current device when unset.
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        free_bytes, _ = torch.cuda.mem_get_info(index)
     _, _, h_lat, w_lat = latent_shape
     px = (w_lat * 8) * (h_lat * 8)
     bytes_per_px = _VAE_BYTES_PER_PX.get(type(vae).__name__, _VAE_BYTES_PER_PX_DEFAULT)
     return px * bytes_per_px < free_bytes * _DECODE_FREE_VRAM_MARGIN
 
 
-__all__ = ["DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "tiled_vae_decode", "to_channels_last"]
+__all__ = ["DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last"]
