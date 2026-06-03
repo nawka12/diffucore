@@ -223,15 +223,21 @@ The remaining extensions (each its own slice):
 - **Sampler / scheduler set — done.** Beyond the original Euler/Heun/ancestral,
   the registry now carries **DPM2** (+ancestral), **DPM++** (`2m`, `sde`,
   `2m_sde`, `3m_sde`), **ER-SDE-Solver-3**, and **SECANT** (σ-space x0-secant
-  multistep, designed for ACAS), plus the **`sgm_uniform`**, **`simple`**, and
-  **`acas`** schedulers. The DPM++ and ER-SDE family are flow-aware via the
+  multistep), plus the **`sgm_uniform`**, **`simple`**, and **`flow_karras`**
+  schedulers. `flow_karras` is a Karras-ρ-warped rectified-flow schedule (one
+  interpretable `rho` knob, `rho=1` reduces exactly to `flow`); it replaced the
+  earlier hand-tuned ACAS schedule, whose multi-bump density had no error
+  criterion. The genuinely model-aware path is **`oss`** — an optimal-stepsize
+  schedule (Pu et al. 2025, arXiv:2503.21774) distilled offline by a DP over a
+  teacher trajectory's per-step error (`sampling/optimal_steps.py`,
+  `calibrate_oss.py`). The DPM++ and ER-SDE family are flow-aware via the
   half-logSNR mapping (with a first-σ offset for flow) so the same function
   drives both VE (SD/SDXL) and rectified-flow (Anima) models, matching ComfyUI's
   `model_sampling`-aware k-diffusion. SECANT is σ-space native — no λ mapping,
-  no first-σ offset — and pairs with `acas_flow_schedule` through a shared
-  `curvature` knob. The Anima path routes any non-Euler sampler through the
+  no first-σ offset — and works on any descending σ schedule via a `curvature`
+  knob. The Anima path routes any non-Euler sampler through the
   shared registry against a CONST x0 denoiser closure, and accepts
-  `scheduler ∈ {flow, acas, sgm_uniform, simple}`. The SDE samplers re-inject
+  `scheduler ∈ {flow, flow_karras, oss, sgm_uniform, simple}`. The SDE samplers re-inject
   **seeded Gaussian noise** (a standard Euler–Maruyama discretization) rather
   than ComfyUI's Brownian-tree noise — correct and seed-reproducible, but not
   bit-identical to a ComfyUI render, and avoiding a `torchsde` dependency.

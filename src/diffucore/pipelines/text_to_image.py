@@ -41,19 +41,21 @@ class TextToImage(_Pipeline):
         scheduler: str = "karras",
         seed: int | None = None,
         shift: float = 3.0,
+        oss_sigmas: "torch.Tensor | list[float] | None" = None,
         progress_callback: Callable[[int, int], None] | None = None,
         return_info: bool = False,
     ) -> Image.Image:
         if self.model.spec.architecture == "anima":
             # The default scheduler ("karras") and other SD-only schedules don't
             # apply to a flow model; fall back to the rectified-flow schedule.
-            anima_scheduler = scheduler if scheduler in ("flow", "acas", "sgm_uniform", "simple") else "flow"
+            anima_scheduler = scheduler if scheduler in ("flow", "flow_karras", "oss", "sgm_uniform", "simple") else "flow"
             return anima_text_to_image(
                 self.model, prompt, negative_prompt,
                 steps=steps, cfg_scale=cfg_scale, shift=shift,
                 width=width if width is not None else self.model.spec.image_size,
                 height=height if height is not None else self.model.spec.image_size,
                 seed=seed, sampler=sampler, scheduler=anima_scheduler,
+                oss_sigmas=oss_sigmas,
                 progress_callback=progress_callback,
                 return_info=return_info,
             )

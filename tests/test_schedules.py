@@ -83,43 +83,43 @@ def test_flow_matching_invalid_args_raise():
         S.flow_matching_schedule(5, shift=0.5)
 
 
-def test_acas_flow_schedule_endpoints_and_descent():
-    sig = S.acas_flow_schedule(24, shift=3.0)
+def test_flow_karras_schedule_endpoints_and_descent():
+    sig = S.flow_karras_schedule(24, shift=3.0)
     assert sig.shape[0] == 25
     assert sig[-1].item() == 0.0
     assert torch.all(sig[:-1] >= sig[1:])
-    assert abs(sig[0].item() - 1.0) < 1e-6
+    assert abs(sig[0].item() - 1.0) < 1e-6           # σ_max == 1 for any shift/rho
     expected_min = 3.0 * (1.0 / 24.0) / (1.0 + 2.0 * (1.0 / 24.0))
     assert abs(sig[-2].item() - expected_min) < 1e-6
 
 
-def test_acas_flow_schedule_reallocates_steps_from_uniform_flow():
+def test_flow_karras_rho1_matches_uniform_flow():
+    """rho == 1 is the uniform-t Karras warp, so it must reduce exactly to the
+    rectified-flow schedule (the analog of polyexp rho=1 == exponential)."""
+    karras = S.flow_karras_schedule(20, shift=3.0, rho=1.0)
+    flow = S.flow_matching_schedule(20, shift=3.0)
+    assert torch.allclose(karras, flow, atol=1e-6)
+
+
+def test_flow_karras_concentrates_low_sigma_tail():
+    """rho > 1 front-loads steps toward low σ, so its late (detail) gaps should
+    be smaller than uniform flow, while endpoints stay pinned at 1 and σ_min."""
     steps = 32
-    acas = S.acas_flow_schedule(steps, shift=3.0)[:-1]
+    karras = S.flow_karras_schedule(steps, shift=3.0, rho=7.0)[:-1]
     flow = S.flow_matching_schedule(steps, shift=3.0)[:-1]
 
-    assert not torch.allclose(acas, flow)
-    # ACAS allocates more points to the detail/refinement tail than uniform
-    # flow, so its late sigma gaps should be smaller on average.
-    acas_tail_gap = (acas[-8:-1] - acas[-7:]).abs().mean()
+    assert not torch.allclose(karras, flow)
+    karras_tail_gap = (karras[-8:-1] - karras[-7:]).abs().mean()
     flow_tail_gap = (flow[-8:-1] - flow[-7:]).abs().mean()
-    assert acas_tail_gap < flow_tail_gap
+    assert karras_tail_gap < flow_tail_gap
 
 
-def test_acas_flow_invalid_args_raise():
+def test_flow_karras_invalid_args_raise():
     import pytest
 
     with pytest.raises(ValueError):
-        S.acas_flow_schedule(0, shift=3.0)
+        S.flow_karras_schedule(0, shift=3.0)
     with pytest.raises(ValueError):
-        S.acas_flow_schedule(5, shift=0.5)
+        S.flow_karras_schedule(5, shift=0.5)
     with pytest.raises(ValueError):
-        S.acas_flow_schedule(5, shift=3.0, grid_size=8)
-    with pytest.raises(ValueError):
-        S.acas_flow_schedule(5, shift=3.0, curvature=1.5)
-
-
-def test_acas_flow_curvature_zero_matches_uniform_flow():
-    acas = S.acas_flow_schedule(20, shift=3.0, curvature=0.0)
-    flow = S.flow_matching_schedule(20, shift=3.0)
-    assert torch.allclose(acas, flow, atol=1e-6)
+        S.flow_karras_schedule(5, shift=3.0, rho=0.0)

@@ -6,10 +6,14 @@ from .schedules import (
     exponential_schedule,
     polyexponential_schedule,
     flow_matching_schedule,
-    acas_flow_schedule,
+    flow_karras_schedule,
     simple_schedule,
     sgm_uniform_schedule,
     FlowSamplingView,
+)
+from .optimal_steps import (
+    optimal_step_schedule,
+    calibrate_oss_schedule,
 )
 from .parameterization import (
     append_dims,
@@ -46,10 +50,12 @@ __all__ = [
     "exponential_schedule",
     "polyexponential_schedule",
     "flow_matching_schedule",
-    "acas_flow_schedule",
+    "flow_karras_schedule",
     "simple_schedule",
     "sgm_uniform_schedule",
     "FlowSamplingView",
+    "optimal_step_schedule",
+    "calibrate_oss_schedule",
     "append_dims",
     "make_betas",
     "rescale_zero_terminal_snr",

@@ -29,7 +29,9 @@ from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
 from ._base import PipelineInfo, _step_progress
 from ..sampling import (
     FlowSamplingView,
-    acas_flow_schedule,
+    append_zero,
+    calibrate_oss_schedule,
+    flow_karras_schedule,
     flow_matching_schedule,
     get_sampler,
     sgm_uniform_schedule,
@@ -77,6 +79,8 @@ def anima_text_to_image(
     sampler: str = "euler",
     scheduler: str = "flow",
     curvature: float = 0.25,
+    rho: float = 7.0,
+    oss_sigmas: "torch.Tensor | list[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     return_info: bool = False,
 ) -> Image.Image:
@@ -89,14 +93,16 @@ def anima_text_to_image(
     ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
     closed-form rectified-flow step; the rest run through the shared sampler
     registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
-    ``"flow"`` (the rectified-flow t-uniform default), ``"acas"`` (Anima
-    curvature-aware shifted flow), ``"sgm_uniform"`` or ``"simple"`` (ComfyUI's,
-    evaluated against a flow sigma table).
+    ``"flow"`` (the rectified-flow t-uniform default), ``"flow_karras"`` (the
+    Karras-ρ-warped flow schedule that concentrates steps toward low noise;
+    ``rho`` controls the concentration), ``"oss"`` (a pre-calibrated
+    optimal-stepsize schedule supplied via ``oss_sigmas``), ``"sgm_uniform"`` or
+    ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
-    if scheduler not in ("flow", "acas", "sgm_uniform", "simple"):
-        raise ValueError(f"Anima scheduler must be 'flow', 'acas', 'sgm_uniform' or 'simple'; got {scheduler!r}")
+    if scheduler not in ("flow", "flow_karras", "oss", "sgm_uniform", "simple"):
+        raise ValueError(f"Anima scheduler must be 'flow', 'flow_karras', 'oss', 'sgm_uniform' or 'simple'; got {scheduler!r}")
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -122,8 +128,17 @@ def anima_text_to_image(
         # ---- 3. σ schedule, init noise
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
-        elif scheduler == "acas":
-            sigmas = acas_flow_schedule(steps, shift=shift, device=device, dtype=torch.float32, curvature=curvature)
+        elif scheduler == "flow_karras":
+            sigmas = flow_karras_schedule(steps, shift=shift, rho=rho, device=device, dtype=torch.float32)
+        elif scheduler == "oss":
+            if oss_sigmas is None:
+                raise ValueError(
+                    "scheduler='oss' needs a pre-calibrated schedule. Run "
+                    "diffucore.sampling.calibrate_oss_schedule on this model/resolution "
+                    "and pass the result as oss_sigmas."
+                )
+            s = torch.as_tensor(oss_sigmas, device=device, dtype=torch.float32)
+            sigmas = s if float(s[-1]) == 0.0 else append_zero(s)
         else:
             view = FlowSamplingView(shift, device=device, dtype=torch.float32)
             schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
@@ -190,3 +205,72 @@ def anima_text_to_image(
         image = _to_pil(image)
         info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
         return (image, info) if return_info else image
+
+
+def anima_calibrate_oss(
+    model: "ModelBundle",
+    prompt: str,
+    negative_prompt: str = "",
+    *,
+    steps: int,
+    width: int = 1024,
+    height: int = 1024,
+    shift: float = 3.0,
+    cfg_scale: float = 4.0,
+    grid: int = 80,
+    seed: int = 0,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[float]:
+    """Calibrate an OSS (optimal-stepsize) schedule for this Anima model/config.
+
+    Runs one dense ``grid``-point teacher trajectory, scores every candidate
+    single step, and DP-distills the ``steps``-step schedule that minimizes total
+    truncation error (see :func:`diffucore.sampling.calibrate_oss_schedule`).
+    Returns the descending σ list (trailing ``0`` included). One-time and
+    GPU-heavy; cache the result and feed it back via ``oss_sigmas``.
+
+    The conditioning + denoise closure mirror the registry-sampler path in
+    :func:`anima_text_to_image` (a CONST x0 estimate ``x − σ·v`` with CFG).
+    """
+    if width % 16 or height % 16:
+        raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
+    if grid < steps:
+        raise ValueError(f"grid ({grid}) must be >= steps ({steps})")
+    policy = model.policy
+    device, dtype = policy.device, policy.compute_dtype
+
+    with perf_context(policy):
+        cond_tok = model.tokenizer(prompt)
+        uncond_tok = model.tokenizer(negative_prompt)
+        with staged([model.text_encoder], device, policy.offload_idle):
+            cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
+            uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
+        cond_t5 = cond_tok.t5_ids.to(device)
+        uncond_t5 = uncond_tok.t5_ids.to(device)
+
+        h_lat, w_lat = height // 8, width // 8
+        gen = torch.Generator(device=device).manual_seed(seed)
+        x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
+        # Dense descending candidate grid (no trailing 0), same σ(t) map as "flow".
+        candidate = flow_matching_schedule(grid, shift=shift, device=device, dtype=torch.float32)[:-1]
+
+        backbone = model.backbone
+        with torch.no_grad(), staged([backbone], device, policy.offload_unet):
+            def denoise(x_in, sigma_b):
+                x_5d = x_in.to(dtype).unsqueeze(2)
+                t = sigma_b.to(dtype)
+                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                if cfg_scale == 1.0:
+                    v = v_cond
+                else:
+                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                sig = sigma_b.float().view(-1, 1, 1, 1)
+                return x_in.float() - sig * v.float()
+
+            sigmas = calibrate_oss_schedule(
+                denoise, x.float(), candidate, num_steps=steps,
+                progress_callback=progress_callback,
+            )
+
+    return [float(s) for s in sigmas.tolist()]

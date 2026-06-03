@@ -303,8 +303,8 @@ Learned while expanding the sampler / scheduler set (`samplers.py`, `schedules.p
   `sample_secant` operates in σ directly: it linearly extrapolates `x0` along the
   secant through the previous two denoised estimates, reconstructs
   `x_{i+1} = (1−σ_{i+1})·x0_pred + σ_{i+1}·ε`, and blends with Euler by
-  `beta = curvature·(1 − |Δσ|/σ)`. Designed to pair with `acas_flow_schedule`
-  (same `curvature` knob feeds both); `curvature=0` recovers Euler exactly.
+  `beta = curvature·(1 − |Δσ|/σ)`. Works on any descending σ schedule;
+  `curvature=0` recovers Euler exactly.
 
 ## Project map
 
@@ -313,7 +313,7 @@ src/diffucore/
   sampling/      ✅ schedules, parameterization, samplers, denoiser
                    (incl. flow_matching_schedule + FlowMatchingConstScaling;
                     Euler/Heun/ancestral/DPM2/DPM++/ER-SDE/SECANT
-                    + sgm_uniform/simple/ACAS)
+                    + sgm_uniform/simple/flow_karras; OSS in optimal_steps.py)
   loading/       ✅ state_dict (safetensors), detect (SD1.5 + SDXL + Anima)
   models/        ✅ clip_text, open_clip_text, vae, unet (SD1.5 + SDXL)
                  ✅ qwen_image_vae, qwen3_text, llm_adapter, anima_dit (Anima)

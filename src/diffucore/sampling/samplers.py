@@ -534,8 +534,7 @@ def sample_secant(
     ``beta = curvature·(1 − r)·(1 − σ)`` where ``r = |Δσ|/σ``, so dense-step,
     lower-noise regions (where the secant extrapolation is reliable) trust the
     correction, while sparse-step and high-noise regions fall back to Euler.
-    ``curvature=0`` recovers Euler exactly. Designed to pair with
-    :func:`acas_flow_schedule`, but works on any descending σ schedule.
+    ``curvature=0`` recovers Euler exactly. Works on any descending σ schedule.
 
     ``s_noise > 0`` enables the SDE variant: noise of magnitude
     ``s_noise·σ_next·sqrt(|Δσ|/σ)`` is injected per step.
@@ -567,11 +566,10 @@ def sample_secant(
             x_euler = x + d * (sigma_next - sigma)
 
             # The x0 estimate is unreliable at high noise, so extrapolating it
-            # there over-corrects — and ACAS densifies high-σ, keeping |Δσ|/σ
-            # (hence the correction weight) large exactly where x0 is least
-            # settled. Gate the correction off as σ→1 (pure noise) and ramp it in
-            # as σ→0, where x0 is reliable and detail refinement matters. σ∈[0,1]
-            # is the rectified-flow parameterization this reconstruction assumes.
+            # there over-corrects. Gate the correction off as σ→1 (pure noise)
+            # and ramp it in as σ→0, where x0 is reliable and detail refinement
+            # matters. σ∈[0,1] is the rectified-flow parameterization this
+            # reconstruction assumes.
             r = ((sigma_next - sigma).abs() / sigma).clamp(0.0, 1.0)
             trust = (1.0 - sigma).clamp(0.0, 1.0)
             beta = float(curvature) * (1.0 - r) * trust

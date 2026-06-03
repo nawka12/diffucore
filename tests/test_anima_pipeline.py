@@ -134,3 +134,34 @@ def test_anima_seed_reproducible(pipe):
     c = np.asarray(_gen(pipe, seed=456))
     assert np.array_equal(a, b), "same seed must yield identical pixels"
     assert not np.array_equal(a, c), "different seed must yield different pixels"
+
+
+def test_anima_calibrate_oss_produces_valid_schedule(pipe):
+    from diffucore import anima_calibrate_oss
+
+    sigmas = anima_calibrate_oss(
+        pipe.model, "a fox in a forest", "blurry",
+        steps=4, width=128, height=128, shift=3.0, cfg_scale=4.0, grid=10, seed=0,
+    )
+    assert len(sigmas) == 5                                   # steps + 1
+    assert sigmas[-1] == 0.0
+    assert all(s == s for s in sigmas)                        # no NaN
+    assert all(a >= b for a, b in zip(sigmas, sigmas[1:]))    # descending
+    assert abs(sigmas[0] - 1.0) < 1e-4                        # starts at σ_max == 1
+
+
+def test_anima_oss_schedule_drives_generation(pipe):
+    # The calibrated schedule must flow through the pipeline and produce an image.
+    from diffucore import anima_calibrate_oss
+
+    sigmas = anima_calibrate_oss(
+        pipe.model, "a fox in a forest", "blurry",
+        steps=4, width=128, height=128, shift=3.0, cfg_scale=4.0, grid=10, seed=0,
+    )
+    img = pipe(
+        "a fox in a forest", negative_prompt="blurry",
+        steps=4, cfg_scale=4.0, width=128, height=128, seed=0,
+        scheduler="oss", oss_sigmas=sigmas,
+    )
+    assert isinstance(img, Image.Image)
+    assert np.asarray(img).std() > 1.0

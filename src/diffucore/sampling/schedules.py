@@ -22,7 +22,7 @@ __all__ = [
     "exponential_schedule",
     "polyexponential_schedule",
     "flow_matching_schedule",
-    "acas_flow_schedule",
+    "flow_karras_schedule",
     "simple_schedule",
     "sgm_uniform_schedule",
     "FlowSamplingView",
@@ -122,71 +122,48 @@ def flow_matching_schedule(
     return append_zero(sigmas)
 
 
-def _beta_pdf(t: torch.Tensor, alpha: float, beta: float) -> torch.Tensor:
-    log_norm = math.lgamma(alpha + beta) - math.lgamma(alpha) - math.lgamma(beta)
-    return (log_norm + (alpha - 1.0) * t.log() + (beta - 1.0) * (1.0 - t).log()).exp()
-
-
-def acas_flow_schedule(
+def flow_karras_schedule(
     steps: int,
     shift: float = 3.0,
+    rho: float = 7.0,
     *,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
-    grid_size: int = 4096,
-    curvature: float = 0.25,
 ) -> torch.Tensor:
-    """Anima Curvature-Aware Shifted flow schedule.
+    """Karras-ρ-warped shifted rectified-flow schedule.
 
-    ACAS keeps Anima's shifted rectified-flow mapping from time to sigma, but
-    blends Anima's stable uniform flow-time grid with a hand-shaped density. The
-    density allocates extra evaluations to mid-noise semantic correction and late
-    low-noise line/detail refinement, while the blend preserves high-noise
-    stability for Euler and other large-step samplers.
+    Generalizes :func:`flow_matching_schedule`: instead of spacing the flow
+    time ``t`` uniformly, it spaces ``t`` with the Karras et al. (2022) ρ-warp
+    (uniform in ``t ** (1/rho)``) and then applies Anima's SD3 shift map
+    ``σ(t) = shift·t / (1 + (shift − 1)·t)``.
+
+    The ρ-warp concentrates steps toward low ``t`` — i.e. low σ, near the data
+    manifold, where the rectified-flow trajectory bends most and single-step
+    (Euler) truncation error is largest. ``shift`` still biases toward σ = 1
+    (matching where training compute went); ``rho`` is an orthogonal knob for
+    sampling-error concentration. ``rho == 1`` recovers
+    :func:`flow_matching_schedule` exactly; ``rho > 1`` front-loads detail.
+
+    A strict log-SNR ρ-warp is deliberately *not* used: the pure-noise start
+    (σ = 1) is log-SNR −∞, and capping σ_max < 1 to make it finite would break
+    the "init is exactly pure noise, no rescale" assumption of the Anima
+    sampler. Warping in ``t`` is the bounded equivalent that keeps σ_max == 1.
+    A trailing ``0`` is appended for the clean endpoint.
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
     if shift < 1.0:
         raise ValueError("shift must be >= 1")
-    if grid_size < 16:
-        raise ValueError("grid_size must be >= 16")
-    if not 0.0 <= curvature <= 1.0:
-        raise ValueError("curvature must be in [0, 1]")
-    if steps == 1:
-        sigmas = torch.ones(1, device=device, dtype=dtype)
-        return append_zero(sigmas)
-
-    work_device = torch.device(device)
-    work_dtype = torch.float32
+    if rho <= 0.0:
+        raise ValueError("rho must be > 0")
     t_min = 1.0 / steps
-    eps = torch.finfo(work_dtype).eps
-    t_grid = torch.linspace(t_min, 1.0 - eps, grid_size, device=work_device, dtype=work_dtype)
-
-    mid = _beta_pdf(t_grid, 2.2, 2.8)
-    low = _beta_pdf(t_grid, 0.9, 4.5)
-    high = torch.sigmoid((t_grid - 0.72) / 0.08)
-    weight = 0.20 + 1.10 * mid + 0.55 * low + 0.25 * high
-
-    dt = t_grid[1:] - t_grid[:-1]
-    area = 0.5 * (weight[1:] + weight[:-1]) * dt
-    cdf = torch.cat([weight.new_zeros(1), area.cumsum(0)])
-    cdf = cdf / cdf[-1]
-
-    targets = torch.linspace(1.0, 0.0, steps, device=work_device, dtype=work_dtype)
-    idx = torch.searchsorted(cdf, targets).clamp(1, grid_size - 1)
-    lo = idx - 1
-    hi = idx
-    cdf_lo = cdf[lo]
-    cdf_hi = cdf[hi]
-    frac = (targets - cdf_lo) / (cdf_hi - cdf_lo).clamp_min(eps)
-    t_curved = t_grid[lo] + frac * (t_grid[hi] - t_grid[lo])
-    t_uniform = torch.linspace(1.0, t_min, steps, device=work_device, dtype=work_dtype)
-    t = (1.0 - curvature) * t_uniform + curvature * t_curved
-    t[0] = 1.0
-    t[-1] = t_min
-
+    # Karras ρ-warp of t over [t_min, 1]: ramp 0→1 maps t from 1 down to t_min.
+    ramp = torch.linspace(0.0, 1.0, steps, device=device, dtype=dtype)
+    min_inv_rho = t_min ** (1.0 / rho)
+    max_inv_rho = 1.0 ** (1.0 / rho)
+    t = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
     sigmas = shift * t / (1.0 + (shift - 1.0) * t)
-    return append_zero(sigmas.to(dtype=dtype))
+    return append_zero(sigmas)
 
 
 class FlowSamplingView:
