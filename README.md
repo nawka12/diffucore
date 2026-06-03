@@ -28,25 +28,25 @@ image.save("fox.png")
 
 - **One API across architectures** — Stable Diffusion 1.5, SDXL, **Anima**
   (a 2 B DiT built on Cosmos-Predict2 with Qwen3-0.6B + Qwen-Image VAE), and the
-  **FLUX** family (FLUX.1 dev/schnell and FLUX.2 Klein/Dev). Load any of them,
-  drive them all the same way. (FLUX is implemented to spec and cross-checked
-  against the reference, but not yet hardware-verified — see [Status](#status).)
-- **Text-to-image, image-to-image, and inpainting** out of the box.
+  **FLUX** family (FLUX.1 dev/schnell, FLUX.2 Klein/Dev). Load any of them, drive
+  them all the same way. (FLUX.1 schnell and FLUX.2 Klein-4B run on real weights;
+  the dev / Dev variants are build-to-spec — see [Status](#status).)
+- **Text-to-image, image-to-image, and inpainting** — SD/SDXL do all three;
+  Anima and FLUX are text-to-image only.
 - **Long prompt weighting (LPW) on SDXL** — A1111-style attention syntax
   (`(word:1.3)`, `(word)`, `[word]`) and prompts beyond CLIP's 77-token limit.
 - **Checkpoint types auto-detected** — epsilon and v-prediction, with
   zero-terminal-SNR (ZTSNR) + CFG-rescale handled for you.
 - **LoRA & LoKr** adapters fuse into the weights at load time (kohya/A1111,
   PEFT, and Anima naming conventions).
-- **11 samplers, multiple schedulers** — Euler, Heun, ancestral, DPM2, the full
-  DPM++ family, ER-SDE, and SECANT (σ-space x0-secant multistep, designed for
-  ACAS); Karras / exponential / sgm_uniform / simple / flow / ACAS schedules.
-  The DPM++, ER-SDE, and SECANT samplers are flow-aware, so they drive Anima too.
-- **Runs on modest GPUs** — optional sequential CPU offload + tiled VAE decode
-  fit SDXL into ~6.6 GB.
+- **11 samplers, multiple schedulers** — Euler/Heun, the DPM++ family, ER-SDE,
+  SECANT, and more (full list under [Usage](#choosing-samplers--schedulers)). The
+  DPM++, ER-SDE, and SECANT samplers are flow-aware, so they drive Anima too.
+- **Runs on modest GPUs** — sequential CPU offload + tiled VAE fit SDXL into
+  ~6.6 GB; FLUX.1's ~23 GB transformer streams block-by-block onto a 24 GB card.
 - **Seed-reproducible** — same seed, same image, every run.
 - **From scratch** — every backbone is implemented from the original papers and
-  verified against reference implementations (the text encoders and SD1.5 UNet
+  verified against reference implementations (text encoders and the SD1.5 UNet
   match bit-for-bit in fp32). No `diffusers`/ComfyUI at runtime.
 
 ## Install
@@ -98,10 +98,10 @@ image = TextToImage(model)(
 
 ### FLUX (DiT)
 
-FLUX is a guidance-distilled rectified-flow MMDiT, so there's no
-negative-prompt CFG pass — `cfg_scale` is the *distilled guidance* scale. Load
-an all-in-one checkpoint (`load_checkpoint` auto-detects it) or the official
-split files (`load_flux_checkpoint`):
+FLUX is a guidance-distilled rectified-flow MMDiT, so there's no negative-prompt
+CFG pass — `cfg_scale` is the *distilled guidance* scale. Load an all-in-one
+checkpoint (`load_checkpoint` auto-detects it) or the official split files
+(`load_flux_checkpoint`):
 
 ```python
 from diffucore import load_flux_checkpoint, TextToImage
@@ -129,15 +129,11 @@ model = load_flux_checkpoint(
 
 For FLUX.2, use the **ComfyUI-format single files** for the VAE and text encoder
 (e.g. `flux2-vae.safetensors`, `qwen_3_4b.safetensors`). The official BFL repo
-ships those two in diffusers layout (`encoder.down_blocks…`, sharded encoder),
-which this loader's LDM `AutoencoderKL` / single-file path doesn't consume; the
-transformer single-file (`flux-2-klein-4b.safetensors`) loads as-is.
-
-FLUX is text-to-image only in this build.
+ships those two in diffusers layout, which this loader's single-file path doesn't
+consume; the transformer single-file loads as-is.
 
 **Fitting FLUX.1 on a 24 GB GPU.** The FLUX.1 transformer is ~23 GB in bf16, so
-keeping it resident leaves no room for activations (and `offload=True` can't even
-stage it — there's nothing left for the 9.8 GB T5). Use `offload="stream"`: the
+keeping it resident leaves no room for activations. Use `offload="stream"`: the
 small modules stay resident and each DiT block is streamed onto the GPU just for
 its own forward. Peak VRAM drops to ~22 GB and a 1024² schnell image fits a
 24 GB card.
@@ -213,8 +209,7 @@ model = load_checkpoint("models/sdxl.safetensors", policy=policy)
 ### Going faster
 
 Five perf flags on `DevicePolicy`. `cudnn_benchmark` defaults **on** (bit-exact,
-3-17 % free win); the rest default off and opt in only when you accept their
-tradeoffs:
+3-17 % free win); the rest default off:
 
 ```python
 policy = DevicePolicy(
@@ -227,18 +222,15 @@ policy = DevicePolicy(
 )
 ```
 
-`compile=True` is incompatible with offload modes that move the backbone
+Constraints: `compile=True` is incompatible with backbone-moving offload
 (`offload=True` / `"full"`) — pair it with `offload=False` or `"encoders"`.
-`cuda_graphs=True` requires `compile=True` and assumes stable input shapes
-(same resolution + LPW chunk count); each new shape triggers one re-record.
-**On Anima above 1024² (e.g. 1024×1536), skip `cuda_graphs` on 12 GB cards** —
-Anima's CFG runs cond/uncond as two different-shape forwards, so each step
-captures two graph pools, and DiT self-attention activations scale as
-O(tokens²). Above 1024² the two resident pools blow the VRAM budget. Use
-`compile=True` alone instead (eager activations are transient and still fit).
-`channels_last` and `compile` are most effective on Ampere+ (RTX 30/40-series);
-on Turing (RTX 20-series) the cuDNN NCHW path is already near-optimal and
-`channels_last` may regress. See [Performance](#performance).
+`cuda_graphs=True` requires `compile=True` and stable input shapes (each new
+resolution / LPW chunk count re-records once). **On Anima above 1024² on 12 GB
+cards, skip `cuda_graphs`** — CFG runs cond/uncond as two different-shape
+forwards, so each step captures two graph pools and DiT attention scales
+O(tokens²), blowing the budget; use `compile=True` alone. `channels_last` /
+`compile` help most on Ampere+; on Turing the cuDNN NCHW path is already
+near-optimal. See [Performance](#performance).
 
 ## Supported models
 
@@ -247,15 +239,15 @@ on Turing (RTX 20-series) the cuDNN NCHW path is already near-optimal and
 | Stable Diffusion 1.5 | 512² | t2i · img2img · inpaint | eps + v-pred, ZTSNR |
 | SDXL | 1024² | t2i · img2img · inpaint | dual text encoders, eps + v-pred, ZTSNR |
 | Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i | flow-matching, Qwen3 + Qwen-Image VAE |
-| FLUX.1 (dev / schnell) | 1024² | t2i | flow-matching MMDiT, T5-XXL + CLIP-L; build-to-spec † |
-| FLUX.2 (Klein / Dev) | 1024² | t2i | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev); build-to-spec † |
+| FLUX.1 (dev / schnell) | 1024² | t2i | flow-matching MMDiT, T5-XXL + CLIP-L † |
+| FLUX.2 (Klein / Dev) | 1024² | t2i | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev) † |
 
 LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima.
 
-† **FLUX is implemented from the published architecture and cross-checked against
-the reference, but not yet verified against real weights on GPU.** A strict
-no-missing-keys load is the correctness gate; numerical parity is pending
-hardware verification. See [Status](#status).
+† **FLUX.1 (schnell) and FLUX.2 (Klein-4B) load and run on the official real
+weights** — coherent, prompt-faithful, deterministic. Bit-exact parity against
+the reference is still pending, and the FLUX.1-dev / FLUX.2-Dev (Mistral-3) paths
+are implemented to spec but not yet hardware-verified. See [Status](#status).
 
 ## Performance
 
@@ -269,17 +261,10 @@ Measured on an RTX 2060 (12 GB, Turing sm_75), fp16, 20 steps.
 | SDXL | 1024² | ~16.89 s | ~10.7 GB (≈6.6 GB with offload) |
 | Anima | 1024² | ~46.33 s | ~8.6 GB |
 
-**Pre-PR-A baseline** (all flags off, for comparison only):
+**With additional opt-in flags** stacked on top (same card, same prompt/seed;
+speedup is vs all flags off):
 
-| Model | Time | Default speedup |
-|---|---|---|
-| SD 1.5 | ~3.01 s | 1.06× |
-| SDXL | ~19.84 s | 1.17× |
-| Anima | ~52.20 s | 1.13× |
-
-**With additional opt-in flags** stacked on top (same card, same prompt/seed):
-
-| Model | Best time | Speedup vs pre-PR-A | Winning flags (over the default) |
+| Model | Best time | Speedup | Winning flags (over the default) |
 |---|---|---|---|
 | SD 1.5 | ~2.78 s | 1.08× | `+ channels_last` |
 | SDXL | ~16.89 s | 1.17× | (none — default is the winner) |
@@ -287,22 +272,16 @@ Measured on an RTX 2060 (12 GB, Turing sm_75), fp16, 20 steps.
 
 Findings:
 
-- `cudnn_benchmark=True` is a free, bit-exact win on every model (3-17 %).
-  **It's the default** as of PR-A; the pre-PR-A numbers above are baselines you
-  no longer have to opt in to. Set `cudnn_benchmark=False` to restore the old
-  path (e.g. for diffusers byte-equivalence comparisons).
-- `compile=True` is the headline win on Anima (~33-41 % on Turing; expect more
-  on Ampere+). Its one-time warmup is ~30-180 s depending on model size, paid
-  at load.
-- `cuda_graphs=True` (requires `compile=True`) adds a small extra speedup on
-  top of compile (~5 % on Anima Turing) and produces *more deterministic*
-  output (PSNR 54.7 dB vs 29.0 dB for compile-alone), because
-  `mode="reduce-overhead", dynamic=False` selects kernels consistently.
-- `channels_last=True` and `compile=True` are hardware-sensitive: on Turing
-  they help SD1.5 marginally and slightly regress on SDXL. On Ampere+ both
-  typically help more.
-- `tf32=True` is a no-op for diffucore's fp16 backbones; only the fp32 VAE
-  benefits, and that's one call per image.
+- `cudnn_benchmark=True` is a free, bit-exact win on every model (3-17 %) and is
+  the default. Set `cudnn_benchmark=False` to restore the old path (e.g. for
+  diffusers byte-equivalence comparisons).
+- `compile=True` is the headline win on Anima (~33-41 % on Turing, more on
+  Ampere+), for a one-time ~30-180 s warmup paid at load.
+- `cuda_graphs=True` (requires `compile=True`) adds a small extra speedup and
+  *more deterministic* output, but skip it on Anima above 1024² on 12 GB cards
+  (two shape-specific graph pools blow the VRAM budget).
+- `channels_last` / `compile` are hardware-sensitive (help more on Ampere+, can
+  regress on Turing SDXL); `tf32` only touches the fp32 VAE — one call per image.
 
 ## Status
 
@@ -312,25 +291,14 @@ unit-tested and every shipped backbone verified against reference
 implementations. APIs may still shift before 1.0. CPU works for testing; real
 generation targets CUDA.
 
-**FLUX.1 and FLUX.2 are build-to-spec.** They're implemented from the published
-architecture and cross-checked against the Black Forest Labs / ComfyUI reference
-(structure, config detection, schedule, latent format), with strict checkpoint
-loading and tiny-model end-to-end + determinism checks as the gate. **FLUX.1
-(schnell) now loads and runs on the official real weights** on a 24 GB GPU
-(RTX 4090, bf16, 4-step, 1024², via `offload="stream"`): the strict no-missing-keys
-load passes, it produces a coherent prompt-faithful image, and same-seed renders
-are byte-identical. A bit-exact comparison against the reference is still
-outstanding. **FLUX.2 Klein-4B now also runs on real weights** (official
-`black-forest-labs/FLUX.2-klein-4B` transformer + the ComfyUI-format Qwen3-4B
-encoder and VAE) and produces clean, prompt-faithful, deterministic images —
-this surfaced two FLUX.2 fixes now in place: the 32-ch-VAE ↔ 128-ch-DiT latent
-bridge (latent batch-norm denormalisation + 2×2 pixel-shuffle) and lifting the
-VAE's nested `encoder.quant_conv` / `decoder.post_quant_conv` into the decoder.
-The Dev (Mistral-3) path is still unverified. FLUX.2 leads
-with the **Klein** (Qwen3-4B/8B) path; the Dev
-(Mistral-3 24B) path is wired but secondary (its Tekken tokenizer isn't vendored
-— pass `mistral_tokenizer_path`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
-the per-component status and what to confirm on real weights.
+**FLUX runs on real weights.** FLUX.1 (schnell) and FLUX.2 (Klein-4B) pass a
+strict no-missing-keys load and produce coherent, prompt-faithful, deterministic
+images on a 24 GB GPU (RTX 4090, bf16, `offload="stream"`). Bit-exact parity
+against the Black Forest Labs / ComfyUI reference is still pending; the FLUX.1-dev
+and FLUX.2-Dev (Mistral-3) paths are implemented to spec but not yet
+hardware-verified (the Dev path's Tekken tokenizer isn't vendored — pass
+`mistral_tokenizer_path`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
+per-component status.
 
 **For ComfyUI users:** samplers and schedulers follow ComfyUI's k-diffusion
 conventions, but the SDE samplers re-inject seeded Gaussian noise instead of
