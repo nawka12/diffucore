@@ -25,7 +25,7 @@ from .models import (
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
 )
 from .models.unet import sdxl_unet_config
-from .runtime import DevicePolicy, maybe_compile_backbone, to_channels_last
+from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
 
 # On-disk prefixes (minus the top-level architecture prefix). SDXL keeps CLIP-L
@@ -398,7 +398,14 @@ def load_flux_checkpoint(
     )
     backbone = Flux(flux_cfg)
     _load_no_missing(backbone, dit_sub)
-    backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+    if policy.offload_stream:
+        # Park the whole DiT on CPU at the right dtype, then keep the small
+        # modules resident and stream the blocks (fits FLUX.1 on a 24 GB card).
+        backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
+        stream_blocks(backbone, ("double_blocks", "single_blocks"),
+                      policy.device, policy.offload_device)
+    else:
+        backbone = backbone.to(unet_target, policy.compute_dtype).eval()
     backbone = maybe_compile_backbone(backbone, policy)
 
     # ---- VAE (config inferred from the weights: 16-ch/8× for FLUX.1, 128-ch/16×
