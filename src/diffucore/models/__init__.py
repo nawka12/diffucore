@@ -15,6 +15,9 @@ from .qwen_image_vae import QwenImageVAE
 from .qwen3_text import Qwen3Config, Qwen3TextEncoder
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
 from .anima_dit import AnimaDiT, CosmosDiT, CosmosDiTConfig
+from .t5_text import T5Config, T5TextEncoder
+from .flux_dit import Flux, FluxConfig
+from .mistral_text import MistralConfig, MistralTextEncoder
 
 __all__ = [
     "RMSNorm",
@@ -34,4 +37,10 @@ __all__ = [
     "AnimaDiT",
     "CosmosDiT",
     "CosmosDiTConfig",
+    "T5Config",
+    "T5TextEncoder",
+    "Flux",
+    "FluxConfig",
+    "MistralConfig",
+    "MistralTextEncoder",
 ]

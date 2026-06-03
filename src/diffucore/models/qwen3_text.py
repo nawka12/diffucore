@@ -204,11 +204,24 @@ class Qwen3TextEncoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        hidden_layers: list[int] | None = None,
+    ):
+        """Run the stack. By default returns the final-norm hidden states.
+
+        ``hidden_layers`` (e.g. ``[9, 18, 27]`` for FLUX.2 Klein) instead returns
+        a list of the raw hidden states *after* each of those layer counts — no
+        final norm — for callers that concatenate intermediate layers.
+        """
         B, T = input_ids.shape
         x = self.model.embed_tokens(input_ids)
         position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
         position_embeddings = self.rotary_emb(x, position_ids)
-        for layer in self.model.layers:
+        targets = set(hidden_layers or [])
+        captured: dict[int, torch.Tensor] = {}
+        for idx, layer in enumerate(self.model.layers, start=1):
             x = layer(x, position_embeddings, attention_mask)
+            if idx in targets:
+                captured[idx] = x
+        if hidden_layers is not None:
+            return [captured[i] for i in hidden_layers]
         return self.model.norm(x)

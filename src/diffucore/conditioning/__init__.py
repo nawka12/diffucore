@@ -219,8 +219,10 @@ class SDXLConditioner:
 
 
 from .anima_tokenizer import AnimaTokenized, AnimaTokenizer
+from .flux_tokenizer import FluxTokenized, FluxTokenizer, Flux2Tokenizer
 
 __all__ = [
     "CLIPTokenizer", "Conditioner", "SDXLConditioner", "parse_prompt_attention",
     "AnimaTokenizer", "AnimaTokenized",
+    "FluxTokenizer", "FluxTokenized", "Flux2Tokenizer",
 ]

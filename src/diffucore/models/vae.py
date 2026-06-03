@@ -26,6 +26,11 @@ class VAEConfig:
     num_res_blocks: int = 2
     z_channels: int = 4
     scale_factor: float = 0.18215
+    # FLUX's autoencoder applies a per-tensor *shift* before the scale and ships
+    # without the quant / post-quant 1x1 convs. Both default to the SD behaviour
+    # (shift 0, convs present) so SD1.5/SDXL loads and numerics are unchanged.
+    shift_factor: float = 0.0
+    use_quant_conv: bool = True
 
 
 def Normalize(channels: int) -> nn.GroupNorm:
@@ -198,8 +203,12 @@ class AutoencoderKL(nn.Module):
         self.config = config or VAEConfig()
         self.encoder = Encoder(self.config)
         self.decoder = Decoder(self.config)
-        self.quant_conv = nn.Conv2d(2 * self.config.z_channels, 2 * self.config.z_channels, 1)
-        self.post_quant_conv = nn.Conv2d(self.config.z_channels, self.config.z_channels, 1)
+        if self.config.use_quant_conv:
+            self.quant_conv = nn.Conv2d(2 * self.config.z_channels, 2 * self.config.z_channels, 1)
+            self.post_quant_conv = nn.Conv2d(self.config.z_channels, self.config.z_channels, 1)
+        else:
+            self.quant_conv = None
+            self.post_quant_conv = None
 
     def encode(
         self,
@@ -207,7 +216,9 @@ class AutoencoderKL(nn.Module):
         sample: bool = True,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
-        moments = self.quant_conv(self.encoder(image))
+        moments = self.encoder(image)
+        if self.quant_conv is not None:
+            moments = self.quant_conv(moments)
         mean, logvar = moments.chunk(2, dim=1)
         if sample:
             logvar = logvar.clamp(-30.0, 20.0)
@@ -216,8 +227,12 @@ class AutoencoderKL(nn.Module):
             z = mean + std * noise
         else:
             z = mean
-        return self.config.scale_factor * z
+        # latent = scale·(z − shift); shift defaults to 0 (SD), so this stays
+        # the plain scale for SD1.5/SDXL and adds FLUX's pre-shift when set.
+        return self.config.scale_factor * (z - self.config.shift_factor)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        z = latent / self.config.scale_factor
-        return self.decoder(self.post_quant_conv(z))
+        z = latent / self.config.scale_factor + self.config.shift_factor
+        if self.post_quant_conv is not None:
+            z = self.post_quant_conv(z)
+        return self.decoder(z)

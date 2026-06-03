@@ -10,13 +10,13 @@ LoRA / LoKr adapters. See ``docs/ARCHITECTURE.md`` and ``docs/ROADMAP.md``.
 
 __version__ = "0.1.0"
 
-from .bundle import ModelBundle, load_anima_checkpoint, load_checkpoint
+from .bundle import ModelBundle, load_anima_checkpoint, load_checkpoint, load_flux_checkpoint
 from .lora import LoraReport, apply_lora, clear_loras, remove_lora
 from .pipelines import ImageToImage, Inpaint, PipelineInfo, TextToImage
 
 __all__ = [
     "__version__", "ModelBundle",
-    "load_checkpoint", "load_anima_checkpoint",
+    "load_checkpoint", "load_anima_checkpoint", "load_flux_checkpoint",
     "apply_lora", "remove_lora", "clear_loras", "LoraReport",
     "ImageToImage", "Inpaint", "PipelineInfo", "TextToImage",
 ]

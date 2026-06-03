@@ -25,6 +25,10 @@ UNET_PREFIX = "model.diffusion_model."
 _INPUT_CONV = UNET_PREFIX + "input_blocks.0.0.weight"
 _ATTN2_TO_K = re.compile(r"transformer_blocks\.\d+\.attn2\.to_k\.weight$")
 _ANIMA_FINGERPRINT = "net.llm_adapter.blocks.0.cross_attn.q_proj.weight"
+# FLUX transformers carry double-stream blocks. In a standalone BFL transformer
+# the key is bare; an all-in-one ComfyUI checkpoint prefixes it with
+# ``model.diffusion_model.`` — so we match on the suffix and recover the prefix.
+_FLUX_FINGERPRINT = "double_blocks.0.img_attn.qkv.weight"
 
 Shape = Sequence[int]
 
@@ -33,7 +37,7 @@ Shape = Sequence[int]
 class ModelSpec:
     """Everything the engine needs to know about a checkpoint before building it."""
 
-    architecture: str          # e.g. "sd15", "sdxl", "anima"
+    architecture: str          # e.g. "sd15", "sdxl", "anima", "flux1", "flux2"
     prediction: str            # "eps" | "v" | "flow"
     zero_terminal_snr: bool    # rescale the schedule to zero terminal SNR (ZTSNR)
     latent_channels: int       # VAE latent channel count
@@ -42,6 +46,8 @@ class ModelSpec:
     num_train_timesteps: int = 1000
     beta_schedule: str = "scaled_linear"
     latent_scale: float = 0.18215   # VAE latent scale factor (SDXL uses 0.13025)
+    latent_shift: float = 0.0       # VAE pre-scale shift (FLUX uses 0.1159; 0 for SD)
+    guidance_distilled: bool = False  # FLUX-dev style baked-in guidance embedding
 
 
 def _context_dim(shapes: Mapping[str, Shape]) -> int | None:
@@ -49,6 +55,61 @@ def _context_dim(shapes: Mapping[str, Shape]) -> int | None:
         if key.startswith(UNET_PREFIX) and _ATTN2_TO_K.search(key):
             return int(shape[1])  # to_k.weight is [inner_dim, context_dim]
     return None
+
+
+def _flux_prefix(shapes: Mapping[str, Shape]) -> str | None:
+    """The on-disk prefix in front of the FLUX transformer keys (``""`` for a bare
+    transformer, ``"model.diffusion_model."`` inside an all-in-one checkpoint)."""
+    for key in shapes:
+        if key.endswith(_FLUX_FINGERPRINT):
+            return key[: -len(_FLUX_FINGERPRINT)]
+    return None
+
+
+def _detect_flux(shapes: Mapping[str, Shape], prefix: str) -> ModelSpec:
+    """FLUX.1 vs FLUX.2 from the transformer shapes.
+
+    FLUX.2 carries a single *global* set of shared modulators
+    (``double_stream_modulation_img.lin``) instead of FLUX.1's per-block
+    ``img_mod``/``txt_mod`` — that key is the discriminator. The two families also
+    differ in their VAE/latent contract: FLUX.1 is 16-channel, 8× downscale, with
+    a ``(0.3611, 0.1159)`` scale/shift; FLUX.2 is 128-channel, 16× downscale, with
+    no latent normalisation (the DiT runs patch_size=1, so the latent channels are
+    the token width directly). ``num_heads``, ``axes_dim``, modulation/MLP/bias
+    flags are family constants the loader supplies (see ``bundle._flux_arch``).
+    """
+    txt_in = shapes.get(prefix + "txt_in.weight")
+    img_in = shapes.get(prefix + "img_in.weight")
+    context_dim = int(txt_in[1]) if txt_in is not None else 0
+    guidance = (prefix + "guidance_in.in_layer.weight") in shapes
+    is_flux2 = (prefix + "double_stream_modulation_img.lin.weight") in shapes
+
+    if is_flux2:
+        in_channels = int(img_in[1]) if img_in is not None else 128
+        return ModelSpec(
+            architecture="flux2",
+            prediction="flow",
+            zero_terminal_snr=False,
+            latent_channels=in_channels,        # patch_size 1: token width == latent channels
+            context_dim=context_dim,
+            image_size=1024,
+            latent_scale=1.0,                   # FLUX.2 latent: no scale/shift
+            latent_shift=0.0,
+            guidance_distilled=guidance,
+        )
+
+    in_channels = int(img_in[1]) if img_in is not None else 64
+    return ModelSpec(
+        architecture="flux1",
+        prediction="flow",
+        zero_terminal_snr=False,
+        latent_channels=in_channels // 4,       # 2×2 patch fold
+        context_dim=context_dim,
+        image_size=1024,
+        latent_scale=0.3611,
+        latent_shift=0.1159,
+        guidance_distilled=guidance,
+    )
 
 
 def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
@@ -70,6 +131,12 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
             image_size=1024,
             latent_scale=1.0,
         )
+
+    # FLUX (BFL rectified-flow DiT): double-stream blocks, bare or under the
+    # ``model.diffusion_model.`` prefix of an all-in-one checkpoint.
+    flux_prefix = _flux_prefix(shapes)
+    if flux_prefix is not None:
+        return _detect_flux(shapes, flux_prefix)
 
     if _INPUT_CONV not in shapes:
         raise ValueError(f"no UNet found (missing {_INPUT_CONV!r}); not a supported checkpoint")

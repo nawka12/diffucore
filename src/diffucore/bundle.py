@@ -13,14 +13,16 @@ takes all three paths and returns the same :class:`ModelBundle` type as
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
-from .conditioning import AnimaTokenizer, CLIPTokenizer
+from .conditioning import AnimaTokenizer, CLIPTokenizer, FluxTokenizer, Flux2Tokenizer
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header
 from .models import (
     AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig,
-    AnimaDiT, QwenImageVAE, Qwen3TextEncoder,
+    AnimaDiT, QwenImageVAE, Qwen3TextEncoder, Qwen3Config,
+    Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
 )
 from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy, maybe_compile_backbone, to_channels_last
@@ -79,6 +81,10 @@ def load_checkpoint(
         policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
 
     spec = detect_architecture(read_header(path))
+    # An all-in-one FLUX checkpoint (transformer + CLIP/T5/Mistral + VAE in one
+    # file) lands here too; route it to the FLUX loader.
+    if spec.architecture in ("flux1", "flux2"):
+        return load_flux_checkpoint(path, device=device, dtype=dtype, policy=policy)
     if spec.architecture not in ("sd15", "sdxl"):
         raise NotImplementedError(f"unsupported architecture {spec.architecture!r}")
 
@@ -206,4 +212,254 @@ def load_anima_checkpoint(
     )
 
 
-__all__ = ["ModelBundle", "load_checkpoint", "load_anima_checkpoint"]
+# ─── FLUX (FLUX.1 + FLUX.2) ──────────────────────────────────────────────────
+#
+# FLUX components can arrive bundled in one all-in-one checkpoint or as separate
+# files (transformer / VAE / text-encoder(s)). Rather than enumerate the many
+# on-disk prefix conventions, each component is located by a fingerprint leaf key
+# and its prefix is recovered and stripped — so bare BFL files and nested
+# ``model.diffusion_model.`` / ``text_encoders.*`` all-in-one layouts both work.
+
+_FLUX_DIT_LEAF = "double_blocks.0.img_attn.qkv.weight"
+_FLUX_VAE_LEAF = "decoder.conv_in.weight"
+_FLUX_CLIP_LEAF = "text_model.embeddings.token_embedding.weight"
+_FLUX_T5_LEAF = "encoder.block.0.layer.0.SelfAttention.q.weight"
+_FLUX_MISTRAL_LEAF = "model.layers.0.self_attn.q_proj.weight"
+
+
+def _flux_arch(architecture: str) -> dict:
+    """Per-family FLUX DiT constants the tensor shapes don't reveal. Both families
+    keep head_dim 128 (axes sum to 128), so ``num_heads = hidden // 128``."""
+    if architecture == "flux2":
+        return dict(
+            axes_dim=(32, 32, 32, 32), theta=2000, mlp_ratio=3.0, qkv_bias=False,
+            global_modulation=True, mlp_silu_act=True, ops_bias=False,
+        )
+    return dict(
+        axes_dim=(16, 56, 56), theta=10000, mlp_ratio=4.0, qkv_bias=True,
+        global_modulation=False, mlp_silu_act=False, ops_bias=True,
+    )
+
+
+def _infer_vae_config(sd, *, scale_factor: float, shift_factor: float) -> VAEConfig:
+    """Build a :class:`VAEConfig` from an LDM-style autoencoder state dict.
+
+    FLUX.1's VAE is 16-channel / 8× (channel_mult ``(1,2,4,4)``) and FLUX.2's is
+    128-channel / 16× (one extra downsample stage) — both follow the LDM
+    ``encoder.down.{i}.block.{j}`` layout, so the depth, base width, per-level
+    multipliers, res-block count, latent channels and quant-conv presence are all
+    read off the weights rather than hardcoded. (Attention is assumed mid-only, as
+    in the FLUX autoencoders.)
+    """
+    ch = sd["encoder.conv_in.weight"].shape[0]
+    num_res = 0
+    while f"encoder.down.0.block.{num_res}.norm1.weight" in sd:
+        num_res += 1
+    n_levels = 0
+    while f"encoder.down.{n_levels}.block.0.norm1.weight" in sd:
+        n_levels += 1
+    mult = []
+    for i in range(n_levels):
+        j = 0
+        while f"encoder.down.{i}.block.{j}.norm1.weight" in sd:
+            j += 1
+        out_ch = sd[f"encoder.down.{i}.block.{j - 1}.conv2.weight"].shape[0]
+        mult.append(out_ch // ch)
+    z_channels = sd["encoder.conv_out.weight"].shape[0] // 2  # double_z
+    return VAEConfig(
+        base_channels=ch,
+        channel_mult=tuple(mult),
+        num_res_blocks=num_res,
+        z_channels=z_channels,
+        scale_factor=scale_factor,
+        shift_factor=shift_factor,
+        use_quant_conv="quant_conv.weight" in sd,
+    )
+
+
+def _extract_component(sd, leaf: str):
+    """Locate the component whose keys end with ``leaf``, strip its on-disk prefix,
+    and return the sub-state-dict (or ``None`` if the component isn't present)."""
+    if sd is None:
+        return None
+    prefix = None
+    for k in sd:
+        if k.endswith(leaf):
+            prefix = k[: -len(leaf)]
+            break
+    if prefix is None:
+        return None
+    return {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+
+
+def _load_no_missing(module, sub, drop_suffixes=()):
+    """Load ``sub`` into ``module``, tolerating benign *extra* keys (duplicated
+    embeddings, projection heads, ``position_ids``) but rejecting any *missing*
+    key — a missing key is a real architecture mismatch, the correctness check."""
+    drop = ("position_ids",) + tuple(drop_suffixes)
+    sub = {k: v for k, v in sub.items() if not any(k.endswith(s) for s in drop)}
+    missing, _ = module.load_state_dict(sub, strict=False)
+    if missing:
+        raise RuntimeError(
+            f"{type(module).__name__}: {len(missing)} missing key(s) "
+            f"(e.g. {missing[:5]}) — checkpoint/architecture mismatch"
+        )
+    return module
+
+
+def _qwen3_config_from_sd(sd) -> Qwen3Config:
+    """Derive a Qwen3 config from a checkpoint (head_dim from the per-head q-norm)."""
+    emb = sd["model.embed_tokens.weight"]
+    n = 0
+    while f"model.layers.{n}.self_attn.q_proj.weight" in sd:
+        n += 1
+    head_dim = sd["model.layers.0.self_attn.q_norm.weight"].shape[0]
+    q = sd["model.layers.0.self_attn.q_proj.weight"].shape[0]
+    kv = sd["model.layers.0.self_attn.k_proj.weight"].shape[0]
+    ffn = sd["model.layers.0.mlp.gate_proj.weight"].shape[0]
+    return Qwen3Config(
+        vocab_size=emb.shape[0], hidden_size=emb.shape[1], intermediate_size=ffn,
+        num_hidden_layers=n, num_attention_heads=q // head_dim,
+        num_key_value_heads=kv // head_dim, head_dim=head_dim,
+    )
+
+
+def _build_flux2_text_encoder(lm_sub):
+    """Build FLUX.2's text encoder from its LM state dict. Returns
+    ``(encoder, tokenizer_kind, needs_mistral_tokenizer)``. Qwen3 (Klein) is told
+    apart from Mistral (Dev) by its per-head ``q_norm`` weight."""
+    if "model.layers.0.self_attn.q_norm.weight" in lm_sub:   # Qwen3 (Klein)
+        cfg = _qwen3_config_from_sd(lm_sub)
+        encoder = Qwen3TextEncoder(cfg)
+        _load_no_missing(encoder, lm_sub, drop_suffixes=("lm_head.weight",))
+        kind = "qwen3_8b" if cfg.hidden_size >= 4096 else "qwen3_4b"
+        return encoder, kind, False
+    cfg = MistralConfig.from_state_dict(lm_sub)              # Mistral (Dev)
+    encoder = MistralTextEncoder(cfg)
+    _load_no_missing(encoder, lm_sub, drop_suffixes=("lm_head.weight",))
+    return encoder, "mistral3_24b", True
+
+
+def load_flux_checkpoint(
+    path: str | None = None,
+    *,
+    transformer_path: str | None = None,
+    vae_path: str | None = None,
+    t5_path: str | None = None,
+    clip_path: str | None = None,
+    mistral_path: str | None = None,
+    mistral_tokenizer_path: str | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float16,
+    policy: DevicePolicy | None = None,
+) -> ModelBundle:
+    """Load FLUX.1 or FLUX.2 into a :class:`ModelBundle`.
+
+    Components come from their dedicated file when given, else from the all-in-one
+    ``path``; pass either (or a mix). FLUX.1 needs transformer + VAE + T5-XXL +
+    CLIP-L; FLUX.2 needs transformer + VAE + Mistral-3 (+ its ``tokenizer.json``,
+    ``mistral_tokenizer_path`` or a sidecar next to the encoder file).
+
+    Like Anima, ``schedule`` is left ``None`` — FLUX is flow-matching and builds
+    its σ schedule (a resolution-dependent shift) at pipeline time. The VAE runs
+    fp32; the transformer and text encoder(s) run in ``dtype``.
+    """
+    if path is None and transformer_path is None:
+        raise ValueError("provide an all-in-one `path` or at least `transformer_path`")
+    if policy is None:
+        policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
+
+    cache: dict[str, dict] = {}
+
+    def source(p):
+        p = p or path
+        if p is None:
+            return None
+        if p not in cache:
+            cache[p] = load_state_dict(p, device="cpu")
+        return cache[p]
+
+    dit_sd_full = source(transformer_path)
+    if dit_sd_full is None:
+        raise ValueError("no transformer found (need `path` or `transformer_path`)")
+    spec = detect_architecture({k: tuple(v.shape) for k, v in dit_sd_full.items()})
+    if spec.architecture not in ("flux1", "flux2"):
+        raise ValueError(f"not a FLUX checkpoint (detected {spec.architecture!r})")
+
+    idle_target = policy.offload_device if policy.offload_idle else policy.device
+    unet_target = policy.offload_device if policy.offload_unet else policy.device
+
+    # ---- transformer (DiT). Family constants from _flux_arch; widths from shapes.
+    dit_sub = _extract_component(dit_sd_full, _FLUX_DIT_LEAF)
+    hidden = dit_sub["img_in.weight"].shape[0]
+    arch_params = _flux_arch(spec.architecture)
+    flux_cfg = FluxConfig.from_state_dict(
+        dit_sub, num_heads=hidden // sum(arch_params["axes_dim"]), **arch_params
+    )
+    backbone = Flux(flux_cfg)
+    _load_no_missing(backbone, dit_sub)
+    backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+    backbone = maybe_compile_backbone(backbone, policy)
+
+    # ---- VAE (config inferred from the weights: 16-ch/8× for FLUX.1, 128-ch/16×
+    # for FLUX.2; scale/shift from the spec — FLUX.2 uses none).
+    vae_sub = _extract_component(source(vae_path), _FLUX_VAE_LEAF)
+    if vae_sub is None:
+        raise ValueError("no VAE found (need it in `path` or `vae_path`)")
+    vae = AutoencoderKL(_infer_vae_config(
+        vae_sub, scale_factor=spec.latent_scale, shift_factor=spec.latent_shift
+    ))
+    _load_no_missing(vae, vae_sub)
+    vae = vae.to(idle_target, policy.vae_dtype).eval()
+
+    # ---- text encoder(s)
+    if spec.architecture == "flux1":
+        t5_sub = _extract_component(source(t5_path), _FLUX_T5_LEAF)
+        if t5_sub is None:
+            raise ValueError("FLUX.1 needs a T5-XXL encoder (in `path` or `t5_path`)")
+        if "shared.weight" not in t5_sub and "encoder.embed_tokens.weight" in t5_sub:
+            t5_sub["shared.weight"] = t5_sub["encoder.embed_tokens.weight"]
+        text_encoder = T5TextEncoder()
+        _load_no_missing(text_encoder, t5_sub, drop_suffixes=("encoder.embed_tokens.weight",))
+        text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+
+        clip_sub = _extract_component(source(clip_path), _FLUX_CLIP_LEAF)
+        if clip_sub is None:
+            raise ValueError("FLUX.1 needs a CLIP-L encoder (in `path` or `clip_path`)")
+        text_encoder_2 = CLIPTextEncoder()
+        _load_no_missing(
+            text_encoder_2, clip_sub, drop_suffixes=("text_projection.weight", "logit_scale")
+        )
+        text_encoder_2 = text_encoder_2.to(idle_target, policy.compute_dtype).eval()
+        tokenizer = FluxTokenizer()
+    else:  # flux2 — a single decoder LM (Klein/Qwen3 or Dev/Mistral)
+        lm_sub = _extract_component(source(mistral_path), _FLUX_MISTRAL_LEAF)
+        if lm_sub is None:
+            raise ValueError("FLUX.2 needs a Qwen3 (Klein) or Mistral-3 (Dev) encoder")
+        text_encoder, kind, mistral_kind = _build_flux2_text_encoder(lm_sub)
+        text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+        text_encoder_2 = None
+        if mistral_kind:
+            tok_path = mistral_tokenizer_path
+            if tok_path is None:
+                sidecar = mistral_path or path
+                tok_path = str(Path(sidecar).with_name("tokenizer.json")) if sidecar else None
+            tokenizer = Flux2Tokenizer(kind=kind, tokenizer_path=tok_path)
+        else:
+            tokenizer = Flux2Tokenizer(kind=kind)
+
+    return ModelBundle(
+        spec=spec,
+        schedule=None,                  # flow-matching: σ-schedule built at sample time
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        backbone=backbone,
+        vae=vae,
+        text_encoder_2=text_encoder_2,
+        policy=policy,
+    )
+
+
+__all__ = [
+    "ModelBundle", "load_checkpoint", "load_anima_checkpoint", "load_flux_checkpoint",
+]

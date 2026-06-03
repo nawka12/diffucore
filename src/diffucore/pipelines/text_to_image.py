@@ -19,6 +19,7 @@ from PIL import Image
 
 from ..runtime import perf_context
 from ._anima import anima_text_to_image
+from ._flux import flux_text_to_image, _FLUX_SCHEDULERS
 from ._base import PipelineInfo, _Pipeline
 
 if TYPE_CHECKING:  # avoid importing the bundle (and torch-heavy models) eagerly
@@ -53,6 +54,19 @@ class TextToImage(_Pipeline):
                 width=width if width is not None else self.model.spec.image_size,
                 height=height if height is not None else self.model.spec.image_size,
                 seed=seed, sampler=sampler, scheduler=anima_scheduler,
+                progress_callback=progress_callback,
+                return_info=return_info,
+            )
+        if self.model.spec.architecture in ("flux1", "flux2"):
+            # FLUX is flow-matching + guidance-distilled: cfg_scale is the distilled
+            # guidance, and SD schedulers don't apply (fall back to "flux").
+            flux_scheduler = scheduler if scheduler in _FLUX_SCHEDULERS else "flux"
+            return flux_text_to_image(
+                self.model, prompt, negative_prompt,
+                steps=steps, guidance=cfg_scale, shift=shift,
+                width=width if width is not None else self.model.spec.image_size,
+                height=height if height is not None else self.model.spec.image_size,
+                seed=seed, sampler=sampler, scheduler=flux_scheduler,
                 progress_callback=progress_callback,
                 return_info=return_info,
             )

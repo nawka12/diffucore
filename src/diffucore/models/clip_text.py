@@ -120,7 +120,7 @@ class CLIPTextEncoder(nn.Module):
         self.config = config or CLIPTextConfig()
         self.text_model = CLIPTextTransformer(self.config)
 
-    def forward(self, token_ids: torch.Tensor, clip_skip: int = 1) -> torch.Tensor:
+    def forward(self, token_ids: torch.Tensor, clip_skip: int = 1, return_pooled: bool = False):
         tm = self.text_model
         x = tm.embeddings(token_ids)
 
@@ -134,4 +134,13 @@ class CLIPTextEncoder(nn.Module):
 
         if clip_skip == 1:
             x = tm.final_layer_norm(x)
+
+        if return_pooled:
+            # CLIP pooler_output: the EOS token's hidden state from the final-
+            # normed sequence (FLUX's pooled CLIP vector). argmax finds the EOS
+            # id (the largest token id) — its first occurrence is the true end.
+            normed = x if clip_skip == 1 else tm.final_layer_norm(x)
+            eos = token_ids.to(torch.int).argmax(dim=-1)
+            pooled = normed[torch.arange(normed.shape[0], device=normed.device), eos]
+            return x, pooled
         return x
