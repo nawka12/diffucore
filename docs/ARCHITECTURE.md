@@ -153,10 +153,13 @@ image = TextToImage(model)("a watercolor fox", steps=20, cfg_scale=4.0,
                            width=1024, height=1024, shift=3.0, seed=0)
 ```
 
-`TextToImage` dispatches by `model.spec.architecture`; the SD/SDXL and Anima
-paths share the bundle/conditioning/decode contract but diverge in the
-sampling-loop internals (different parameterization, schedule, and the DiT's
-extra `t5xxl_ids` kwarg routed through its built-in LLM-Adapter).
+`TextToImage` dispatches by `model.spec.architecture`; the SD/SDXL, Anima, and
+FLUX (`flux1`/`flux2`) paths share the bundle/conditioning/decode contract but
+diverge in the sampling-loop internals (different parameterization, schedule,
+and per-backbone kwargs — Anima's `t5xxl_ids` through its built-in LLM-Adapter,
+FLUX's patchified image tokens + axial position ids + distilled guidance).
+FLUX loads via `load_flux_checkpoint` (`flux2` leads with the Qwen3 "Klein"
+encoder) and is build-to-spec — see [`ROADMAP.md`](ROADMAP.md).
 
 Lower layers stay usable on their own (e.g. build a `Denoiser` and call a
 `Sampler` directly) so the engine is composable, not just a single black box.
@@ -227,6 +230,19 @@ fixed 4-channel latents, scalar `latent_scale`) doesn't apply to flow-matching
 DiTs that the Anima path lives in its own self-contained driver
 (`pipelines/_anima.py`) that `TextToImage` dispatches into. This is by
 design — see §9 in [`ROADMAP.md`](ROADMAP.md) for the DT0–DT7 build sheet.
+
+The **FLUX** family (FLUX.1 + FLUX.2) exercised the same seams again: one
+config-driven MMDiT (`models/flux_dit.py`) covers both via a `FluxConfig`
+derived from the checkpoint shapes (FLUX.2 flips on global modulation, a
+SiLU-gated MLP, bias-free linears, a 4-axis RoPE, and patch_size 1); the VAE
+reuses the LDM `AutoencoderKL` with a config inferred from the weights (the
+only structural additions being `VAEConfig.shift_factor` + `use_quant_conv`,
+both defaulting to the SD behaviour); the text encoders reuse T5/CLIP (FLUX.1)
+and the existing Qwen3 encoder (FLUX.2 "Klein"). Like Anima, FLUX gets its own
+driver (`pipelines/_flux.py`) and a detector branch, with no changes to the
+σ-space samplers or the loop. FLUX is **build-to-spec** — implemented from the
+published architecture and cross-checked against the reference, but not yet
+GPU-verified; the strict checkpoint load is the correctness gate.
 
 ## 9. Provenance and licensing
 

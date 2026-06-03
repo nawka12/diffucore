@@ -128,6 +128,54 @@ The remaining extensions (each its own slice):
     `comfy_aimdo` native dep), so DT4 (adapter) and DT5 (DiT) rely on
     strict-load + behavioral tests; correctness is confirmed end-to-end at
     DT7 by visual inspection vs the same prompt/seed in ComfyUI.
+- **FLUX family (FLUX.1 + FLUX.2) — implemented, build-to-spec.**
+  `load_flux_checkpoint(...)` → `TextToImage` runs both families end-to-end on
+  tiny models (CPU), seed-reproducible. **Not yet GPU-verified against real
+  weights** — implemented from the published architecture and cross-checked
+  against the Black Forest Labs / ComfyUI reference (block structure, config
+  detection, latent format, schedule); a strict no-missing-keys load is the
+  correctness gate, with numerical parity deferred to hardware verification.
+  Components:
+  - **Detection** — both families carry double-stream blocks
+    (`double_blocks.0.img_attn.qkv.weight`), located bare or under an all-in-one
+    `model.diffusion_model.` prefix. FLUX.2 is told apart by its *global*
+    modulators (`double_stream_modulation_img.lin.weight`). Widths/depths derive
+    from tensor shapes; the family constants live in `bundle._flux_arch`.
+  - **FLUX DiT** (`models/flux_dit.py`) — one config-driven MMDiT for both.
+    **FLUX.1**: per-block `img_mod`/`txt_mod` AdaLN, GELU-tanh MLP, biases on,
+    axial RoPE `(16,56,56)` θ=10000, `qkv_bias=True`; the pipeline 2×2-patchifies
+    (in_channels 64). **FLUX.2**: three *shared* bias-free modulators
+    (`double_stream_modulation_img`/`_txt`, `single_stream_modulation`) drive
+    every block, SiLU-gated MLP, no biases, RoPE `(32,32,32,32)` θ=2000,
+    patch_size 1 (in_channels 128, text ids positioned on axis 3).
+  - **VAE** — the FLUX autoencoders reuse the LDM `AutoencoderKL` layout, so the
+    config (channel_mult, z_channels, quant-conv presence) is inferred from the
+    weights: FLUX.1 16-ch / 8× with scale 0.3611 + shift 0.1159; FLUX.2 128-ch /
+    16× with no scale/shift. `VAEConfig` gained `shift_factor` + `use_quant_conv`
+    (both default to the SD behaviour, so SD/SDXL load byte-identically).
+  - **Text encoders** — **FLUX.1**: T5-XXL v1.1 encoder (`models/t5_text.py`,
+    relative-position bias, gated-GELU; reuses the vendored `t5_tokenizer.json`)
+    for the sequence context + CLIP-L's pooled vector (a `return_pooled` path
+    added to `CLIPTextEncoder`, SD/SDXL output unchanged). **FLUX.2 Klein**: a
+    single Qwen3-4B/8B encoder, reusing Anima's `Qwen3TextEncoder` with an
+    intermediate-layer (`[9,18,27]`) capture; the context is those three layers
+    concatenated (no final norm), with the Qwen chat template and the vendored
+    Qwen2.5 tokenizer. **FLUX.2 Dev**: a Mistral-3 24B encoder
+    (`models/mistral_text.py`, layers `[10,20,30]`, SYSTEM_PROMPT template) — the
+    secondary path; its Tekken tokenizer is not vendored.
+  - **Schedule / parameterization** — reuses `FlowMatchingConstScaling` and
+    `flow_matching_schedule`; the shift matches ComfyUI's `flux_time_shift`
+    (FLUX.1-dev resolution-interpolated `exp(mu)`, schnell 1.0, FLUX.2
+    `exp(2.02)`). Euler is exact; the flow-aware DPM++/ER-SDE/SECANT samplers
+    drive FLUX too, via the same CONST x0 closure the Anima path uses.
+  - **Loading** — `load_flux_checkpoint` takes an all-in-one checkpoint or split
+    files (transformer / VAE / text encoder(s)); each component is located by a
+    fingerprint-leaf key and its on-disk prefix is stripped, so bare BFL files
+    and nested all-in-one layouts both load. `load_checkpoint` routes a detected
+    FLUX checkpoint here automatically.
+  - **What to confirm on real weights** — the FLUX.2 VAE key layout (assumed
+    LDM-style, mid-only attention), Qwen3/Mistral padding+mask handling, and the
+    exact guidance/shift defaults. FLUX is text-to-image only in this build.
 - **LoRA / LoKr application — done.** `apply_lora(bundle, path, multiplier)`
   fuses adapter weight deltas into the loaded modules in place (no forward
   wrapping, so offload and the sampling path are untouched). Covers two

@@ -26,9 +26,11 @@ image.save("fox.png")
 
 ## Highlights
 
-- **Three model families, one API** — Stable Diffusion 1.5, SDXL, and **Anima**
-  (a 2 B DiT built on Cosmos-Predict2 with Qwen3-0.6B + Qwen-Image VAE). Load any
-  of them, drive them all the same way.
+- **One API across architectures** — Stable Diffusion 1.5, SDXL, **Anima**
+  (a 2 B DiT built on Cosmos-Predict2 with Qwen3-0.6B + Qwen-Image VAE), and the
+  **FLUX** family (FLUX.1 dev/schnell and FLUX.2 Klein/Dev). Load any of them,
+  drive them all the same way. (FLUX is implemented to spec and cross-checked
+  against the reference, but not yet hardware-verified — see [Status](#status).)
 - **Text-to-image, image-to-image, and inpainting** out of the box.
 - **Long prompt weighting (LPW) on SDXL** — A1111-style attention syntax
   (`(word:1.3)`, `(word)`, `[word]`) and prompts beyond CLIP's 77-token limit.
@@ -75,7 +77,8 @@ image = TextToImage(model)(
   `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`, `secant`
   (the last is Anima-only; pair with `scheduler="acas"`).
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `sgm_uniform`,
-  `simple` (SD/SDXL); `flow` (default), `acas`, `sgm_uniform`, `simple` (Anima).
+  `simple` (SD/SDXL); `flow` (default), `acas`, `sgm_uniform`, `simple` (Anima);
+  `flux` (default), `flow`, `sgm_uniform`, `simple` (FLUX).
 
 ### Anima (DiT)
 
@@ -92,6 +95,39 @@ image = TextToImage(model)(
     sampler="er_sde", shift=3.0, seed=0,
 )
 ```
+
+### FLUX (DiT)
+
+FLUX is a guidance-distilled rectified-flow MMDiT, so there's no
+negative-prompt CFG pass — `cfg_scale` is the *distilled guidance* scale. Load
+an all-in-one checkpoint (`load_checkpoint` auto-detects it) or the official
+split files (`load_flux_checkpoint`):
+
+```python
+from diffucore import load_flux_checkpoint, TextToImage
+
+# FLUX.1: transformer + VAE + T5-XXL + CLIP-L
+model = load_flux_checkpoint(
+    transformer_path="flux/flux1-dev.safetensors",
+    vae_path="flux/ae.safetensors",
+    t5_path="flux/t5xxl.safetensors",
+    clip_path="flux/clip_l.safetensors",
+    device="cuda", dtype=torch.bfloat16,
+)
+image = TextToImage(model)(
+    "a watercolor fox", steps=20, cfg_scale=3.5, width=1024, height=1024, seed=0,
+)
+
+# FLUX.2 Klein: transformer + VAE + a single Qwen3 (4B/8B) text encoder
+model = load_flux_checkpoint(
+    transformer_path="flux2/flux2-klein.safetensors",
+    vae_path="flux2/ae.safetensors",
+    mistral_path="flux2/qwen3_4b.safetensors",   # Qwen3 or Mistral-3; auto-detected
+    device="cuda", dtype=torch.bfloat16,
+)
+```
+
+FLUX is text-to-image only in this build.
 
 ### Image-to-image & inpainting
 
@@ -184,8 +220,15 @@ on Turing (RTX 20-series) the cuDNN NCHW path is already near-optimal and
 | Stable Diffusion 1.5 | 512² | t2i · img2img · inpaint | eps + v-pred, ZTSNR |
 | SDXL | 1024² | t2i · img2img · inpaint | dual text encoders, eps + v-pred, ZTSNR |
 | Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i | flow-matching, Qwen3 + Qwen-Image VAE |
+| FLUX.1 (dev / schnell) | 1024² | t2i | flow-matching MMDiT, T5-XXL + CLIP-L; build-to-spec † |
+| FLUX.2 (Klein / Dev) | 1024² | t2i | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev); build-to-spec † |
 
-LoRA / LoKr adapters are supported on all three.
+LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima.
+
+† **FLUX is implemented from the published architecture and cross-checked against
+the reference, but not yet verified against real weights on GPU.** A strict
+no-missing-keys load is the correctness gate; numerical parity is pending
+hardware verification. See [Status](#status).
 
 ## Performance
 
@@ -237,9 +280,20 @@ Findings:
 ## Status
 
 Diffucore is in **alpha**. The engine is end-to-end working and seed-reproducible
-across all three model families, with the sampling core and checkpoint detection
-unit-tested and every backbone verified against reference implementations. APIs
-may still shift before 1.0. CPU works for testing; real generation targets CUDA.
+on SD1.5 / SDXL / Anima, with the sampling core and checkpoint detection
+unit-tested and every shipped backbone verified against reference
+implementations. APIs may still shift before 1.0. CPU works for testing; real
+generation targets CUDA.
+
+**FLUX.1 and FLUX.2 are build-to-spec.** They're implemented from the published
+architecture and cross-checked against the Black Forest Labs / ComfyUI reference
+(structure, config detection, schedule, latent format), with strict checkpoint
+loading and tiny-model end-to-end + determinism checks as the gate — but they
+have **not** been run against real weights on a GPU yet, so numerical parity is
+unconfirmed. FLUX.2 leads with the **Klein** (Qwen3-4B/8B) path; the Dev
+(Mistral-3 24B) path is wired but secondary (its Tekken tokenizer isn't vendored
+— pass `mistral_tokenizer_path`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
+the per-component status and what to confirm on real weights.
 
 **For ComfyUI users:** samplers and schedulers follow ComfyUI's k-diffusion
 conventions, but the SDE samplers re-inject seeded Gaussian noise instead of
