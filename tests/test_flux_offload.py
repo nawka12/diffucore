@@ -106,3 +106,49 @@ def test_can_decode_untiled_indexless_cuda_device():
     # torch.cuda.mem_get_info; it should resolve to the current device instead.
     out = can_decode_untiled(torch.nn.Identity(), (1, 16, 8, 8), torch.device("cuda"))
     assert isinstance(out, bool)
+
+
+# ---- FLUX.2 VAE/latent bridge -------------------------------------------------
+
+def test_flux2_unpatchify_inverts_reference_patchify():
+    from diffucore.pipelines._flux import _flux2_unpatchify_latents
+    torch.manual_seed(0)
+    z = torch.randn(2, 32, 16, 16)  # VAE latent (32-ch)
+    # reference Flux2 pipeline _patchify_latents: 32-ch -> 128-ch (2x2 pixel-shuffle)
+    b, c, h, w = z.shape
+    zp = z.reshape(b, c, h // 2, 2, w // 2, 2).permute(0, 1, 3, 5, 2, 4).reshape(b, c * 4, h // 2, w // 2)
+    assert tuple(zp.shape) == (2, 128, 8, 8)
+    back = _flux2_unpatchify_latents(zp)
+    assert tuple(back.shape) == (2, 32, 16, 16)
+    assert torch.allclose(back, z, atol=1e-6)
+
+
+def test_lift_quant_convs_promotes_flux2_nested_keys():
+    from diffucore.bundle import _lift_quant_convs
+    sd = {
+        "encoder.conv_in.weight": 1, "decoder.conv_in.weight": 1,
+        "encoder.quant_conv.weight": 2, "encoder.quant_conv.bias": 3,
+        "decoder.post_quant_conv.weight": 4, "decoder.post_quant_conv.bias": 5,
+        "bn.running_mean": 6,
+    }
+    out = _lift_quant_convs(sd)
+    assert out["quant_conv.weight"] == 2 and out["quant_conv.bias"] == 3
+    assert out["post_quant_conv.weight"] == 4 and out["post_quant_conv.bias"] == 5
+    assert "encoder.quant_conv.weight" not in out and "decoder.post_quant_conv.weight" not in out
+    assert out["encoder.conv_in.weight"] == 1 and out["bn.running_mean"] == 6  # untouched
+
+
+def test_infer_vae_config_detects_nested_quant_conv():
+    from diffucore.bundle import _infer_vae_config, _lift_quant_convs
+    # minimal LDM-ish header with FLUX.2-style nested quant convs
+    sd = {
+        "encoder.conv_in.weight": torch.zeros(128, 3, 3, 3),
+        "encoder.down.0.block.0.norm1.weight": torch.zeros(128),
+        "encoder.down.0.block.0.conv2.weight": torch.zeros(128, 128, 3, 3),
+        "encoder.conv_out.weight": torch.zeros(64, 512, 3, 3),
+        "encoder.quant_conv.weight": torch.zeros(64, 64, 1, 1),
+        "decoder.post_quant_conv.weight": torch.zeros(32, 32, 1, 1),
+    }
+    cfg = _infer_vae_config(_lift_quant_convs(sd), scale_factor=1.0, shift_factor=0.0)
+    assert cfg.use_quant_conv is True
+    assert cfg.z_channels == 32

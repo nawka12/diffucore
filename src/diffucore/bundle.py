@@ -273,8 +273,27 @@ def _infer_vae_config(sd, *, scale_factor: float, shift_factor: float) -> VAECon
         z_channels=z_channels,
         scale_factor=scale_factor,
         shift_factor=shift_factor,
-        use_quant_conv="quant_conv.weight" in sd,
+        # SD/LDM keeps them at the top level; FLUX.2 nests them under
+        # encoder./decoder. (lifted by _lift_quant_convs before this runs).
+        use_quant_conv="quant_conv.weight" in sd or "encoder.quant_conv.weight" in sd,
     )
+
+
+def _lift_quant_convs(sd):
+    """Lift FLUX.2's nested ``encoder.quant_conv.*`` / ``decoder.post_quant_conv.*``
+    to the top-level ``quant_conv.*`` / ``post_quant_conv.*`` that
+    :class:`AutoencoderKL` expects. A no-op for SD/LDM and FLUX.1 (which either
+    keep them top-level or have none)."""
+    moves = (("encoder.quant_conv.", "quant_conv."),
+             ("decoder.post_quant_conv.", "post_quant_conv."))
+    out = {}
+    for k, v in sd.items():
+        for old, new in moves:
+            if k.startswith(old):
+                k = new + k[len(old):]
+                break
+        out[k] = v
+    return out
 
 
 def _extract_component(sd, leaf: str):
@@ -413,10 +432,23 @@ def load_flux_checkpoint(
     vae_sub = _extract_component(source(vae_path), _FLUX_VAE_LEAF)
     if vae_sub is None:
         raise ValueError("no VAE found (need it in `path` or `vae_path`)")
+    vae_sub = _lift_quant_convs(vae_sub)   # FLUX.2 nests the quant convs
     vae = AutoencoderKL(_infer_vae_config(
         vae_sub, scale_factor=spec.latent_scale, shift_factor=spec.latent_shift
     ))
     _load_no_missing(vae, vae_sub)
+    # FLUX.2 bridges its 32-ch VAE latent to the 128-ch DiT space with a 2×2
+    # pixel-shuffle + a (non-affine) batch-norm latent normalisation. The conv
+    # stack lives in AutoencoderKL; stash the bn stats so the pipeline can invert
+    # them before decode (see _flux.flux_text_to_image). eps = config batch_norm_eps.
+    if spec.architecture == "flux2" and "bn.running_mean" in vae_sub:
+        eps = 1e-4
+        vae.register_buffer(
+            "flux2_latent_mean", vae_sub["bn.running_mean"].float().view(1, -1, 1, 1),
+            persistent=False)
+        vae.register_buffer(
+            "flux2_latent_std", (vae_sub["bn.running_var"].float() + eps).sqrt().view(1, -1, 1, 1),
+            persistent=False)
     vae = vae.to(idle_target, policy.vae_dtype).eval()
 
     # ---- text encoder(s)

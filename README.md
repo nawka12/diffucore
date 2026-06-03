@@ -127,6 +127,12 @@ model = load_flux_checkpoint(
 )
 ```
 
+For FLUX.2, use the **ComfyUI-format single files** for the VAE and text encoder
+(e.g. `flux2-vae.safetensors`, `qwen_3_4b.safetensors`). The official BFL repo
+ships those two in diffusers layout (`encoder.down_blocks…`, sharded encoder),
+which this loader's LDM `AutoencoderKL` / single-file path doesn't consume; the
+transformer single-file (`flux-2-klein-4b.safetensors`) loads as-is.
+
 FLUX is text-to-image only in this build.
 
 **Fitting FLUX.1 on a 24 GB GPU.** The FLUX.1 transformer is ~23 GB in bf16, so
@@ -314,7 +320,13 @@ loading and tiny-model end-to-end + determinism checks as the gate. **FLUX.1
 (RTX 4090, bf16, 4-step, 1024², via `offload="stream"`): the strict no-missing-keys
 load passes, it produces a coherent prompt-faithful image, and same-seed renders
 are byte-identical. A bit-exact comparison against the reference is still
-outstanding, and **FLUX.2 has not yet been run on real weights**. FLUX.2 leads
+outstanding. **FLUX.2 Klein-4B now also runs on real weights** (official
+`black-forest-labs/FLUX.2-klein-4B` transformer + the ComfyUI-format Qwen3-4B
+encoder and VAE) and produces clean, prompt-faithful, deterministic images —
+this surfaced two FLUX.2 fixes now in place: the 32-ch-VAE ↔ 128-ch-DiT latent
+bridge (latent batch-norm denormalisation + 2×2 pixel-shuffle) and lifting the
+VAE's nested `encoder.quant_conv` / `decoder.post_quant_conv` into the decoder.
+The Dev (Mistral-3) path is still unverified. FLUX.2 leads
 with the **Klein** (Qwen3-4B/8B) path; the Dev
 (Mistral-3 24B) path is wired but secondary (its Tekken tokenizer isn't vendored
 — pass `mistral_tokenizer_path`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for

@@ -75,6 +75,17 @@ def _unpatchify(x: torch.Tensor, h: int, w: int, patch: int) -> torch.Tensor:
     return rearrange(x, "b (h w) (c ph pw) -> b c (h ph) (w pw)", h=h // patch, w=w // patch, ph=patch, pw=patch)
 
 
+def _flux2_unpatchify_latents(x: torch.Tensor) -> torch.Tensor:
+    """Invert FLUX.2's 2×2 latent pixel-shuffle: [B, 4C, H, W] -> [B, C, 2H, 2W].
+
+    FLUX.2 runs the DiT in a 128-ch latent space that is the VAE's 32-ch latent
+    pixel-shuffled by 2 (config ``patch_size=[2,2]``). Matches the reference BFL
+    ``Flux2`` pipeline ``_unpatchify_latents`` exactly (reshape→permute→reshape)."""
+    b, c, h, w = x.shape
+    x = x.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3)
+    return x.reshape(b, c // 4, h * 2, w * 2)
+
+
 def _img_ids(h: int, w: int, patch: int, n_axes: int, device) -> torch.Tensor:
     """Axial position ids for the image tokens over the (h/p × w/p) patch grid:
     axis 1 = patch row, axis 2 = patch col, the rest 0."""
@@ -222,9 +233,16 @@ def flux_text_to_image(
 
         x = _unpatchify(x.to(dtype), h_lat, w_lat, patch)
 
-        # ---- 5. decode (AutoencoderKL.decode folds in the FLUX.1 unscale+shift;
-        # FLUX.2's scale/shift are identity, so it decodes the latent directly).
+        # ---- 5. decode (AutoencoderKL.decode folds in the FLUX.1 unscale+shift).
+        # FLUX.2 first bridges the 128-ch DiT latent back to the VAE's 32-ch latent:
+        # denormalise the latent batch-norm, then invert the 2×2 pixel-shuffle.
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
+            if arch == "flux2":
+                if getattr(model.vae, "flux2_latent_mean", None) is not None:
+                    mean = model.vae.flux2_latent_mean.to(x.device, x.dtype)
+                    std = model.vae.flux2_latent_std.to(x.device, x.dtype)
+                    x = x * std + mean
+                x = _flux2_unpatchify_latents(x)
             latent = x.to(policy.vae_dtype)
             tile = policy.vae_tile or not can_decode_untiled(model.vae, latent.shape, device)
             image = tiled_vae_decode(model.vae, latent) if tile else model.vae.decode(latent)
