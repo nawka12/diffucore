@@ -50,6 +50,7 @@ class Inpaint(_Pipeline):
         scheduler: str = "karras",
         seed: int | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
     ) -> Image.Image:
         """Repaint the white region of ``mask_image`` in ``init_image`` to match
@@ -68,7 +69,8 @@ class Inpaint(_Pipeline):
                 width=width or self.model.spec.image_size,
                 height=height or self.model.spec.image_size,
                 sampler=sampler, scheduler=scheduler, seed=seed,
-                progress_callback=progress_callback, return_info=return_info,
+                progress_callback=progress_callback, preview_callback=preview_callback,
+                return_info=return_info,
             )
         model = self.model
         policy = self._policy()
@@ -95,7 +97,7 @@ class Inpaint(_Pipeline):
             mask = preprocess_mask(mask_image, width, height).to(device, compute_dtype)
             masked = MaskedDenoiser(cfg, z0, mask)
 
-            x0 = self._sample(sampler, masked, x, sigmas, policy, progress_callback)
+            x0 = self._sample(sampler, masked, x, sigmas, policy, progress_callback, preview_callback)
             image, vae_decode_mode = self._decode(x0, policy, width, height)
             image = self._composite(image, init_image, mask_image, width, height)
             info = PipelineInfo(vae_decode_mode=vae_decode_mode)

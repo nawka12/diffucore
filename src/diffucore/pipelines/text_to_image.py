@@ -43,6 +43,7 @@ class TextToImage(_Pipeline):
         shift: float = 3.0,
         oss_sigmas: "torch.Tensor | list[float] | None" = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
     ) -> Image.Image:
         if self.model.spec.architecture == "anima":
@@ -57,6 +58,7 @@ class TextToImage(_Pipeline):
                 seed=seed, sampler=sampler, scheduler=anima_scheduler,
                 oss_sigmas=oss_sigmas,
                 progress_callback=progress_callback,
+                preview_callback=preview_callback,
                 return_info=return_info,
             )
         if self.model.spec.architecture in ("flux1", "flux2"):
@@ -70,6 +72,7 @@ class TextToImage(_Pipeline):
                 height=height if height is not None else self.model.spec.image_size,
                 seed=seed, sampler=sampler, scheduler=flux_scheduler,
                 progress_callback=progress_callback,
+                preview_callback=preview_callback,
                 return_info=return_info,
             )
         """Return a ``PIL.Image`` for ``prompt``. ``width``/``height`` default to
@@ -96,7 +99,7 @@ class TextToImage(_Pipeline):
                 generator=generator, device=device, dtype=compute_dtype,
             ) * sigmas[0]
 
-            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback, preview_callback)
             image, vae_decode_mode = self._decode(x0, policy, width, height)
             info = PipelineInfo(vae_decode_mode=vae_decode_mode)
             return (image, info) if return_info else image

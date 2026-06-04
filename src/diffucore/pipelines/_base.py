@@ -76,15 +76,22 @@ def preprocess_image(image: Image.Image, width: int, height: int) -> torch.Tenso
 
 
 @contextmanager
-def _step_progress(total: int, progress_callback: Callable[[int, int], None] | None = None):
+def _step_progress(total: int, progress_callback: Callable[[int, int], None] | None = None,
+                   preview_callback: Callable[[object], None] | None = None):
     """A tqdm bar over the ``total`` sampling steps, advanced through the
-    sampler's ``callback`` hook. Yields the callback; closes the bar on exit."""
+    sampler's ``callback`` hook. Yields the callback; closes the bar on exit.
+
+    The sampler calls ``on_step(i, sigma, x, denoised)``; when ``preview_callback``
+    is set the ``denoised`` x0 estimate (4th arg) is forwarded to it for live
+    latent previews."""
     bar = tqdm(total=total, desc="sampling", leave=False)
     try:
-        def on_step(*_):
+        def on_step(*args):
             bar.update(1)
             if progress_callback is not None:
                 progress_callback(bar.n, total)
+            if preview_callback is not None and len(args) >= 4 and args[3] is not None:
+                preview_callback(args[3])
 
         yield on_step
     finally:
@@ -179,7 +186,7 @@ class _Pipeline:
             dtype=dtype,
         )
 
-    def _sample(self, sampler, cfg, x, sigmas, policy, progress_callback=None):
+    def _sample(self, sampler, cfg, x, sigmas, policy, progress_callback=None, preview_callback=None):
         # Match the input layout to the (NHWC) UNet weights when channels_last is
         # on, so cuDNN runs entirely in channels-last instead of transposing each
         # step. Cheap one-shot reorder; semantically a no-op.
@@ -187,7 +194,7 @@ class _Pipeline:
             x = x.contiguous(memory_format=torch.channels_last)
         with torch.no_grad():
             with staged([self.model.backbone], policy.device, policy.offload_unet):
-                with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
+                with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
 
     # --- decode --------------------------------------------------------------

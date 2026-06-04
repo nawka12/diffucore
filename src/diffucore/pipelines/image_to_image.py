@@ -38,6 +38,7 @@ class ImageToImage(_Pipeline):
         scheduler: str = "karras",
         seed: int | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
     ) -> Image.Image:
         """Return a ``PIL.Image`` derived from ``init_image``. ``width``/``height``
@@ -53,7 +54,8 @@ class ImageToImage(_Pipeline):
                 width=width or self.model.spec.image_size,
                 height=height or self.model.spec.image_size,
                 sampler=sampler, scheduler=scheduler, seed=seed,
-                progress_callback=progress_callback, return_info=return_info,
+                progress_callback=progress_callback, preview_callback=preview_callback,
+                return_info=return_info,
             )
         model = self.model
         policy = self._policy()
@@ -77,7 +79,7 @@ class ImageToImage(_Pipeline):
             noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
             x = z0 + noise * sigmas[0]
 
-            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback, preview_callback)
             image, vae_decode_mode = self._decode(x0, policy, width, height)
             info = PipelineInfo(vae_decode_mode=vae_decode_mode)
             return (image, info) if return_info else image

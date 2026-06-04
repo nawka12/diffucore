@@ -82,6 +82,7 @@ def anima_text_to_image(
     rho: float = 7.0,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
 ) -> Image.Image:
     """Drive Anima's text-to-image path end-to-end.
@@ -153,7 +154,7 @@ def anima_text_to_image(
         with torch.no_grad(), staged([backbone], device, policy.offload_unet):
             if sampler == "euler":
                 total = len(sigmas) - 1
-                with _step_progress(total, progress_callback) as on_step:
+                with _step_progress(total, progress_callback, preview_callback) as on_step:
                     for i in range(total):
                         sigma, sigma_next = sigmas[i], sigmas[i + 1]
                         x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
@@ -168,8 +169,9 @@ def anima_text_to_image(
 
                         # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
                         # (closed-form exact for any constant x0 estimate).
+                        denoised = x - sigma.to(dtype) * v
                         x = x + (sigma_next - sigma).to(dtype) * v
-                        on_step(i, sigma, x, None)
+                        on_step(i, sigma, x, denoised)
             else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
                 def denoise(x_in, sigma_b):
                     """``model(x, σ) -> x0``: predict velocity (with CFG), return the
@@ -191,7 +193,7 @@ def anima_text_to_image(
                 if sampler == "secant":
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
-                with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
+                with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         # ---- 5. process_out then decode (tiled when explicitly requested, or
@@ -227,6 +229,7 @@ def anima_img2img(
     rho: float = 7.0,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
 ) -> Image.Image:
     """Anima image-to-image, or inpaint when ``mask_image`` is given (white =
@@ -319,7 +322,7 @@ def anima_img2img(
             if sampler == "secant":
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
-            with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
+            with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         # ---- 5. decode

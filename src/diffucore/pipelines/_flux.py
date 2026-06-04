@@ -138,6 +138,7 @@ def flux_text_to_image(
     sampler: str = "euler",
     scheduler: str = "flux",
     progress_callback: Callable[[int, int], None] | None = None,
+    preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
 ) -> Image.Image:
     """Drive FLUX (FLUX.1 or FLUX.2) text-to-image end-to-end.
@@ -206,6 +207,9 @@ def flux_text_to_image(
             return model.backbone(x_tokens, img_ids, context, txt_ids, t, pooled, guidance_vec)
 
         # ---- 4. integrate the rectified-flow ODE/SDE (CONST: denoised = x − σ·v)
+        # ``preview_callback`` is accepted for a uniform pipeline API but not wired
+        # here: FLUX's latent is patchified token-space [B, L, C], so a live preview
+        # would need _unpatchify first (left out until FLUX gets GPU-verified).
         backbone = model.backbone
         with torch.no_grad(), staged([backbone], device, policy.offload_unet):
             if sampler == "euler":
