@@ -80,7 +80,8 @@ image = TextToImage(model)(
   `simple` (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`,
   `simple` (Anima); `flux` (default), `flow`, `sgm_uniform`, `simple` (FLUX).
   `flow_dyn` is `flow` with a Flux-style resolution-aware shift (auto-derived
-  from the image's token count, ignoring the manual `shift`). `oss` is a
+  from the image's token count; the `shift` value is ignored — and the UI has
+  no shift control, so plain `flow` always runs shift=3.0). `oss` is a
   pre-calibrated optimal-stepsize schedule — calibrate it from the UI's OSS
   panel (or headless via `calibrate_oss.py`), once per steps/resolution/shift.
 

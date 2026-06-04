@@ -95,7 +95,7 @@ def anima_text_to_image(
     registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
     ``"flow"`` (the rectified-flow t-uniform default), ``"flow_dyn"`` (``flow``
     with a Flux-style resolution-aware shift derived from the image's token
-    count, ignoring the manual ``shift``), ``"oss"`` (a pre-calibrated
+    count, ignoring the passed-in ``shift``), ``"oss"`` (a pre-calibrated
     optimal-stepsize schedule supplied via ``oss_sigmas``), ``"sgm_uniform"`` or
     ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
     """
