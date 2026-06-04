@@ -45,6 +45,16 @@ class ImageToImage(_Pipeline):
         ``strength`` in ``(0, 1]`` controls how much of the init image survives."""
         if not 0.0 < strength <= 1.0:
             raise ValueError(f"strength must be in (0, 1], got {strength}")
+        if self.model.spec.architecture == "anima":
+            from ._anima import anima_img2img
+            return anima_img2img(
+                self.model, prompt, init_image, negative_prompt,
+                strength=strength, steps=steps, cfg_scale=cfg_scale,
+                width=width or self.model.spec.image_size,
+                height=height or self.model.spec.image_size,
+                sampler=sampler, scheduler=scheduler, seed=seed,
+                progress_callback=progress_callback, return_info=return_info,
+            )
         model = self.model
         policy = self._policy()
         device, compute_dtype = policy.device, policy.compute_dtype

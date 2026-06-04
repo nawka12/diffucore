@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 
 from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
-from ._base import PipelineInfo, _step_progress
+from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
     FlowSamplingView,
     append_zero,
@@ -203,6 +203,139 @@ def anima_text_to_image(
             tile = policy.vae_tile or not can_decode_untiled(model.vae, z.shape, device)
             image = tiled_vae_decode(model.vae, z) if tile else model.vae.decode(z)
         image = _to_pil(image)
+        info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
+        return (image, info) if return_info else image
+
+
+def anima_img2img(
+    model: "ModelBundle",
+    prompt: str,
+    init_image: Image.Image,
+    negative_prompt: str = "",
+    *,
+    mask_image: "Image.Image | None" = None,
+    strength: float = 0.75,
+    steps: int = 20,
+    cfg_scale: float = 4.0,
+    shift: float = 3.0,
+    width: int = 1024,
+    height: int = 1024,
+    sampler: str = "euler",
+    scheduler: str = "flow",
+    seed: int | None = None,
+    curvature: float = 0.25,
+    rho: float = 7.0,
+    oss_sigmas: "torch.Tensor | list[float] | None" = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    return_info: bool = False,
+) -> Image.Image:
+    """Anima image-to-image, or inpaint when ``mask_image`` is given (white =
+    repaint, black = keep).
+
+    Mirrors :func:`anima_text_to_image` but starts the rectified-flow ODE from the
+    strength-noised init latent ``x_σ = (1-σ)·z0 + σ·ε`` instead of pure noise.
+    For inpaint the keep region (mask 0) is pinned to the init latent ``z0`` at the
+    x0-estimate each step — the same masking the SD ``MaskedDenoiser`` does, which
+    is scaling-agnostic, so it holds for the flow ``x0 = x − σ·v`` too — and the
+    original pixels are composited back after decode so untouched areas stay exact.
+
+    Sampler/scheduler are coerced to Anima-valid defaults (``euler`` / ``flow``)
+    when an SD-style value comes through, so the shared img2img/inpaint pipelines
+    and the detailer "just work" on Anima.
+    """
+    if sampler not in _ANIMA_SAMPLERS:
+        sampler = "euler"
+    if scheduler not in ("flow", "flow_karras", "oss", "sgm_uniform", "simple"):
+        scheduler = "flow"
+    if not 0.0 < strength <= 1.0:
+        raise ValueError(f"strength must be in (0, 1], got {strength}")
+    if width % 16 or height % 16:
+        raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
+    policy = model.policy
+    device, dtype = policy.device, policy.compute_dtype
+
+    with perf_context(policy):
+        # ---- 1. tokenize + encode cond/uncond (same as t2i)
+        cond_tok = model.tokenizer(prompt)
+        uncond_tok = model.tokenizer(negative_prompt)
+        with staged([model.text_encoder], device, policy.offload_idle):
+            cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
+            uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
+        cond_t5 = cond_tok.t5_ids.to(device)
+        uncond_t5 = uncond_tok.t5_ids.to(device)
+
+        # ---- 2. σ schedule (same builder as t2i)
+        if scheduler == "flow":
+            sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_karras":
+            sigmas = flow_karras_schedule(steps, shift=shift, rho=rho, device=device, dtype=torch.float32)
+        elif scheduler == "oss":
+            if oss_sigmas is None:
+                raise ValueError("scheduler='oss' needs a pre-calibrated schedule (oss_sigmas).")
+            s = torch.as_tensor(oss_sigmas, device=device, dtype=torch.float32)
+            sigmas = s if float(s[-1]) == 0.0 else append_zero(s)
+        else:
+            view = FlowSamplingView(shift, device=device, dtype=torch.float32)
+            schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
+            sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
+
+        # ---- 3. encode init → DiT-space latent z0; build strength-noised start
+        gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+        pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
+        with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
+            z0 = model.vae.process_in(model.vae.encode(pixels)).to(dtype)
+        sigmas = sigmas[img2img_start(steps, strength):]
+        sigma0 = sigmas[0].to(dtype)
+        noise = torch.randn(z0.shape, generator=gen, device=device, dtype=dtype)
+        x = (1.0 - sigma0) * z0 + sigma0 * noise            # flow forward: x_σ=(1-σ)z0+σε
+
+        mask_lat = None
+        if mask_image is not None:
+            m = mask_image.convert("L").resize((width // 8, height // 8), Image.BILINEAR)
+            mask_lat = torch.from_numpy(np.asarray(m, dtype=np.float32) / 255.0)[None, None].to(device)
+        z0_f = z0.float()
+
+        # ---- 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
+        backbone = model.backbone
+        with torch.no_grad(), staged([backbone], device, policy.offload_unet):
+            def denoise(x_in, sigma_b):
+                x_5d = x_in.to(dtype).unsqueeze(2)
+                t = sigma_b.to(dtype)
+                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                if cfg_scale == 1.0:
+                    v = v_cond
+                else:
+                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                sig = sigma_b.float().view(-1, 1, 1, 1)
+                x0 = x_in.float() - sig * v.float()
+                if mask_lat is not None:
+                    x0 = x0 * mask_lat + z0_f * (1.0 - mask_lat)
+                return x0
+
+            kwargs = {}
+            if sampler in _FLOW_AWARE_SAMPLERS:
+                kwargs = dict(generator=gen, model_type="flow", shift=shift)
+            if sampler == "secant":
+                kwargs.setdefault("generator", gen)
+                kwargs["curvature"] = curvature
+            with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
+                x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
+
+        # ---- 5. decode
+        with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
+            z = model.vae.process_out(x.to(policy.vae_dtype))
+            tile = policy.vae_tile or not can_decode_untiled(model.vae, z.shape, device)
+            image = tiled_vae_decode(model.vae, z) if tile else model.vae.decode(z)
+        image = _to_pil(image)
+
+        # inpaint: paste the original pixels back into the keep region (byte-exact)
+        if mask_image is not None:
+            keep = np.asarray(mask_image.convert("L").resize((width, height), Image.NEAREST)) < 128
+            original = np.asarray(init_image.convert("RGB").resize((width, height), Image.LANCZOS))
+            out = np.where(keep[..., None], original, np.asarray(image))
+            image = Image.fromarray(out.astype(np.uint8))
+
         info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
         return (image, info) if return_info else image
 
