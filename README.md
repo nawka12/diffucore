@@ -77,10 +77,9 @@ image = TextToImage(model)(
   `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`, `secant`
   (the last is Anima-only; works with any descending flow schedule).
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `sgm_uniform`,
-  `simple` (SD/SDXL); `flow` (default), `flow_karras`, `oss`, `sgm_uniform`,
+  `simple` (SD/SDXL); `flow` (default), `oss`, `sgm_uniform`,
   `simple` (Anima); `flux` (default), `flow`, `sgm_uniform`, `simple` (FLUX).
-  `flow_karras` is a Karras-ρ-warped flow schedule (one `rho` knob, ρ=1 ≡
-  `flow`); `oss` is a pre-calibrated optimal-stepsize schedule — calibrate it
+  `oss` is a pre-calibrated optimal-stepsize schedule — calibrate it
   from the UI's OSS panel (or headless via `calibrate_oss.py`), once per
   steps/resolution/shift.
 

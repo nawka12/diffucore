@@ -49,7 +49,7 @@ class TextToImage(_Pipeline):
         if self.model.spec.architecture == "anima":
             # The default scheduler ("karras") and other SD-only schedules don't
             # apply to a flow model; fall back to the rectified-flow schedule.
-            anima_scheduler = scheduler if scheduler in ("flow", "flow_karras", "oss", "sgm_uniform", "simple") else "flow"
+            anima_scheduler = scheduler if scheduler in ("flow", "oss", "sgm_uniform", "simple") else "flow"
             return anima_text_to_image(
                 self.model, prompt, negative_prompt,
                 steps=steps, cfg_scale=cfg_scale, shift=shift,

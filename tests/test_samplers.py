@@ -144,18 +144,18 @@ def test_secant_constant_x0_ends_clean():
 def test_secant_curvature_zero_equals_euler():
     # curvature=0 ⇒ beta=0 everywhere ⇒ output must equal sample_euler.
     target = torch.full((1, 8, 4, 4), -0.05)
-    sigmas = S.flow_karras_schedule(12, shift=3.0)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
     x_init = torch.randn(1, 8, 4, 4)
     euler_out = K.sample_euler(const_denoiser(target), x_init.clone(), sigmas)
     secant_out = K.sample_secant(const_denoiser(target), x_init.clone(), sigmas, curvature=0.0)
     assert torch.allclose(secant_out, euler_out, atol=1e-6)
 
 
-def test_secant_high_curvature_stays_finite_on_flow_karras_schedule():
-    # Full correction (curvature=1) on the flow_karras schedule must not NaN/Inf
+def test_secant_high_curvature_stays_finite_on_flow_schedule():
+    # Full correction (curvature=1) on the flow schedule must not NaN/Inf
     # and must still converge to the constant prediction.
     target = torch.full((1, 16, 8, 8), 0.0)
-    sigmas = S.flow_karras_schedule(20, shift=3.0)
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
     x_init = torch.randn(1, 16, 8, 8)
     out = K.sample_secant(const_denoiser(target), x_init, sigmas, curvature=1.0)
     assert torch.isfinite(out).all()
@@ -176,7 +176,7 @@ def test_secant_correction_gated_off_at_high_noise():
         g = 1.0 / (1.0 + (4.0 * s) ** 2)          # x0 settles toward target as σ→0
         return g * target + (1.0 - g) * 3.0 * torch.sin(3.0 * x)
 
-    sigmas = S.flow_karras_schedule(20, shift=3.0)
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
     x_init = torch.randn(1, 4, 8, 8)
 
     secant_states, euler_states = {}, {}
@@ -217,7 +217,7 @@ def test_secant_s_noise_changes_output_and_is_seed_reproducible():
     # last non-zero sigma via the callback, since σ_next == 0 forces both runs
     # onto the constant prediction at the very end.
     target = torch.zeros(1, 8, 4, 4)
-    sigmas = S.flow_karras_schedule(12, shift=3.0)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
     x_init = torch.randn(1, 8, 4, 4)
 
     def run(seed):

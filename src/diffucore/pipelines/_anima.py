@@ -31,7 +31,6 @@ from ..sampling import (
     FlowSamplingView,
     append_zero,
     calibrate_oss_schedule,
-    flow_karras_schedule,
     flow_matching_schedule,
     get_sampler,
     sgm_uniform_schedule,
@@ -79,7 +78,6 @@ def anima_text_to_image(
     sampler: str = "euler",
     scheduler: str = "flow",
     curvature: float = 0.25,
-    rho: float = 7.0,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
@@ -94,16 +92,14 @@ def anima_text_to_image(
     ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
     closed-form rectified-flow step; the rest run through the shared sampler
     registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
-    ``"flow"`` (the rectified-flow t-uniform default), ``"flow_karras"`` (the
-    Karras-ρ-warped flow schedule that concentrates steps toward low noise;
-    ``rho`` controls the concentration), ``"oss"`` (a pre-calibrated
+    ``"flow"`` (the rectified-flow t-uniform default), ``"oss"`` (a pre-calibrated
     optimal-stepsize schedule supplied via ``oss_sigmas``), ``"sgm_uniform"`` or
     ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
-    if scheduler not in ("flow", "flow_karras", "oss", "sgm_uniform", "simple"):
-        raise ValueError(f"Anima scheduler must be 'flow', 'flow_karras', 'oss', 'sgm_uniform' or 'simple'; got {scheduler!r}")
+    if scheduler not in ("flow", "oss", "sgm_uniform", "simple"):
+        raise ValueError(f"Anima scheduler must be 'flow', 'oss', 'sgm_uniform' or 'simple'; got {scheduler!r}")
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -129,8 +125,6 @@ def anima_text_to_image(
         # ---- 3. σ schedule, init noise
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
-        elif scheduler == "flow_karras":
-            sigmas = flow_karras_schedule(steps, shift=shift, rho=rho, device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError(
@@ -226,7 +220,6 @@ def anima_img2img(
     scheduler: str = "flow",
     seed: int | None = None,
     curvature: float = 0.25,
-    rho: float = 7.0,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
@@ -248,7 +241,7 @@ def anima_img2img(
     """
     if sampler not in _ANIMA_SAMPLERS:
         sampler = "euler"
-    if scheduler not in ("flow", "flow_karras", "oss", "sgm_uniform", "simple"):
+    if scheduler not in ("flow", "oss", "sgm_uniform", "simple"):
         scheduler = "flow"
     if not 0.0 < strength <= 1.0:
         raise ValueError(f"strength must be in (0, 1], got {strength}")
@@ -270,8 +263,6 @@ def anima_img2img(
         # ---- 2. σ schedule (same builder as t2i)
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
-        elif scheduler == "flow_karras":
-            sigmas = flow_karras_schedule(steps, shift=shift, rho=rho, device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError("scheduler='oss' needs a pre-calibrated schedule (oss_sigmas).")
