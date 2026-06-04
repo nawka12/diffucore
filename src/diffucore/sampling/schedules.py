@@ -126,29 +126,37 @@ def flow_karras_schedule(
     steps: int,
     shift: float = 3.0,
     rho: float = 7.0,
+    sigma_min: float = 0.0292,
     *,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Karras-ρ-warped shifted rectified-flow schedule.
 
-    Generalizes :func:`flow_matching_schedule`: instead of spacing the flow
-    time ``t`` uniformly, it spaces ``t`` with the Karras et al. (2022) ρ-warp
-    (uniform in ``t ** (1/rho)``) and then applies Anima's SD3 shift map
-    ``σ(t) = shift·t / (1 + (shift − 1)·t)``.
+    Walks σ from σ_max = 1 (pure noise) down to an explicit ``sigma_min`` along
+    Anima's SD3 shift map ``σ(t) = shift·t / (1 + (shift − 1)·t)``, but spaces
+    the flow time ``t`` with the Karras et al. (2022) ρ-warp (uniform in
+    ``t ** (1/rho)``) instead of uniformly. Keeping the shift map is what gives
+    a healthy high-noise step distribution; the ρ-warp then concentrates the
+    remaining budget toward ``sigma_min`` — the final approach to the data
+    manifold. A trailing ``0`` is appended for the clean endpoint.
 
-    The ρ-warp concentrates steps toward low ``t`` — i.e. low σ, near the data
-    manifold, where the rectified-flow trajectory bends most and single-step
-    (Euler) truncation error is largest. ``shift`` still biases toward σ = 1
-    (matching where training compute went); ``rho`` is an orthogonal knob for
-    sampling-error concentration. ``rho == 1`` recovers
-    :func:`flow_matching_schedule` exactly; ``rho > 1`` front-loads detail.
+    Unlike :func:`flow_matching_schedule`, the low-σ endpoint is an explicit
+    ``sigma_min`` (default 0.0292, the canonical Karras value) rather than the
+    step-count-dependent ``σ(1/steps)``. This shrinks the final Euler step to 0
+    (~0.03 vs ~0.14 for ``flow`` at 20 steps) and lets ``rho`` actually densify
+    that final stretch — both impossible when the endpoint is pinned at
+    ``σ(1/steps)``. ``rho == 1`` with ``sigma_min`` set to ``σ(1/steps)``
+    recovers :func:`flow_matching_schedule` exactly.
 
-    A strict log-SNR ρ-warp is deliberately *not* used: the pure-noise start
-    (σ = 1) is log-SNR −∞, and capping σ_max < 1 to make it finite would break
-    the "init is exactly pure noise, no rescale" assumption of the Anima
-    sampler. Warping in ``t`` is the bounded equivalent that keeps σ_max == 1.
-    A trailing ``0`` is appended for the clean endpoint.
+    ``shift`` and ``rho`` are *not* independent: ``shift`` pushes the budget
+    toward σ = 1 (where training compute went) while ``rho`` pulls it toward
+    ``sigma_min``, so raising ``rho`` trades high-noise coverage for
+    data-manifold resolution.
+
+    σ is warped through ``t`` rather than directly: a Karras ρ-warp applied
+    straight to σ on ``[sigma_min, 1]`` gives σ_max = 1 a large first step off
+    pure noise and starves the high-σ region; the shift map keeps it resolved.
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -156,12 +164,13 @@ def flow_karras_schedule(
         raise ValueError("shift must be >= 1")
     if rho <= 0.0:
         raise ValueError("rho must be > 0")
-    t_min = 1.0 / steps
-    # Karras ρ-warp of t over [t_min, 1]: ramp 0→1 maps t from 1 down to t_min.
+    if not 0.0 < sigma_min < 1.0:
+        raise ValueError("sigma_min must be in (0, 1)")
+    # sigma_min → flow time via the inverse shift map, then ρ-warp t over
+    # [t_min, 1]: ramp 0→1 maps t from 1 (σ=1) down to t_min (σ=sigma_min).
+    t_min = sigma_min / (shift - (shift - 1.0) * sigma_min)
     ramp = torch.linspace(0.0, 1.0, steps, device=device, dtype=dtype)
-    min_inv_rho = t_min ** (1.0 / rho)
-    max_inv_rho = 1.0 ** (1.0 / rho)
-    t = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+    t = (1.0 + ramp * (t_min ** (1.0 / rho) - 1.0)) ** rho
     sigmas = shift * t / (1.0 + (shift - 1.0) * t)
     return append_zero(sigmas)
 
