@@ -32,6 +32,7 @@ from ..sampling import (
     append_zero,
     calibrate_oss_schedule,
     flow_matching_schedule,
+    flow_matching_dynamic_shift,
     get_sampler,
     sgm_uniform_schedule,
     simple_schedule,
@@ -92,14 +93,16 @@ def anima_text_to_image(
     ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
     closed-form rectified-flow step; the rest run through the shared sampler
     registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
-    ``"flow"`` (the rectified-flow t-uniform default), ``"oss"`` (a pre-calibrated
+    ``"flow"`` (the rectified-flow t-uniform default), ``"flow_dyn"`` (``flow``
+    with a Flux-style resolution-aware shift derived from the image's token
+    count, ignoring the manual ``shift``), ``"oss"`` (a pre-calibrated
     optimal-stepsize schedule supplied via ``oss_sigmas``), ``"sgm_uniform"`` or
     ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
-    if scheduler not in ("flow", "oss", "sgm_uniform", "simple"):
-        raise ValueError(f"Anima scheduler must be 'flow', 'oss', 'sgm_uniform' or 'simple'; got {scheduler!r}")
+    if scheduler not in ("flow", "flow_dyn", "oss", "sgm_uniform", "simple"):
+        raise ValueError(f"Anima scheduler must be 'flow', 'flow_dyn', 'oss', 'sgm_uniform' or 'simple'; got {scheduler!r}")
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -123,8 +126,12 @@ def anima_text_to_image(
         uncond_t5 = uncond_tok.t5_ids.to(device)
 
         # ---- 3. σ schedule, init noise
+        sched_shift = shift
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_dyn":
+            sched_shift = flow_matching_dynamic_shift((height // 16) * (width // 16))
+            sigmas = flow_matching_schedule(steps, shift=sched_shift, device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError(
@@ -183,7 +190,7 @@ def anima_text_to_image(
 
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
-                    kwargs = dict(generator=gen, model_type="flow", shift=shift)
+                    kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
                 if sampler == "secant":
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
@@ -241,7 +248,7 @@ def anima_img2img(
     """
     if sampler not in _ANIMA_SAMPLERS:
         sampler = "euler"
-    if scheduler not in ("flow", "oss", "sgm_uniform", "simple"):
+    if scheduler not in ("flow", "flow_dyn", "oss", "sgm_uniform", "simple"):
         scheduler = "flow"
     if not 0.0 < strength <= 1.0:
         raise ValueError(f"strength must be in (0, 1], got {strength}")
@@ -261,8 +268,12 @@ def anima_img2img(
         uncond_t5 = uncond_tok.t5_ids.to(device)
 
         # ---- 2. σ schedule (same builder as t2i)
+        sched_shift = shift
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_dyn":
+            sched_shift = flow_matching_dynamic_shift((height // 16) * (width // 16))
+            sigmas = flow_matching_schedule(steps, shift=sched_shift, device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError("scheduler='oss' needs a pre-calibrated schedule (oss_sigmas).")
@@ -309,7 +320,7 @@ def anima_img2img(
 
             kwargs = {}
             if sampler in _FLOW_AWARE_SAMPLERS:
-                kwargs = dict(generator=gen, model_type="flow", shift=shift)
+                kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
             if sampler == "secant":
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature

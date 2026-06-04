@@ -77,11 +77,12 @@ image = TextToImage(model)(
   `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`, `secant`
   (the last is Anima-only; works with any descending flow schedule).
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `sgm_uniform`,
-  `simple` (SD/SDXL); `flow` (default), `oss`, `sgm_uniform`,
+  `simple` (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`,
   `simple` (Anima); `flux` (default), `flow`, `sgm_uniform`, `simple` (FLUX).
-  `oss` is a pre-calibrated optimal-stepsize schedule — calibrate it
-  from the UI's OSS panel (or headless via `calibrate_oss.py`), once per
-  steps/resolution/shift.
+  `flow_dyn` is `flow` with a Flux-style resolution-aware shift (auto-derived
+  from the image's token count, ignoring the manual `shift`). `oss` is a
+  pre-calibrated optimal-stepsize schedule — calibrate it from the UI's OSS
+  panel (or headless via `calibrate_oss.py`), once per steps/resolution/shift.
 
 ### Anima (DiT)
 

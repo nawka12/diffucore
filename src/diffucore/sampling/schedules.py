@@ -22,6 +22,7 @@ __all__ = [
     "exponential_schedule",
     "polyexponential_schedule",
     "flow_matching_schedule",
+    "flow_matching_dynamic_shift",
     "simple_schedule",
     "sgm_uniform_schedule",
     "FlowSamplingView",
@@ -119,6 +120,34 @@ def flow_matching_schedule(
     t = torch.arange(steps, 0, -1, device=device, dtype=dtype) / steps
     sigmas = shift * t / (1.0 + (shift - 1.0) * t)
     return append_zero(sigmas)
+
+
+def flow_matching_dynamic_shift(
+    seq_len: int,
+    *,
+    base_seq_len: int = 256,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.5,
+    max_shift: float = 1.15,
+) -> float:
+    """Flux-style resolution-aware shift for :func:`flow_matching_schedule`.
+
+    Linearly interpolates the log-shift ``mu`` in the DiT token count
+    ``seq_len = (H // 16) * (W // 16)`` between ``base_shift`` (the ``mu`` at
+    ``base_seq_len``) and ``max_shift`` (the ``mu`` at ``max_seq_len``) — Flux's
+    ``calculate_shift`` — then returns the multiplicative shift ``exp(mu)`` that
+    :func:`flow_matching_schedule` consumes (its σ(t) map equals Flux's
+    ``time_shift`` exactly when ``shift == exp(mu)``).
+
+    Larger images get a larger shift, i.e. more steps near σ = 1 where the model
+    resolves global composition; smaller images get less. At 1024² (4096 tokens)
+    this returns ≈ 3.16, close to Anima's training shift of 3.0. ``base_shift``
+    and ``max_shift`` are ``mu`` (log-shift) endpoints, matching Flux's
+    (confusingly named) defaults.
+    """
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    mu = base_shift + m * (seq_len - base_seq_len)
+    return math.exp(mu)
 
 
 class FlowSamplingView:

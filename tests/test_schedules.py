@@ -81,3 +81,17 @@ def test_flow_matching_invalid_args_raise():
         S.flow_matching_schedule(0, shift=3.0)
     with pytest.raises(ValueError):
         S.flow_matching_schedule(5, shift=0.5)
+
+
+def test_flow_matching_dynamic_shift_monotonic_and_anchor():
+    """Flux-style mu interpolation: shift grows with the token count and lands
+    near Anima's training shift (~3.16) at 1024² (4096 tokens)."""
+    s_lo = S.flow_matching_dynamic_shift(1024)     # 512²
+    s_mid = S.flow_matching_dynamic_shift(4096)    # 1024²
+    s_hi = S.flow_matching_dynamic_shift(16384)    # 2048²
+    assert s_lo < s_mid < s_hi
+    assert abs(s_mid - 3.16) < 0.05
+    # feeds flow_matching_schedule as a plain shift -> valid descending run
+    sig = S.flow_matching_schedule(20, shift=s_mid)
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] >= sig[1:])
