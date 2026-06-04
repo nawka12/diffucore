@@ -84,22 +84,20 @@ def test_flow_matching_invalid_args_raise():
 
 
 def test_flow_karras_schedule_endpoints_and_descent():
-    sig = S.flow_karras_schedule(24, shift=3.0, sigma_min=0.0292)
+    sig = S.flow_karras_schedule(24, shift=3.0)
     assert sig.shape[0] == 25
     assert sig[-1].item() == 0.0
     assert torch.all(sig[:-1] >= sig[1:])
     assert abs(sig[0].item() - 1.0) < 1e-6           # σ_max == 1 for any shift/rho
-    assert abs(sig[-2].item() - 0.0292) < 1e-6       # last nonzero == explicit σ_min
+    expected_min = 3.0 * (1.0 / 24.0) / (1.0 + 2.0 * (1.0 / 24.0))
+    assert abs(sig[-2].item() - expected_min) < 1e-6
 
 
 def test_flow_karras_rho1_matches_uniform_flow():
-    """rho == 1 is the uniform-t Karras warp, so with sigma_min pinned to the
-    flow endpoint σ(1/steps) it must reduce exactly to the rectified-flow
-    schedule (the analog of polyexp rho=1 == exponential)."""
-    shift, steps = 3.0, 20
-    sigma_min = shift * (1.0 / steps) / (1.0 + (shift - 1.0) * (1.0 / steps))
-    karras = S.flow_karras_schedule(steps, shift=shift, rho=1.0, sigma_min=sigma_min)
-    flow = S.flow_matching_schedule(steps, shift=shift)
+    """rho == 1 is the uniform-t Karras warp, so it must reduce exactly to the
+    rectified-flow schedule (the analog of polyexp rho=1 == exponential)."""
+    karras = S.flow_karras_schedule(20, shift=3.0, rho=1.0)
+    flow = S.flow_matching_schedule(20, shift=3.0)
     assert torch.allclose(karras, flow, atol=1e-6)
 
 
@@ -125,5 +123,3 @@ def test_flow_karras_invalid_args_raise():
         S.flow_karras_schedule(5, shift=0.5)
     with pytest.raises(ValueError):
         S.flow_karras_schedule(5, shift=3.0, rho=0.0)
-    with pytest.raises(ValueError):
-        S.flow_karras_schedule(5, shift=3.0, sigma_min=1.0)
