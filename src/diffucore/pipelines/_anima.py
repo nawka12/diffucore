@@ -267,13 +267,18 @@ def anima_img2img(
         cond_t5 = cond_tok.t5_ids.to(device)
         uncond_t5 = uncond_tok.t5_ids.to(device)
 
-        # ---- 2. σ schedule (same builder as t2i)
+        # ---- 2. σ schedule. img2img/inpaint follow ComfyUI's KSampler denoise
+        # convention (Anima's reference): build the schedule at int(steps/strength)
+        # resolution and keep the last `steps + 1` σ (sliced in step 3), so a
+        # strength<1 run still takes the full `steps` from the strength-appropriate
+        # σ — unlike SD/SDXL's A1111 default (see _base.img2img_start).
         sched_shift = shift
+        sched_steps = int(steps / strength)
         if scheduler == "flow":
-            sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+            sigmas = flow_matching_schedule(sched_steps, shift=shift, device=device, dtype=torch.float32)
         elif scheduler == "flow_dyn":
             sched_shift = flow_matching_dynamic_shift((height // 16) * (width // 16))
-            sigmas = flow_matching_schedule(steps, shift=sched_shift, device=device, dtype=torch.float32)
+            sigmas = flow_matching_schedule(sched_steps, shift=sched_shift, device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError("scheduler='oss' needs a pre-calibrated schedule (oss_sigmas).")
@@ -282,14 +287,18 @@ def anima_img2img(
         else:
             view = FlowSamplingView(shift, device=device, dtype=torch.float32)
             schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
-            sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
+            sigmas = schedule_fn(view, sched_steps, device=device, dtype=torch.float32)
 
         # ---- 3. encode init → DiT-space latent z0; build strength-noised start
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z0 = model.vae.process_in(model.vae.encode(pixels)).to(dtype)
-        sigmas = sigmas[img2img_start(steps, strength):]
+        # Keep the tail: last `steps + 1` σ → run `steps` from σ(t≈strength), the
+        # ComfyUI denoise slice. OSS is a fixed calibrated trajectory, so it falls
+        # back to the A1111 start index instead.
+        sigmas = sigmas[img2img_start(steps, strength):] if scheduler == "oss" \
+            else sigmas[-(steps + 1):]
         sigma0 = sigmas[0].to(dtype)
         noise = torch.randn(z0.shape, generator=gen, device=device, dtype=dtype)
         x = (1.0 - sigma0) * z0 + sigma0 * noise            # flow forward: x_σ=(1-σ)z0+σε
