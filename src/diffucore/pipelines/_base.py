@@ -75,6 +75,26 @@ def preprocess_image(image: Image.Image, width: int, height: int) -> torch.Tenso
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
 
 
+def _match_context_chunks(ctx_c, ctx_u, conditioner):
+    """Pad the shorter of the SDXL cond/uncond contexts so both span the same
+    number of 77-token chunks. With long-prompt weighting the positive and
+    negative prompts can split into different chunk counts (e.g. a long positive
+    prompt -> 154, a short negative -> 77), leaving their contexts unequal along
+    the sequence axis. CFG batches them along the batch axis (see ``CFGDenoiser``),
+    which needs equal sequence lengths; pad the shorter with the empty-prompt
+    chunk embedding (A1111 LPW)."""
+    if ctx_c.shape[1] == ctx_u.shape[1]:
+        return ctx_c, ctx_u
+    empty = conditioner("", batch=1)[0]  # [1, 77, dim] empty-prompt window
+    target = max(ctx_c.shape[1], ctx_u.shape[1])
+
+    def pad(ctx):
+        reps = (target - ctx.shape[1]) // empty.shape[1]
+        return ctx if reps == 0 else torch.cat([ctx, empty.repeat(1, reps, 1)], dim=1)
+
+    return pad(ctx_c), pad(ctx_u)
+
+
 @contextmanager
 def _step_progress(total: int, progress_callback: Callable[[int, int], None] | None = None,
                    preview_callback: Callable[[object], None] | None = None):
@@ -142,6 +162,7 @@ class _Pipeline:
             conditioner = SDXLConditioner(model.tokenizer, model.text_encoder, model.text_encoder_2)
             ctx_c, pooled_c = conditioner(prompt, batch=1)
             ctx_u, pooled_u = conditioner(negative_prompt, batch=1)
+            ctx_c, ctx_u = _match_context_chunks(ctx_c, ctx_u, conditioner)
             # time_ids = (orig_h, orig_w, crop_top, crop_left, target_h, target_w)
             time_ids = torch.tensor([height, width, 0, 0, height, width], device=device)
             return ({"context": ctx_c, "y": self._sdxl_y(pooled_c, time_ids)},

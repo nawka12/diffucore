@@ -92,3 +92,28 @@ def test_long_prompt_exceeds_77_tokens():
         ctx, pooled = cond("cat " * 200, batch=2)
     assert ctx.shape == (2, MAX_LENGTH * 3, 80 + 64)
     assert pooled.shape == (2, 80)
+
+
+def test_mismatched_chunks_padded_for_cfg_batching():
+    # A long positive prompt and a short negative prompt split into different
+    # chunk counts; CFG batches them along dim 0, so their sequence lengths must
+    # match. _match_context_chunks pads the shorter with empty-prompt chunks.
+    from diffucore.pipelines._base import _match_context_chunks
+
+    cond, _, _ = _tiny_conditioner()
+    with torch.no_grad():
+        ctx_c, _ = cond("cat " * 200)  # several chunks
+        ctx_u, _ = cond("")            # single chunk
+        assert ctx_c.shape[1] != ctx_u.shape[1]
+
+        padded_c, padded_u = _match_context_chunks(ctx_c, ctx_u, cond)
+        assert padded_c.shape[1] == padded_u.shape[1]
+        # batching cond+uncond along dim 0 (what CFGDenoiser does) now works
+        torch.cat([padded_c, padded_u])
+
+        # the longer context is untouched; the shorter is extended with the
+        # empty-prompt chunk embedding
+        assert torch.equal(padded_c, ctx_c)
+        empty = cond("", batch=1)[0]
+        assert torch.allclose(padded_u[:, :MAX_LENGTH], empty)
+        assert torch.allclose(padded_u[:, MAX_LENGTH : 2 * MAX_LENGTH], empty)
