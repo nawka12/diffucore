@@ -104,7 +104,7 @@ def _step_progress(total: int, progress_callback: Callable[[int, int], None] | N
     The sampler calls ``on_step(i, sigma, x, denoised)``; when ``preview_callback``
     is set the ``denoised`` x0 estimate (4th arg) is forwarded to it for live
     latent previews."""
-    bar = tqdm(total=total, desc="sampling", leave=False)
+    bar = tqdm(total=total, desc="sampling", leave=True)
     try:
         def on_step(*args):
             bar.update(1)
