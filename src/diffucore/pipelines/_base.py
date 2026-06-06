@@ -26,9 +26,13 @@ from ..sampling import (
     EpsScaling,
     ModelDenoiser,
     VScaling,
+    ddim_uniform_schedule,
     exponential_schedule,
     get_sampler,
     karras_schedule,
+    kl_optimal_schedule,
+    linear_quadratic_schedule,
+    normal_schedule,
     polyexponential_schedule,
     sgm_uniform_schedule,
     simple_schedule,
@@ -41,6 +45,7 @@ _SCHEDULERS = {
     "karras": karras_schedule,
     "exponential": exponential_schedule,
     "polyexponential": polyexponential_schedule,
+    "kl_optimal": kl_optimal_schedule,
 }
 
 # Schedulers that read the model's discrete sigma table / timestep map rather
@@ -48,6 +53,9 @@ _SCHEDULERS = {
 _SCHEDULE_FROM_MODEL = {
     "simple": simple_schedule,
     "sgm_uniform": sgm_uniform_schedule,
+    "normal": normal_schedule,
+    "ddim_uniform": ddim_uniform_schedule,
+    "linear_quadratic": linear_quadratic_schedule,
 }
 
 

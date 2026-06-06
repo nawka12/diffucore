@@ -27,19 +27,27 @@ from PIL import Image
 from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
 from ._base import PipelineInfo, _step_progress
 from ..sampling import (
-    FlowSamplingView,
     flow_matching_schedule,
+    flow_table_schedule,
     get_sampler,
-    sgm_uniform_schedule,
-    simple_schedule,
 )
 
 _FLUX_SAMPLERS = {
-    "euler", "er_sde", "dpm_2", "dpm_2_ancestral",
-    "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde", "secant",
+    "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
+    "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
+    "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
+    "gradient_estimation", "lms", "lcm", "secant",
 }
-_FLOW_AWARE_SAMPLERS = {"er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde"}
-_FLUX_SCHEDULERS = ("flux", "flow", "sgm_uniform", "simple")
+_FLOW_AWARE_SAMPLERS = {
+    "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
+    "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
+}
+# "ddim_uniform" omitted on flow: it starts below σ_max, clashing with the
+# pure-noise init. See schedules._FLOW_TABLE_SCHEDULERS.
+_FLUX_SCHEDULERS = (
+    "flux", "flow", "sgm_uniform", "simple",
+    "normal", "kl_optimal", "linear_quadratic",
+)
 
 # FLUX.2 uses ModelSamplingFlux with shift=2.02 (the value is the log-shift `mu`).
 _FLUX2_SHIFT = math.exp(2.02)
@@ -189,9 +197,7 @@ def flux_text_to_image(
             eff_shift = shift
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
         else:
-            view = FlowSamplingView(eff_shift, device=device, dtype=torch.float32)
-            schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
-            sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
+            sigmas = flow_table_schedule(scheduler, eff_shift, steps, device=device, dtype=torch.float32)
 
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = _patchify(torch.randn(1, model.spec.latent_channels, h_lat, w_lat,

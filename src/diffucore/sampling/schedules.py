@@ -21,10 +21,15 @@ __all__ = [
     "karras_schedule",
     "exponential_schedule",
     "polyexponential_schedule",
+    "kl_optimal_schedule",
     "flow_matching_schedule",
     "flow_matching_dynamic_shift",
     "simple_schedule",
     "sgm_uniform_schedule",
+    "normal_schedule",
+    "ddim_uniform_schedule",
+    "linear_quadratic_schedule",
+    "flow_table_schedule",
     "FlowSamplingView",
 ]
 
@@ -91,6 +96,26 @@ def polyexponential_schedule(
     ramp = torch.linspace(1, 0, steps, device=device, dtype=dtype) ** rho
     log_min, log_max = math.log(sigma_min), math.log(sigma_max)
     sigmas = (ramp * (log_max - log_min) + log_min).exp()
+    return append_zero(sigmas)
+
+
+def kl_optimal_schedule(
+    steps: int,
+    sigma_min: float,
+    sigma_max: float,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """KL-optimal schedule (Karras-style, arXiv:2407.12173).
+
+    Interpolates linearly in ``arctan(sigma)`` from ``sigma_max`` to ``sigma_min``,
+    i.e. ``sigma_i = tan((1-i/(n-1))·atan(sigma_max) + (i/(n-1))·atan(sigma_min))``,
+    then appends the trailing 0. Model-agnostic (works for VE and flow ranges)."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    ramp = torch.arange(steps, device=device, dtype=dtype) / max(steps - 1, 1)
+    sigmas = (ramp * math.atan(sigma_min) + (1.0 - ramp) * math.atan(sigma_max)).tan()
     return append_zero(sigmas)
 
 
@@ -212,3 +237,94 @@ def sgm_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "
     ts = torch.linspace(start, end, steps + 1, device=device, dtype=torch.float32)[:-1]
     sigmas = schedule.t_to_sigma(ts).to(device=device, dtype=dtype)
     return append_zero(sigmas)
+
+
+def normal_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                    dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """ComfyUI ``normal``: ``steps`` sigmas uniform in timestep between
+    ``sigma_max`` and ``sigma_min`` (``normal_scheduler`` with ``sgm=False`` —
+    all ``steps`` timesteps kept, trailing 0 appended)."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    start = float(schedule.sigma_to_t(schedule.sigma_max))
+    end = float(schedule.sigma_to_t(schedule.sigma_min))
+    ts = torch.linspace(start, end, steps, device=device, dtype=torch.float32)
+    sigmas = schedule.t_to_sigma(ts).to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
+def ddim_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                          dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """ComfyUI ``ddim_uniform``: pick sigmas from the model's (ascending) sigma
+    table at a fixed stride from the low-noise end, then reverse to descending
+    with a trailing 0."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    table = schedule.sigmas
+    n = len(table)
+    stride = max(n // steps, 1)
+    sigs = [0.0]
+    x = 1
+    while x < n:
+        sigs.append(float(table[x]))
+        x += stride
+    sigs.reverse()
+    return torch.tensor(sigs, device=device, dtype=dtype)
+
+
+def linear_quadratic_schedule(schedule, steps: int, *, threshold_noise: float = 0.025,
+                              linear_steps: int | None = None,
+                              device: torch.device | str = "cpu",
+                              dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """ComfyUI ``linear_quadratic`` (Mochi, arXiv:2412.xxxx): a normalized
+    schedule that is linear up to ``threshold_noise`` over the first
+    ``linear_steps`` (default ``steps // 2``) and quadratic after, scaled to the
+    model's ``sigma_max``. Returns ``steps + 1`` descending sigmas ending at 0."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if steps == 1:
+        normalized = [1.0, 0.0]
+    else:
+        if linear_steps is None:
+            linear_steps = steps // 2
+        linear = [i * threshold_noise / linear_steps for i in range(linear_steps)]
+        diff = linear_steps - threshold_noise * steps
+        quad_steps = steps - linear_steps
+        quad_coef = diff / (linear_steps * quad_steps ** 2)
+        lin_coef = threshold_noise / linear_steps - 2 * diff / (quad_steps ** 2)
+        const = quad_coef * (linear_steps ** 2)
+        quad = [quad_coef * (i ** 2) + lin_coef * i + const for i in range(linear_steps, steps)]
+        normalized = [1.0 - v for v in (linear + quad + [1.0])]
+    sigma_max = float(schedule.sigma_max)
+    return torch.tensor(normalized, device=device, dtype=dtype) * sigma_max
+
+
+# Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
+# / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
+# routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
+# on purpose: it starts below σ_max, which the flow pipelines' σ_max==1 pure-noise
+# init assumes; it is offered for SD/SDXL only (which scales its init by σ[0]).
+_FLOW_TABLE_SCHEDULERS = {
+    "sgm_uniform": sgm_uniform_schedule,
+    "simple": simple_schedule,
+    "normal": normal_schedule,
+    "linear_quadratic": linear_quadratic_schedule,
+}
+
+
+def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
+                        device: torch.device | str = "cpu",
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Build a flow sigma schedule for the table/timestep-based schedulers by
+    evaluating them against a :class:`FlowSamplingView` of the rectified-flow
+    model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``linear_quadratic``
+    and ``kl_optimal``."""
+    view = FlowSamplingView(shift, device=device, dtype=dtype)
+    if scheduler == "kl_optimal":
+        return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),
+                                   device=device, dtype=dtype)
+    try:
+        fn = _FLOW_TABLE_SCHEDULERS[scheduler]
+    except KeyError:
+        raise ValueError(f"unknown flow table scheduler {scheduler!r}") from None
+    return fn(view, steps, device=device, dtype=dtype)

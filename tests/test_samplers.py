@@ -1,7 +1,16 @@
+import pytest
 import torch
 
 from diffucore.sampling import schedules as S
 from diffucore.sampling import samplers as K
+
+
+def _ve_sigmas():
+    return S.karras_schedule(20, 0.03, 14.6)
+
+
+def _flow_sigmas():
+    return S.flow_matching_schedule(16, shift=3.0)
 
 
 def const_denoiser(target):
@@ -250,3 +259,104 @@ def test_secant_s_noise_changes_output_and_is_seed_reproducible():
 
 def test_secant_registered_in_sampler_table():
     assert K.get_sampler("secant") is K.sample_secant
+
+
+# ── ComfyUI-parity samplers ──────────────────────────────────────────
+# With a constant-x0 denoiser the probability-flow ODE is exactly linear (its
+# derivative d = (x - target)/σ is constant along the exact trajectory), so every
+# consistent solver must land on ``target`` on any descending schedule ending at
+# 0. The clean-snap stochastic ones also land exactly because σ_next == 0 forces
+# x = denoised on the final step.
+
+
+@pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
+                                  "gradient_estimation", "lms"])
+@pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
+def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
+    target = torch.full((1, 4, 4, 4), 0.2)
+    sigmas = sigmas_fn()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    out = K.get_sampler(name)(const_denoiser(target), x_init.clone(), sigmas)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-3)
+
+
+@pytest.mark.parametrize("name,extra", [
+    ("euler_ancestral", {}),
+    ("dpmpp_2s_ancestral", {}),
+    ("res_multistep_ancestral", {}),
+    ("lcm", {}),
+])
+@pytest.mark.parametrize("model_type", ["ve", "flow"])
+def test_new_ancestral_samplers_land_on_target(name, extra, model_type):
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = _flow_sigmas() if model_type == "flow" else _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    g = torch.Generator().manual_seed(0)
+    out = K.get_sampler(name)(
+        const_denoiser(target), x_init.clone(), sigmas,
+        generator=g, model_type=model_type, **extra,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_euler_ancestral_flow_differs_from_ve_midtrajectory():
+    # The headline fix: on a flow schedule the RF branch must actually run a
+    # different (rectified-flow) ancestral step than the VE split, not silently
+    # reuse the VE path. Capture the latent at the last non-zero sigma (both snap
+    # to target at σ_next == 0).
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    def model(x, sigma):  # σ-dependent so the two branches diverge
+        return 0.3 * torch.tanh(x)
+
+    def run(model_type):
+        last = {}
+        K.sample_euler_ancestral(
+            model, x_init.clone(), sigmas, model_type=model_type,
+            generator=torch.Generator().manual_seed(1),
+            callback=lambda i, s, x, d: last.__setitem__("x", x.clone()),
+        )
+        return last["x"]
+
+    assert not torch.allclose(run("flow"), run("ve"), atol=1e-3)
+
+
+def test_euler_ancestral_flow_seed_reproducible():
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 4, 4, 4)
+    a = K.sample_euler_ancestral(const_denoiser(target), x_init.clone(), sigmas,
+                                 generator=torch.Generator().manual_seed(3), model_type="flow")
+    b = K.sample_euler_ancestral(const_denoiser(target), x_init.clone(), sigmas,
+                                 generator=torch.Generator().manual_seed(3), model_type="flow")
+    assert torch.equal(a, b)
+
+
+def test_dpmpp_2m_sde_heun_alias_resolves_and_lands_clean():
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    fn = K.get_sampler("dpmpp_2m_sde_heun")
+    out = fn(const_denoiser(target), x_init, sigmas, generator=torch.Generator().manual_seed(0))
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_ddpm_finite_and_converges():
+    # DDPM doesn't clean-snap (no x = denoised at the end); it's a contraction
+    # toward the constant prediction, so check it stays finite and lands close.
+    target = torch.full((1, 4, 4, 4), 0.1)
+    sigmas = S.karras_schedule(30, 0.03, 14.6)
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    out = K.sample_ddpm(const_denoiser(target), x_init, sigmas,
+                        generator=torch.Generator().manual_seed(0))
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=0.1)
+
+
+def test_all_registered_samplers_resolve():
+    for name, fn in K.SAMPLERS.items():
+        assert K.get_sampler(name) is fn

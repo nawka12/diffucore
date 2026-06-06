@@ -28,24 +28,32 @@ from PIL import Image
 from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
 from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
-    FlowSamplingView,
     append_zero,
     calibrate_oss_schedule,
     flow_matching_schedule,
     flow_matching_dynamic_shift,
+    flow_table_schedule,
     get_sampler,
-    sgm_uniform_schedule,
-    simple_schedule,
 )
 
 # Samplers Anima can drive (all routed through a CONST x0 denoiser closure).
 # The stochastic, flow-aware ones additionally take ``model_type``/``shift``.
 _ANIMA_SAMPLERS = {
-    "euler", "er_sde", "dpm_2", "dpm_2_ancestral",
-    "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde",
-    "secant",
+    "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
+    "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
+    "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
+    "gradient_estimation", "lms", "lcm", "secant",
 }
-_FLOW_AWARE_SAMPLERS = {"er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde"}
+_FLOW_AWARE_SAMPLERS = {
+    "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
+    "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
+}
+# "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
+# with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
+_ANIMA_SCHEDULERS = (
+    "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
+    "normal", "kl_optimal", "linear_quadratic",
+)
 
 if TYPE_CHECKING:
     from ..bundle import ModelBundle
@@ -101,8 +109,8 @@ def anima_text_to_image(
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
-    if scheduler not in ("flow", "flow_dyn", "oss", "sgm_uniform", "simple"):
-        raise ValueError(f"Anima scheduler must be 'flow', 'flow_dyn', 'oss', 'sgm_uniform' or 'simple'; got {scheduler!r}")
+    if scheduler not in _ANIMA_SCHEDULERS:
+        raise ValueError(f"Anima scheduler must be one of {_ANIMA_SCHEDULERS}; got {scheduler!r}")
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -142,9 +150,7 @@ def anima_text_to_image(
             s = torch.as_tensor(oss_sigmas, device=device, dtype=torch.float32)
             sigmas = s if float(s[-1]) == 0.0 else append_zero(s)
         else:
-            view = FlowSamplingView(shift, device=device, dtype=torch.float32)
-            schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
-            sigmas = schedule_fn(view, steps, device=device, dtype=torch.float32)
+            sigmas = flow_table_schedule(scheduler, shift, steps, device=device, dtype=torch.float32)
         h_lat, w_lat = height // 8, width // 8
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
@@ -248,7 +254,7 @@ def anima_img2img(
     """
     if sampler not in _ANIMA_SAMPLERS:
         sampler = "euler"
-    if scheduler not in ("flow", "flow_dyn", "oss", "sgm_uniform", "simple"):
+    if scheduler not in _ANIMA_SCHEDULERS:
         scheduler = "flow"
     if not 0.0 < strength <= 1.0:
         raise ValueError(f"strength must be in (0, 1], got {strength}")
@@ -285,9 +291,7 @@ def anima_img2img(
             s = torch.as_tensor(oss_sigmas, device=device, dtype=torch.float32)
             sigmas = s if float(s[-1]) == 0.0 else append_zero(s)
         else:
-            view = FlowSamplingView(shift, device=device, dtype=torch.float32)
-            schedule_fn = simple_schedule if scheduler == "simple" else sgm_uniform_schedule
-            sigmas = schedule_fn(view, sched_steps, device=device, dtype=torch.float32)
+            sigmas = flow_table_schedule(scheduler, shift, sched_steps, device=device, dtype=torch.float32)
 
         # ---- 3. encode init → DiT-space latent z0; build strength-noised start
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None

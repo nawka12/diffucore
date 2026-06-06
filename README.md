@@ -73,12 +73,19 @@ image = TextToImage(model)(
 )
 ```
 
-- **Samplers** — `euler`, `heun`, `euler_ancestral`, `dpm_2`, `dpm_2_ancestral`,
-  `dpmpp_2m`, `dpmpp_sde`, `dpmpp_2m_sde`, `dpmpp_3m_sde`, `er_sde`, `secant`
-  (the last is Anima-only; works with any descending flow schedule).
-- **Schedulers** — `karras`, `exponential`, `polyexponential`, `sgm_uniform`,
-  `simple` (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`,
-  `simple` (Anima); `flux` (default), `flow`, `sgm_uniform`, `simple` (FLUX).
+- **Samplers** — `euler`, `euler_ancestral`, `heun`, `heunpp2`, `dpm_2`,
+  `dpm_2_ancestral`, `dpmpp_2s_ancestral`, `dpmpp_2m`, `dpmpp_2m_sde`,
+  `dpmpp_2m_sde_heun`, `dpmpp_sde`, `dpmpp_3m_sde`, `ipndm`, `ipndm_v`,
+  `res_multistep`, `res_multistep_ancestral`, `gradient_estimation`, `lms`,
+  `er_sde`, `lcm`, `secant`, plus `ddpm` (SD/SDXL only — a VP/VE sampler).
+  Ancestral samplers are rectified-flow-aware on Anima/FLUX.
+- **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
+  `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
+  (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`, `simple`,
+  `normal`, `kl_optimal`, `linear_quadratic` (Anima); `flux` (default), `flow`,
+  `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
+  `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
+  pipelines' σ_max = 1 init assumes).
   `flow_dyn` is `flow` with a Flux-style resolution-aware shift (auto-derived
   from the image's token count; the `shift` value is ignored — and the UI has
   no shift control, so plain `flow` always runs shift=3.0). `oss` is a

@@ -83,6 +83,69 @@ def test_flow_matching_invalid_args_raise():
         S.flow_matching_schedule(5, shift=0.5)
 
 
+def test_kl_optimal_endpoints_and_descent():
+    sig = S.kl_optimal_schedule(20, sigma_min=0.0292, sigma_max=14.6)
+    assert sig.shape[0] == 21
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] >= sig[1:])
+    assert abs(sig[0].item() - 14.6) < 1e-3            # tan(atan(σ_max)) == σ_max
+    assert abs(sig[-2].item() - 0.0292) < 1e-3
+
+
+def _flow_view(shift=3.0):
+    return S.FlowSamplingView(shift)
+
+
+def test_normal_schedule_descends_to_zero():
+    sig = S.normal_schedule(_flow_view(), 20)
+    assert sig.shape[0] == 21
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] >= sig[1:])
+    assert torch.isfinite(sig).all()
+    assert abs(sig[0].item() - 1.0) < 1e-3             # flow σ_max == 1
+
+
+def test_ddim_uniform_descends_to_zero():
+    sig = S.ddim_uniform_schedule(_flow_view(), 20)
+    assert sig[-1].item() == 0.0
+    assert sig.shape[0] >= 2
+    assert torch.all(sig[:-1] >= sig[1:])
+    assert torch.isfinite(sig).all()
+
+
+def test_linear_quadratic_endpoints_and_descent():
+    sig = S.linear_quadratic_schedule(_flow_view(), 20)
+    assert sig.shape[0] == 21
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] >= sig[1:])
+    assert abs(sig[0].item() - 1.0) < 1e-6             # starts at σ_max (==1 for flow)
+
+
+def test_flow_table_schedule_dispatches_all_names():
+    # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
+    # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
+    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic", "kl_optimal"):
+        sig = S.flow_table_schedule(name, shift=3.0, steps=12)
+        assert sig[-1].item() == 0.0
+        assert torch.all(sig[:-1] >= sig[1:]), name
+        assert torch.isfinite(sig).all(), name
+        assert abs(sig[0].item() - 1.0) < 1e-3, name   # flow init assumes σ_max == 1
+
+
+def test_flow_table_schedule_rejects_ddim_uniform():
+    import pytest
+
+    with pytest.raises(ValueError):
+        S.flow_table_schedule("ddim_uniform", shift=3.0, steps=12)
+
+
+def test_flow_table_schedule_unknown_raises():
+    import pytest
+
+    with pytest.raises(ValueError):
+        S.flow_table_schedule("nope", shift=3.0, steps=10)
+
+
 def test_flow_matching_dynamic_shift_monotonic_and_anchor():
     """Flux-style mu interpolation: shift grows with the token count and lands
     near Anima's training shift (~3.16) at 1024² (4096 tokens)."""

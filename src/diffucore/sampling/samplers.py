@@ -18,8 +18,10 @@ References:
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 from .parameterization import append_dims
@@ -29,14 +31,24 @@ __all__ = [
     "get_ancestral_step",
     "sample_euler",
     "sample_heun",
+    "sample_heunpp2",
     "sample_euler_ancestral",
     "sample_er_sde",
     "sample_dpm_2",
     "sample_dpm_2_ancestral",
+    "sample_dpmpp_2s_ancestral",
     "sample_dpmpp_2m",
     "sample_dpmpp_sde",
     "sample_dpmpp_2m_sde",
     "sample_dpmpp_3m_sde",
+    "sample_ipndm",
+    "sample_ipndm_v",
+    "sample_res_multistep",
+    "sample_res_multistep_ancestral",
+    "sample_gradient_estimation",
+    "sample_lms",
+    "sample_lcm",
+    "sample_ddpm",
     "sample_secant",
     "get_sampler",
     "SAMPLERS",
@@ -61,6 +73,23 @@ def get_ancestral_step(sigma_from: torch.Tensor, sigma_to: torch.Tensor, eta: fl
     sigma_up = torch.minimum(sigma_to, eta * var.sqrt())
     sigma_down = (sigma_to ** 2 - sigma_up ** 2).clamp(min=0).sqrt()
     return sigma_down, sigma_up
+
+
+def _rf_ancestral_step(sigma: torch.Tensor, sigma_next: torch.Tensor, eta: float):
+    """Rectified-flow ancestral split (ComfyUI's ``*_RF`` ancestral samplers).
+
+    For CONST / rectified-flow models (``alpha_t = 1 - sigma_t``) the ancestral
+    step can't use the VE :func:`get_ancestral_step` variance bookkeeping. Instead
+    it shrinks the deterministic target to ``sigma_down = sigma_next·(1 + (sigma_next/sigma
+    - 1)·eta)`` and renoises with ``renoise_coeff`` so the marginal at ``sigma_next``
+    is preserved. Returns ``(sigma_down, alpha_next, alpha_down, renoise_coeff)``;
+    ``eta=0`` ⇒ deterministic (``sigma_down = sigma_next``, ``renoise = 0``)."""
+    downstep_ratio = 1.0 + (sigma_next / sigma - 1.0) * eta
+    sigma_down = sigma_next * downstep_ratio
+    alpha_next = 1.0 - sigma_next
+    alpha_down = 1.0 - sigma_down
+    renoise_coeff = (sigma_next ** 2 - sigma_down ** 2 * alpha_next ** 2 / alpha_down ** 2).clamp(min=0).sqrt()
+    return sigma_down, alpha_next, alpha_down, renoise_coeff
 
 
 def _offset_first_sigma_for_snr(sigmas: torch.Tensor, model_type: str, shift: float,
@@ -134,22 +163,41 @@ def sample_euler_ancestral(
     sigmas: torch.Tensor,
     *,
     eta: float = 1.0,
+    s_noise: float = 1.0,
     generator: Optional[torch.Generator] = None,
     callback: Callback = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
 ) -> torch.Tensor:
-    """Euler sampler with ancestral (stochastic) noise re-injection."""
+    """Euler sampler with ancestral (stochastic) noise re-injection.
+
+    ``model_type="flow"`` uses the rectified-flow ancestral step (ComfyUI's
+    ``sample_euler_ancestral_RF``), required for CONST models like Anima/FLUX;
+    ``"ve"`` uses the standard sigma-space ancestral split. ``shift`` is accepted
+    for pipeline kwarg uniformity (the Euler-ancestral step needs no first-sigma
+    offset)."""
+    del shift
     s_in = x.new_ones([x.shape[0]])
     for i in range(len(sigmas) - 1):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * s_in)
-        sigma_down, sigma_up = get_ancestral_step(sigma, sigma_next, eta)
-        d = to_d(x, sigma * s_in, denoised)
         if callback is not None:
             callback(i, sigma, x, denoised)
-        x = x + d * (sigma_down - sigma)
-        if bool(sigma_up > 0):
-            noise = torch.randn(x.shape, generator=generator, device=x.device, dtype=x.dtype)
-            x = x + noise * sigma_up
+        if model_type == "flow":
+            if bool(sigma_next == 0):
+                x = denoised
+                continue
+            sigma_down, alpha_next, alpha_down, renoise_coeff = _rf_ancestral_step(sigma, sigma_next, eta)
+            ratio = sigma_down / sigma
+            x = ratio * x + (1.0 - ratio) * denoised
+            if eta > 0 and s_noise > 0:
+                x = (alpha_next / alpha_down) * x + _noise_like(x, generator) * s_noise * renoise_coeff
+        else:
+            sigma_down, sigma_up = get_ancestral_step(sigma, sigma_next, eta)
+            d = to_d(x, sigma * s_in, denoised)
+            x = x + d * (sigma_down - sigma)
+            if bool(sigma_up > 0) and s_noise > 0:
+                x = x + _noise_like(x, generator) * s_noise * sigma_up
     return x
 
 
@@ -583,17 +631,431 @@ def sample_secant(
     return x
 
 
+def sample_heunpp2(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None) -> torch.Tensor:
+    """Heun++ — a higher-order Heun that, away from the schedule endpoint, takes a
+    third evaluation and blends the three derivatives with sigma-proportional
+    weights. Deterministic; model-agnostic (works in sigma space for VE and flow).
+    After the original MIT-licensed sd-webui-samplers-scheduler implementation."""
+    s_in = x.new_ones([x.shape[0]])
+    s_end = sigmas[-1]
+    for i in range(len(sigmas) - 1):
+        sigma = sigmas[i]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        dt = sigmas[i + 1] - sigma
+        if bool(sigmas[i + 1] == s_end):
+            # Last step: plain Euler onto the clean sample.
+            x = x + d * dt
+        elif bool(sigmas[i + 2] == s_end):
+            # Penultimate step: 2nd-order Heun with sigma-weighted derivatives.
+            x_2 = x + d * dt
+            d_2 = to_d(x_2, sigmas[i + 1] * s_in, model(x_2, sigmas[i + 1] * s_in))
+            w = 2 * sigmas[0]
+            w2 = sigmas[i + 1] / w
+            x = x + (d * (1 - w2) + d_2 * w2) * dt
+        else:
+            # 3rd-order: extrapolate two extra points and blend all three slopes.
+            x_2 = x + d * dt
+            d_2 = to_d(x_2, sigmas[i + 1] * s_in, model(x_2, sigmas[i + 1] * s_in))
+            x_3 = x_2 + d_2 * (sigmas[i + 2] - sigmas[i + 1])
+            d_3 = to_d(x_3, sigmas[i + 2] * s_in, model(x_3, sigmas[i + 2] * s_in))
+            w = 3 * sigmas[0]
+            w2 = sigmas[i + 1] / w
+            w3 = sigmas[i + 2] / w
+            x = x + ((1 - w2 - w3) * d + w2 * d_2 + w3 * d_3) * dt
+    return x
+
+
+def sample_dpmpp_2s_ancestral(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """DPM-Solver++(2S) ancestral: single-step 2nd-order ancestral sampler (two
+    evaluations per step). ``model_type="flow"`` uses ComfyUI's
+    ``sample_dpmpp_2s_ancestral_RF`` (the data-prediction update in flow
+    half-logSNR space, with the σ=1 singularity guarded); ``"ve"`` uses the
+    standard logSNR form. ``shift`` is accepted for kwarg uniformity (unused)."""
+    del shift
+    s_in = x.new_ones([x.shape[0]])
+    if model_type == "flow":
+        sigma_fn = lambda lam: (lam.exp() + 1.0) ** -1          # σ from half-logSNR
+        lambda_fn = lambda sig: ((1.0 - sig) / sig).log()       # half-logSNR from σ
+        for i in range(len(sigmas) - 1):
+            sigma, sigma_next = sigmas[i], sigmas[i + 1]
+            denoised = model(x, sigma * s_in)
+            if callback is not None:
+                callback(i, sigma, x, denoised)
+            if bool(sigma_next == 0):
+                x = denoised
+                continue
+            sigma_down, alpha_next, alpha_down, renoise_coeff = _rf_ancestral_step(sigma, sigma_next, eta)
+            if bool(sigma >= 1):
+                sigma_s = torch.full_like(sigma, 0.9999)        # guard log((1-σ)/σ) at σ=1
+            else:
+                t_i, t_down = lambda_fn(sigma), lambda_fn(sigma_down)
+                sigma_s = sigma_fn(t_i + 0.5 * (t_down - t_i))
+            ratio_s = sigma_s / sigma
+            u = ratio_s * x + (1.0 - ratio_s) * denoised
+            denoised_2 = model(u, sigma_s * s_in)
+            ratio_down = sigma_down / sigma
+            x = ratio_down * x + (1.0 - ratio_down) * denoised_2
+            if eta > 0 and s_noise > 0:
+                x = (alpha_next / alpha_down) * x + _noise_like(x, generator) * s_noise * renoise_coeff
+    else:
+        sigma_fn = lambda t: t.neg().exp()
+        t_fn = lambda sig: sig.log().neg()
+        for i in range(len(sigmas) - 1):
+            sigma, sigma_next = sigmas[i], sigmas[i + 1]
+            denoised = model(x, sigma * s_in)
+            sigma_down, sigma_up = get_ancestral_step(sigma, sigma_next, eta)
+            if callback is not None:
+                callback(i, sigma, x, denoised)
+            if bool(sigma_down == 0):
+                d = to_d(x, sigma * s_in, denoised)
+                x = x + d * (sigma_down - sigma)
+            else:
+                t, t_next = t_fn(sigma), t_fn(sigma_down)
+                h = t_next - t
+                s = t + 0.5 * h
+                x_2 = (sigma_fn(s) / sigma_fn(t)) * x - (-0.5 * h).expm1() * denoised
+                denoised_2 = model(x_2, sigma_fn(s) * s_in)
+                x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_2
+            if bool(sigma_next > 0) and s_noise > 0:
+                x = x + _noise_like(x, generator) * s_noise * sigma_up
+    return x
+
+
+def sample_ipndm(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None,
+                 max_order: int = 4) -> torch.Tensor:
+    """iPNDM — improved pseudo-numerical (Adams–Bashforth) multistep solver in σ
+    space, up to 4th order with the fixed AB coefficients. Deterministic and
+    model-agnostic. After the Apache-2.0 zju-pi/diff-sampler implementation."""
+    s_in = x.new_ones([x.shape[0]])
+    buffer: list[torch.Tensor] = []
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        d = to_d(x, sigma * s_in, denoised)
+        order = min(max_order, i + 1)
+        dt = sigma_next - sigma
+        if bool(sigma_next == 0):
+            x = denoised
+        elif order == 1:
+            x = x + dt * d
+        elif order == 2:
+            x = x + dt * (3 * d - buffer[-1]) / 2
+        elif order == 3:
+            x = x + dt * (23 * d - 16 * buffer[-1] + 5 * buffer[-2]) / 12
+        else:
+            x = x + dt * (55 * d - 59 * buffer[-1] + 37 * buffer[-2] - 9 * buffer[-3]) / 24
+        buffer.append(d)
+        if len(buffer) > max_order - 1:
+            buffer.pop(0)
+    return x
+
+
+def sample_ipndm_v(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None,
+                   max_order: int = 4) -> torch.Tensor:
+    """iPNDM_v — the variable-step variant of :func:`sample_ipndm`: the AB
+    coefficients are recomputed from the actual σ spacing each step (suited to
+    non-uniform schedules). Deterministic, model-agnostic. zju-pi/diff-sampler
+    (Apache-2.0)."""
+    s_in = x.new_ones([x.shape[0]])
+    t = sigmas
+    buffer: list[torch.Tensor] = []
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        d = to_d(x, sigma * s_in, denoised)
+        order = min(max_order, i + 1)
+        dt = sigma_next - sigma
+        if bool(sigma_next == 0):
+            x = denoised
+        elif order == 1:
+            x = x + dt * d
+        elif order == 2:
+            h_n = sigma_next - sigma
+            h_n_1 = sigma - t[i - 1]
+            c1 = (2 + (h_n / h_n_1)) / 2
+            c2 = -(h_n / h_n_1) / 2
+            x = x + dt * (c1 * d + c2 * buffer[-1])
+        elif order == 3:
+            h_n = sigma_next - sigma
+            h_n_1 = sigma - t[i - 1]
+            h_n_2 = t[i - 1] - t[i - 2]
+            temp = (1 - h_n / (3 * (h_n + h_n_1)) * (h_n * (h_n + h_n_1)) / (h_n_1 * (h_n_1 + h_n_2))) / 2
+            c1 = (2 + (h_n / h_n_1)) / 2 + temp
+            c2 = -(h_n / h_n_1) / 2 - (1 + h_n_1 / h_n_2) * temp
+            c3 = temp * h_n_1 / h_n_2
+            x = x + dt * (c1 * d + c2 * buffer[-1] + c3 * buffer[-2])
+        else:
+            h_n = sigma_next - sigma
+            h_n_1 = sigma - t[i - 1]
+            h_n_2 = t[i - 1] - t[i - 2]
+            h_n_3 = t[i - 2] - t[i - 3]
+            temp1 = (1 - h_n / (3 * (h_n + h_n_1)) * (h_n * (h_n + h_n_1)) / (h_n_1 * (h_n_1 + h_n_2))) / 2
+            temp2 = ((1 - h_n / (3 * (h_n + h_n_1))) / 2 + (1 - h_n / (2 * (h_n + h_n_1))) * h_n / (6 * (h_n + h_n_1 + h_n_2))) \
+                * (h_n * (h_n + h_n_1) * (h_n + h_n_1 + h_n_2)) / (h_n_1 * (h_n_1 + h_n_2) * (h_n_1 + h_n_2 + h_n_3))
+            c1 = (2 + (h_n / h_n_1)) / 2 + temp1 + temp2
+            c2 = -(h_n / h_n_1) / 2 - (1 + h_n_1 / h_n_2) * temp1 \
+                - (1 + (h_n_1 / h_n_2) + (h_n_1 * (h_n_1 + h_n_2) / (h_n_2 * (h_n_2 + h_n_3)))) * temp2
+            c3 = temp1 * h_n_1 / h_n_2 \
+                + ((h_n_1 / h_n_2) + (h_n_1 * (h_n_1 + h_n_2) / (h_n_2 * (h_n_2 + h_n_3))) * (1 + h_n_2 / h_n_3)) * temp2
+            c4 = -temp2 * (h_n_1 * (h_n_1 + h_n_2) / (h_n_2 * (h_n_2 + h_n_3))) * h_n_1 / h_n_2
+            x = x + dt * (c1 * d + c2 * buffer[-1] + c3 * buffer[-2] + c4 * buffer[-3])
+        buffer.append(d)
+        if len(buffer) > max_order - 1:
+            buffer.pop(0)
+    return x
+
+
+def _res_multistep(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta: float,
+    s_noise: float,
+    generator: Optional[torch.Generator],
+    callback: Callback,
+    model_type: str,
+) -> torch.Tensor:
+    """Shared body for :func:`sample_res_multistep` (``eta=0``) and
+    :func:`sample_res_multistep_ancestral` (``eta>0``).
+
+    Second-order multistep exponential (RES) solver in data-prediction form,
+    Zhang et al. (arXiv:2308.02157), evaluated in the half-logSNR-free
+    ``t = -log σ`` space (so it serves VE and flow alike). The ancestral split is
+    rectified-flow-aware when ``model_type="flow"`` and VE otherwise."""
+    s_in = x.new_ones([x.shape[0]])
+    sigma_fn = lambda t: t.neg().exp()
+    t_fn = lambda sig: sig.log().neg()
+    phi1_fn = lambda t: t.expm1() / t
+    phi2_fn = lambda t: (phi1_fn(t) - 1.0) / t
+    old_denoised = None
+    old_sigma_down = None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        alpha_next = alpha_down = renoise_coeff = sigma_up = None
+        if eta > 0 and bool(sigma_next > 0):
+            if model_type == "flow":
+                sigma_down, alpha_next, alpha_down, renoise_coeff = _rf_ancestral_step(sigma, sigma_next, eta)
+            else:
+                sigma_down, sigma_up = get_ancestral_step(sigma, sigma_next, eta)
+        else:
+            sigma_down = sigma_next
+        if bool(sigma_down == 0) or old_denoised is None:
+            d = to_d(x, sigma * s_in, denoised)
+            x = x + d * (sigma_down - sigma)
+        else:
+            t, t_old = t_fn(sigma), t_fn(old_sigma_down)
+            t_next, t_prev = t_fn(sigma_down), t_fn(sigmas[i - 1])
+            h = t_next - t
+            c2 = (t_prev - t_old) / h
+            phi1_val, phi2_val = phi1_fn(-h), phi2_fn(-h)
+            b1 = torch.nan_to_num(phi1_val - phi2_val / c2, nan=0.0)
+            b2 = torch.nan_to_num(phi2_val / c2, nan=0.0)
+            x = sigma_fn(h) * x + h * (b1 * denoised + b2 * old_denoised)
+        if eta > 0 and bool(sigma_next > 0) and s_noise > 0:
+            noise = _noise_like(x, generator)
+            if model_type == "flow":
+                x = (alpha_next / alpha_down) * x + noise * s_noise * renoise_coeff
+            else:
+                x = x + noise * s_noise * sigma_up
+        old_denoised = denoised
+        old_sigma_down = sigma_down
+    return x
+
+
+def sample_res_multistep(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
+                         callback: Callback = None) -> torch.Tensor:
+    """RES (refined exponential solver), deterministic 2nd-order multistep. See
+    :func:`_res_multistep`. Model-agnostic."""
+    return _res_multistep(model, x, sigmas, eta=0.0, s_noise=1.0, generator=None,
+                          callback=callback, model_type="ve")
+
+
+def sample_res_multistep_ancestral(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """Ancestral RES multistep solver (stochastic). ``model_type="flow"`` uses
+    the rectified-flow ancestral step. See :func:`_res_multistep`. ``shift`` is
+    accepted for kwarg uniformity (unused)."""
+    del shift
+    return _res_multistep(model, x, sigmas, eta=eta, s_noise=s_noise, generator=generator,
+                          callback=callback, model_type=model_type)
+
+
+def sample_gradient_estimation(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
+                               callback: Callback = None, ge_gamma: float = 2.0) -> torch.Tensor:
+    """Gradient-estimation sampler (Liu et al., openreview o2ND9v0CeK): an Euler
+    step plus a first-order correction ``(γ-1)·(d_i - d_{i-1})`` from the change in
+    the ODE derivative between steps. Deterministic; model-agnostic. ``ge_gamma=1``
+    reduces to Euler."""
+    s_in = x.new_ones([x.shape[0]])
+    old_d = None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        dt = sigma_next - sigma
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            x = x + d * dt
+            if old_d is not None:
+                x = x + (ge_gamma - 1.0) * (d - old_d) * dt
+        old_d = d
+    return x
+
+
+def _linear_multistep_coeff(order: int, t: np.ndarray, i: int, j: int) -> float:
+    """Adams–Bashforth coefficient for :func:`sample_lms`: the integral over
+    ``[t_i, t_{i+1}]`` of the ``j``-th Lagrange basis polynomial through the last
+    ``order`` nodes. Integrated exactly in closed form (numpy polynomials), which
+    matches ComfyUI's ``scipy.integrate.quad`` without the scipy dependency."""
+    poly = np.polynomial.Polynomial([1.0])
+    for k in range(order):
+        if k == j:
+            continue
+        poly = poly * np.polynomial.Polynomial([-t[i - k], 1.0]) / (t[i - j] - t[i - k])
+    integ = poly.integ()
+    return float(integ(t[i + 1]) - integ(t[i]))
+
+
+def sample_lms(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None,
+               order: int = 4) -> torch.Tensor:
+    """LMS — linear multistep (Adams–Bashforth) in σ space, with coefficients
+    computed from the actual σ nodes each step. Deterministic; model-agnostic.
+    The classic k-diffusion sampler (MIT)."""
+    s_in = x.new_ones([x.shape[0]])
+    sigmas_np = sigmas.detach().cpu().numpy()
+    ds: list[torch.Tensor] = []
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        ds.append(d)
+        if len(ds) > order:
+            ds.pop(0)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            cur_order = min(i + 1, order)
+            coeffs = [_linear_multistep_coeff(cur_order, sigmas_np, i, j) for j in range(cur_order)]
+            x = x + sum(c * d_ for c, d_ in zip(coeffs, reversed(ds)))
+    return x
+
+
+def sample_lcm(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """LCM (Latent Consistency Model) sampling: each step jumps straight to the x0
+    estimate, then — unless it's the last step — re-noises to ``sigma_next``.
+    ``model_type="flow"`` re-noises as ``(1-σ)·x0 + σ·ε`` (the rectified-flow
+    forward), ``"ve"`` as ``x0 + σ·ε``. ``shift`` accepted for uniformity (unused)."""
+    del shift
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        x = denoised
+        if bool(sigma_next > 0):
+            noise = _noise_like(x, generator)
+            if model_type == "flow":
+                x = (1.0 - sigma_next) * denoised + sigma_next * noise
+            else:
+                x = denoised + sigma_next * noise
+    return x
+
+
+def sample_ddpm(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
+                generator: Optional[torch.Generator] = None, callback: Callback = None) -> torch.Tensor:
+    """DDPM ancestral sampling (Ho et al., 2020), expressed in Karras σ space via
+    the VP mapping ``alpha_cumprod = 1/(σ²+1)``. Stochastic. For VE/VP (eps/v)
+    checkpoints — SD/SDXL — not rectified-flow models."""
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        noise_pred = (x - denoised) / sigma                       # ε estimate
+        x_vp = x / (1.0 + sigma ** 2).sqrt()                      # VE latent → VP latent
+        alpha_cumprod = 1.0 / (sigma ** 2 + 1.0)
+        alpha_cumprod_prev = 1.0 / (sigma_next ** 2 + 1.0)
+        alpha = alpha_cumprod / alpha_cumprod_prev
+        x_vp = (1.0 / alpha).sqrt() * (x_vp - (1.0 - alpha) * noise_pred / (1.0 - alpha_cumprod).sqrt())
+        if bool(sigma_next > 0):
+            std = ((1.0 - alpha) * (1.0 - alpha_cumprod_prev) / (1.0 - alpha_cumprod)).sqrt()
+            x_vp = x_vp + std * _noise_like(x, generator)
+            x = x_vp * (1.0 + sigma_next ** 2).sqrt()             # VP latent → VE latent
+        else:
+            x = x_vp
+    return x
+
+
 SAMPLERS: dict[str, Denoiser] = {
     "euler": sample_euler,
     "heun": sample_heun,
+    "heunpp2": sample_heunpp2,
     "euler_ancestral": sample_euler_ancestral,
     "er_sde": sample_er_sde,
     "dpm_2": sample_dpm_2,
     "dpm_2_ancestral": sample_dpm_2_ancestral,
+    "dpmpp_2s_ancestral": sample_dpmpp_2s_ancestral,
     "dpmpp_2m": sample_dpmpp_2m,
     "dpmpp_sde": sample_dpmpp_sde,
     "dpmpp_2m_sde": sample_dpmpp_2m_sde,
+    "dpmpp_2m_sde_heun": partial(sample_dpmpp_2m_sde, solver_type="heun"),
     "dpmpp_3m_sde": sample_dpmpp_3m_sde,
+    "ipndm": sample_ipndm,
+    "ipndm_v": sample_ipndm_v,
+    "res_multistep": sample_res_multistep,
+    "res_multistep_ancestral": sample_res_multistep_ancestral,
+    "gradient_estimation": sample_gradient_estimation,
+    "lms": sample_lms,
+    "lcm": sample_lcm,
+    "ddpm": sample_ddpm,
     "secant": sample_secant,
 }
 
