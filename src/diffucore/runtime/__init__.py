@@ -324,14 +324,17 @@ def _tile_starts(size: int, tile: int, step: int) -> list[int]:
 #     raw; rounded up to 6 KB/px to cover allocator fragmentation and reserved
 #     blocks that ``mem_get_info`` reports as free.
 #   - QwenImageVAE (Anima): ~2.25 GB activations at 1024×1536 (see commit
-#     f10771f) → 1.5 KB/px raw; rounded up to 5 KB/px so the check tiles at
-#     1024×1536 on a 12 GB card with the DiT resident (where the raw number
-#     OOMs once allocator overhead is accounted for) but still untiles at
-#     1024² where the f10771f scenario was known to fit.
+#     f10771f) → 1.5 KB/px raw; set to 3.5 KB/px (~2.3× raw) for peak-vs-steady
+#     headroom + decode-time fragmentation. (Was 5 KB/px to mask a deflated free
+#     reading — but can_decode_untiled now empty_cache()s before mem_get_info, so
+#     free is accurate and that inflation double-counted, tiling 832×1216/1024²
+#     unnecessarily. On a 12 GB card with the DiT resident, measured free ≈5.2 GB:
+#     3.5 KB/px untiles ≤1024²-class (~3.6-3.8 GB est) and still tiles 1024×1536+
+#     (~5.6 GB est).)
 # Unknown VAE classes fall back to the SDXL constant (the more conservative one).
 _VAE_BYTES_PER_PX = {
     "AutoencoderKL": 6 * 1024,
-    "QwenImageVAE": 5 * 1024,
+    "QwenImageVAE": 3584,  # 3.5 KB/px
 }
 _VAE_BYTES_PER_PX_DEFAULT = 6 * 1024
 _DECODE_FREE_VRAM_MARGIN = 0.85
@@ -360,9 +363,19 @@ def can_decode_untiled(
     ``free_bytes`` is an optional override for testing; production callers
     leave it unset so the live free figure is read each call.
     """
+    measured = free_bytes is None  # real GPU read (vs a test-supplied budget)
     if free_bytes is None:
         if device.type != "cuda":
             return True
+        # Reclaim the caching allocator's reserved-but-unused blocks before
+        # reading free VRAM. After a sampling loop with the backbone resident
+        # (the 12 GB ``encoders`` path) torch holds several GB of freed-but-
+        # cached activation memory; mem_get_info (driver-level free) counts that
+        # as used, understating headroom and tripping otherwise-fine decodes
+        # (Anima 1024²) into needless tiling. Handing the blocks back makes the
+        # reading reflect true free — and the decode about to run benefits from
+        # the defragmented pool anyway.
+        torch.cuda.empty_cache()
         # mem_get_info needs an explicit index or int; a bare torch.device("cuda")
         # (no index) raises, so fall back to the current device when unset.
         index = device.index if device.index is not None else torch.cuda.current_device()
@@ -370,7 +383,19 @@ def can_decode_untiled(
     _, _, h_lat, w_lat = latent_shape
     px = (w_lat * 8) * (h_lat * 8)
     bytes_per_px = _VAE_BYTES_PER_PX.get(type(vae).__name__, _VAE_BYTES_PER_PX_DEFAULT)
-    return px * bytes_per_px < free_bytes * _DECODE_FREE_VRAM_MARGIN
+    need = px * bytes_per_px
+    budget = free_bytes * _DECODE_FREE_VRAM_MARGIN
+    fits = need < budget
+    if measured:
+        _GB = 1024**3
+        print(
+            f"[vae-decode] {type(vae).__name__} {w_lat * 8}x{h_lat * 8} | "
+            f"need {need / _GB:.2f} GB ({bytes_per_px / 1024:.1f} KB/px) | "
+            f"free {free_bytes / _GB:.2f} GB → budget {budget / _GB:.2f} GB "
+            f"(×{_DECODE_FREE_VRAM_MARGIN:g}) | {'untiled' if fits else 'TILED'}",
+            flush=True,
+        )
+    return fits
 
 
 __all__ = ["DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last"]

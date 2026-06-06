@@ -165,8 +165,12 @@ tile regardless of output resolution.
 - **Blend the overlaps** with a linear (or raised-cosine) ramp so seams vanish.
   A hard cut leaves visible grid lines; the ramp is what makes tiling acceptable.
 - Trigger automatically when `vae_tile` is set, or when `can_decode_untiled` (a
-  free-VRAM check using `torch.cuda.mem_get_info` against per-family activation
-  estimates) reports that an untiled decode won't fit at decode time.
+  free-VRAM check that `torch.cuda.empty_cache()`-reclaims the caching allocator,
+  then compares `torch.cuda.mem_get_info` against per-family activation estimates)
+  reports that an untiled decode won't fit at decode time. The reclaim matters:
+  after a sampling loop with the backbone resident, torch holds GBs of freed-but-
+  cached blocks that `mem_get_info` counts as used — skipping it understates free
+  VRAM and over-tiles (e.g. Anima at ≤1024²).
 
 Put this as a function in `runtime/` (e.g. `tiled_vae_decode(vae, latent, tile,
 overlap)`) and have the pipeline call it instead of `vae.decode` when the policy
