@@ -123,6 +123,19 @@ def test_flux2_unpatchify_inverts_reference_patchify():
     assert torch.allclose(back, z, atol=1e-6)
 
 
+def test_flux2_patchify_latents_round_trips():
+    """The img2img encode-side bridge inverts the t2i decode-side one exactly."""
+    from diffucore.pipelines._flux import (
+        _flux2_patchify_latents,
+        _flux2_unpatchify_latents,
+    )
+    torch.manual_seed(0)
+    z = torch.randn(2, 128, 5, 7)  # DiT-space latent (128-ch)
+    rt = _flux2_patchify_latents(_flux2_unpatchify_latents(z))
+    assert tuple(rt.shape) == (2, 128, 5, 7)
+    assert torch.equal(rt, z)
+
+
 def test_lift_quant_convs_promotes_flux2_nested_keys():
     from diffucore.bundle import _lift_quant_convs
     sd = {

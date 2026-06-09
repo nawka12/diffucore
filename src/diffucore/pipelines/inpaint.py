@@ -72,6 +72,19 @@ class Inpaint(_Pipeline):
                 progress_callback=progress_callback, preview_callback=preview_callback,
                 return_info=return_info,
             )
+        if self.model.spec.architecture in ("flux1", "flux2"):
+            # FLUX is guidance-distilled: cfg_scale is the distilled guidance.
+            from ._flux import flux_img2img
+            return flux_img2img(
+                self.model, prompt, init_image, negative_prompt,
+                mask_image=mask_image,
+                strength=strength, steps=steps, guidance=cfg_scale,
+                width=width or self.model.spec.image_size,
+                height=height or self.model.spec.image_size,
+                sampler=sampler, scheduler=scheduler, seed=seed,
+                progress_callback=progress_callback, preview_callback=preview_callback,
+                return_info=return_info,
+            )
         model = self.model
         policy = self._policy()
         device, compute_dtype = policy.device, policy.compute_dtype

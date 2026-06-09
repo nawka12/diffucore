@@ -31,8 +31,9 @@ image.save("fox.png")
   **FLUX** family (FLUX.1 dev/schnell, FLUX.2 Klein/Dev). Load any of them, drive
   them all the same way. (FLUX.1 schnell and FLUX.2 Klein-4B run on real weights;
   the dev / Dev variants are build-to-spec — see [Status](#status).)
-- **Text-to-image, image-to-image, and inpainting** — SD/SDXL do all three;
-  Anima and FLUX are text-to-image only.
+- **Text-to-image, image-to-image, and inpainting** — all four architectures do
+  all three. Anima and FLUX use soft, latent-mask inpainting (no dedicated
+  inpaint model), so masked edits follow the base model's denoise.
 - **Long prompt weighting (LPW) on SDXL** — A1111-style attention syntax
   (`(word:1.3)`, `(word)`, `[word]`) and prompts beyond CLIP's 77-token limit.
 - **Checkpoint types auto-detected** — epsilon and v-prediction, with
@@ -250,9 +251,11 @@ near-optimal. See [Performance](#performance).
 |---|---|---|---|
 | Stable Diffusion 1.5 | 512² | t2i · img2img · inpaint | eps + v-pred, ZTSNR |
 | SDXL | 1024² | t2i · img2img · inpaint | dual text encoders, eps + v-pred, ZTSNR |
-| Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i | flow-matching, Qwen3 + Qwen-Image VAE |
-| FLUX.1 (dev / schnell) | 1024² | t2i | flow-matching MMDiT, T5-XXL + CLIP-L † |
-| FLUX.2 (Klein / Dev) | 1024² | t2i | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev) † |
+| Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i · img2img · inpaint ‡ | flow-matching, Qwen3 + Qwen-Image VAE |
+| FLUX.1 (dev / schnell) | 1024² | t2i · img2img · inpaint ‡ | flow-matching MMDiT, T5-XXL + CLIP-L † |
+| FLUX.2 (Klein / Dev) | 1024² | t2i · img2img · inpaint ‡ | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev) † |
+
+‡ Soft, latent-mask inpaint (no dedicated inpaint model).
 
 LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima.
 

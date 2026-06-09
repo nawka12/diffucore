@@ -175,7 +175,9 @@ The remaining extensions (each its own slice):
     FLUX checkpoint here automatically.
   - **What to confirm on real weights** — the FLUX.2 VAE key layout (assumed
     LDM-style, mid-only attention), Qwen3/Mistral padding+mask handling, and the
-    exact guidance/shift defaults. FLUX is text-to-image only in this build.
+    exact guidance/shift defaults. FLUX now supports img2img + soft (latent-mask)
+    inpaint via `flux_img2img`, mirroring the Anima flow path; a dedicated inpaint
+    model (FLUX.1 Fill) is not implemented.
 - **LoRA / LoKr application — done.** `apply_lora(bundle, path, multiplier)`
   fuses adapter weight deltas into the loaded modules in place (no forward
   wrapping, so offload and the sampling path are untouched). Covers two
