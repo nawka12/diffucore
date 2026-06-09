@@ -39,14 +39,15 @@ from ..sampling import (
 # Samplers Anima can drive (all routed through a CONST x0 denoiser closure).
 # The stochastic, flow-aware ones additionally take ``model_type``/``shift``.
 _ANIMA_SAMPLERS = {
-    "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
-    "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
-    "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
-    "gradient_estimation", "lms", "lcm", "secant",
+    "euler", "heun", "heunpp2", "euler_ancestral", "euler_ancestral_anneal", "er_sde",
+    "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
+    "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
+    "res_multistep_ancestral", "gradient_estimation", "lms", "lcm", "secant",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
-    "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
+    "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "dpmpp_2s_ancestral",
+    "res_multistep_ancestral", "lcm",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.

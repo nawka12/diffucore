@@ -33,6 +33,7 @@ __all__ = [
     "sample_heun",
     "sample_heunpp2",
     "sample_euler_ancestral",
+    "sample_euler_ancestral_anneal",
     "sample_er_sde",
     "sample_dpm_2",
     "sample_dpm_2_ancestral",
@@ -198,6 +199,49 @@ def sample_euler_ancestral(
             x = x + d * (sigma_down - sigma)
             if bool(sigma_up > 0) and s_noise > 0:
                 x = x + _noise_like(x, generator) * s_noise * sigma_up
+    return x
+
+
+def sample_euler_ancestral_anneal(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "flow",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """Euler-ancestral with a σ-annealed ``eta`` (rectified-flow only).
+
+    Identical to :func:`sample_euler_ancestral`'s ``flow`` branch, but the
+    ancestral noise fraction is ``eta_i = eta_max·σ_i`` rather than a constant
+    ``eta``: near-full ancestral re-noise at high σ (a stochastic burn-in that
+    lets an imperfect / merged velocity field average out its inconsistencies)
+    tapering to a near-deterministic step as σ→0 (so low-σ detail isn't washed
+    out, the failure mode of constant ``eta=1``). Pairs with a high-σ-dense
+    schedule (e.g. ``linear_quadratic``) on rectified-flow merges. ``shift`` is
+    accepted for kwarg uniformity (unused; σ_max == 1 needs no first-σ offset)."""
+    if model_type != "flow":
+        raise ValueError("euler_ancestral_anneal is rectified-flow only (model_type='flow')")
+    del shift
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+            continue
+        eta = eta_max * float(sigma.clamp(max=1.0))
+        sigma_down, alpha_next, alpha_down, renoise_coeff = _rf_ancestral_step(sigma, sigma_next, eta)
+        ratio = sigma_down / sigma
+        x = ratio * x + (1.0 - ratio) * denoised
+        if eta > 0 and s_noise > 0:
+            x = (alpha_next / alpha_down) * x + _noise_like(x, generator) * s_noise * renoise_coeff
     return x
 
 
@@ -1039,6 +1083,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "heun": sample_heun,
     "heunpp2": sample_heunpp2,
     "euler_ancestral": sample_euler_ancestral,
+    "euler_ancestral_anneal": sample_euler_ancestral_anneal,
     "er_sde": sample_er_sde,
     "dpm_2": sample_dpm_2,
     "dpm_2_ancestral": sample_dpm_2_ancestral,
