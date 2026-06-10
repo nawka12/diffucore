@@ -137,10 +137,47 @@ def test_smoothstep_endpoints_descent_and_u_shape():
     assert sig[-2].item() < 0.02
 
 
+def test_beta_endpoints_descent_and_u_shape():
+    sig = S.beta_schedule(_flow_view(), 28)
+    assert sig.shape[0] == 29
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] > sig[1:])
+    assert abs(sig[0].item() - 1.0) < 1e-6             # σ(t=1) == 1: pure-noise init
+    # last nonzero sigma is the table floor σ(1/1000), like the table walks
+    view = _flow_view()
+    assert abs(sig[-2].item() - float(view.sigma_min)) < 1e-4
+    # U-shaped in t: quantiles cluster at both t ends, so the first σ gaps and
+    # the last nonzero gaps are small relative to the mid-schedule maximum (the
+    # low-σ end less so — the shift=3 map expands σ near t=0 by ~shift×).
+    gaps = sig[:-2] - sig[1:-1]                        # exclude the final →0 jump
+    assert gaps[0] < gaps.max() / 4
+    assert gaps[-1] < gaps.max() / 2
+
+
+def test_beta_inv_cdf_against_scipy():
+    import pytest
+
+    scipy_stats = pytest.importorskip("scipy.stats")
+    q = torch.linspace(0.0, 1.0, 101, dtype=torch.float64)
+    for a, b in ((0.6, 0.6), (0.5, 0.7), (2.0, 2.0)):
+        ours = S._beta_inv_cdf(q, a, b)
+        ref = torch.tensor(scipy_stats.beta.ppf(q.numpy(), a, b))
+        assert (ours - ref).abs().max().item() < 1e-4, (a, b)
+
+
+def test_beta_invalid_args_raise():
+    import pytest
+
+    with pytest.raises(ValueError):
+        S.beta_schedule(_flow_view(), 0)
+    with pytest.raises(ValueError):
+        S.beta_schedule(_flow_view(), 10, alpha=0.0)
+
+
 def test_flow_table_schedule_dispatches_all_names():
     # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
-    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic", "smoothstep", "kl_optimal"):
+    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic", "smoothstep", "beta", "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name

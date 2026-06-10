@@ -46,12 +46,15 @@ image = TextToImage(model)(
   `dpm_2_ancestral`, `dpmpp_2s_ancestral`, `dpmpp_2m`, `dpmpp_2m_sde`,
   `dpmpp_2m_sde_heun`, `dpmpp_sde`, `dpmpp_3m_sde`, `ipndm`, `ipndm_v`,
   `res_multistep`, `res_multistep_ancestral`, `gradient_estimation`, `lms`,
-  `er_sde`, `lcm`, `secant`, plus `ddpm` (SD/SDXL only — a VP/VE sampler).
+  `er_sde`, `lcm`, `secant`, plus `ddpm` (SD/SDXL only — a VP/VE sampler) and
+  `secant_anneal` (Anima only — σ-annealed ancestral burn-in at high σ handing
+  off to `secant`'s 2nd-order x0 refinement as σ→0; spans `euler_ancestral_anneal`
+  at `curvature=0` and deterministic `secant` at `eta_max=0`).
   Ancestral samplers are rectified-flow-aware on Anima/FLUX.
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
   `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
   (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`, `simple`,
-  `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep` (Anima); `flux` (default), `flow`,
+  `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep`, `beta` (Anima); `flux` (default), `flow`,
   `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
   `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
   pipelines' σ_max = 1 init assumes).
@@ -62,6 +65,9 @@ image = TextToImage(model)(
   panel (or headless via `calibrate_oss.py`), once per steps/resolution/shift.
   `smoothstep` (Anima) is U-shaped — dense near σ = 1 *and* σ = 0 — designed
   to pair with `euler_ancestral_anneal` on rectified-flow merges.
+  `beta` (Anima) places timesteps at Beta(0.6, 0.6) quantiles before the flow
+  shift map — a tunable U-shape (the ComfyUI `beta` schedule, pure-torch) that
+  the community favors with DPM++-family samplers.
 
 ### Anima (DiT)
 

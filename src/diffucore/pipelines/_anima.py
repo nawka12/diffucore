@@ -42,18 +42,18 @@ _ANIMA_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "euler_ancestral_anneal", "er_sde",
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
-    "res_multistep_ancestral", "gradient_estimation", "lms", "lcm", "secant",
+    "res_multistep_ancestral", "gradient_estimation", "lms", "lcm", "secant", "secant_anneal",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
-    "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "dpmpp_2s_ancestral",
-    "res_multistep_ancestral", "lcm",
+    "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
+    "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
-    "normal", "kl_optimal", "linear_quadratic", "smoothstep",
+    "normal", "kl_optimal", "linear_quadratic", "smoothstep", "beta",
 )
 
 if TYPE_CHECKING:
@@ -198,7 +198,7 @@ def anima_text_to_image(
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
                     kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
-                if sampler == "secant":
+                if sampler in ("secant", "secant_anneal"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
@@ -335,7 +335,7 @@ def anima_img2img(
             kwargs = {}
             if sampler in _FLOW_AWARE_SAMPLERS:
                 kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
-            if sampler == "secant":
+            if sampler in ("secant", "secant_anneal"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:

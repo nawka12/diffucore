@@ -30,6 +30,7 @@ __all__ = [
     "ddim_uniform_schedule",
     "linear_quadratic_schedule",
     "smoothstep_schedule",
+    "beta_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
 ]
@@ -321,6 +322,57 @@ def smoothstep_schedule(schedule, steps: int, *, device: torch.device | str = "c
     return append_zero(sigmas)
 
 
+def _beta_inv_cdf(q: torch.Tensor, alpha: float, beta: float, *, grid: int = 4096) -> torch.Tensor:
+    """Inverse regularized incomplete beta function (the Beta(α, β) quantile
+    function), in pure torch.
+
+    The CDF is built by midpoint-rule integration of the unnormalized density
+    ``x^(α−1)·(1−x)^(β−1)`` on a uniform grid (midpoints avoid evaluating the
+    α, β < 1 endpoint singularities; the two edge cells, where the midpoint
+    rule is poorest, use the exact leading-order masses ``h^α/α`` and
+    ``h^β/β``), then inverted by linear interpolation. Accurate to ~1e-5 —
+    far below the σ resolution any schedule needs — without a scipy
+    dependency. ``q`` is float64-promoted."""
+    edges = torch.linspace(0.0, 1.0, grid + 1, dtype=torch.float64)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    pdf = centers ** (alpha - 1.0) * (1.0 - centers) ** (beta - 1.0)
+    h = 1.0 / grid
+    pdf[0] = h ** alpha / alpha / h          # exact ∫₀ʰ x^(α−1) dx, as a cell mean
+    pdf[-1] = h ** beta / beta / h           # exact ∫₁₋ₕ¹ (1−x)^(β−1) dx
+    cdf = torch.cat([torch.zeros(1, dtype=torch.float64), pdf.cumsum(0)])
+    cdf = cdf / cdf[-1].clone()
+    q = q.to(torch.float64).clamp(0.0, 1.0)
+    idx = torch.searchsorted(cdf, q).clamp(1, grid)
+    c0, c1 = cdf[idx - 1], cdf[idx]
+    w = ((q - c0) / (c1 - c0).clamp_min(1e-300)).clamp(0.0, 1.0)
+    return edges[idx - 1] + w * (edges[idx] - edges[idx - 1])
+
+
+def beta_schedule(schedule, steps: int, *, alpha: float = 0.6, beta: float = 0.6,
+                  device: torch.device | str = "cpu",
+                  dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Beta-quantile schedule (ComfyUI's ``beta``; cf. Lee et al.,
+    "Beta Sampling is All You Need", arXiv:2407.12173).
+
+    Timesteps are placed at the quantiles of a Beta(α, β) distribution —
+    ``t_i = 1 − BetaInvCDF(i/(n−1))`` — then mapped through the model's σ(t)
+    (the shift map for rectified flow). With the α = β = 0.6 default the
+    density is U-shaped in *t*: dense near t = 1 (σ = 1, global composition)
+    and near t = 0 (fine detail), sparser in the middle. Unlike
+    :func:`smoothstep_schedule` (a fixed easing), the endpoint emphasis is
+    tunable via α (low-t end) and β (high-t end). The first sigma is exactly
+    ``σ(1)`` (1.0 for flow — the pure-noise init) and the last nonzero sigma is
+    the table floor ``σ(1/multiplier)``; a trailing 0 is appended."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if alpha <= 0 or beta <= 0:
+        raise ValueError("alpha and beta must be > 0")
+    q = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    t = (1.0 - _beta_inv_cdf(q, alpha, beta)).clamp(min=1.0 / schedule.multiplier)
+    sigmas = schedule.t_to_sigma(t.to(torch.float32) * schedule.multiplier).to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
 # Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
 # / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
 # routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
@@ -332,6 +384,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "normal": normal_schedule,
     "linear_quadratic": linear_quadratic_schedule,
     "smoothstep": smoothstep_schedule,
+    "beta": beta_schedule,
 }
 
 
@@ -340,8 +393,8 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Build a flow sigma schedule for the table/timestep-based schedulers by
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
-    model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``linear_quadratic``
-    and ``kl_optimal``."""
+    model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``linear_quadratic``,
+    ``smoothstep``, ``beta`` and ``kl_optimal``."""
     view = FlowSamplingView(shift, device=device, dtype=dtype)
     if scheduler == "kl_optimal":
         return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),

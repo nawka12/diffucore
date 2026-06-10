@@ -14,6 +14,7 @@ from .schedules import (
     ddim_uniform_schedule,
     linear_quadratic_schedule,
     smoothstep_schedule,
+    beta_schedule,
     flow_table_schedule,
     FlowSamplingView,
 )
@@ -56,6 +57,7 @@ from .samplers import (
     sample_lcm,
     sample_ddpm,
     sample_secant,
+    sample_secant_anneal,
     get_sampler,
     SAMPLERS,
 )
@@ -74,6 +76,7 @@ __all__ = [
     "ddim_uniform_schedule",
     "linear_quadratic_schedule",
     "smoothstep_schedule",
+    "beta_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
     "optimal_step_schedule",
@@ -112,6 +115,7 @@ __all__ = [
     "sample_lcm",
     "sample_ddpm",
     "sample_secant",
+    "sample_secant_anneal",
     "get_sampler",
     "SAMPLERS",
 ]

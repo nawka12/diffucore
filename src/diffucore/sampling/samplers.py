@@ -51,6 +51,7 @@ __all__ = [
     "sample_lcm",
     "sample_ddpm",
     "sample_secant",
+    "sample_secant_anneal",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -675,6 +676,82 @@ def sample_secant(
     return x
 
 
+def sample_secant_anneal(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    curvature: float = 0.25,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "flow",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """SECANT-ANNEAL: σ-annealed ancestral burn-in handing off to a 2nd-order
+    x0-secant refinement (rectified-flow only).
+
+    A union of this repo's two flow samplers, split by σ because their useful
+    ranges are complementary. Each step is built from:
+
+      1. σ-annealed ancestral re-noise (:func:`sample_euler_ancestral_anneal`):
+         the ancestral fraction is ``eta_i = eta_max·σ_i``, so high-σ steps get a
+         near-full stochastic burn-in that lets an imperfect / merged velocity
+         field average out its inconsistencies, tapering to deterministic as σ→0.
+      2. A 2nd-order x0-secant correction (:func:`sample_secant`): the
+         deterministic core extrapolates the x0 estimate along the secant through
+         the previous and current x0 (toward ``σ_down``), blended in by
+         ``beta = curvature·(1−r)·(1−σ)`` so it only acts at low σ, where x0 is
+         reliable and detail refinement matters.
+
+    The two are anti-correlated by construction — ``eta`` is large exactly where
+    ``beta≈0`` and vice-versa — so high σ behaves like ``euler_ancestral_anneal``
+    and low σ like deterministic ``secant``, with a smooth handoff between. The
+    hybrid is an exact generalization of both: ``curvature=0`` recovers
+    ``euler_ancestral_anneal``; ``eta_max=0`` recovers deterministic ``secant``.
+    ``shift`` is accepted for kwarg uniformity (unused; σ_max == 1 needs no
+    first-σ offset)."""
+    if model_type != "flow":
+        raise ValueError("secant_anneal is rectified-flow only (model_type='flow')")
+    del shift
+    s_in = x.new_ones([x.shape[0]])
+    old_x0 = None
+    old_sigma = None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            eta = eta_max * float(sigma.clamp(max=1.0))
+            sigma_down, alpha_next, alpha_down, renoise_coeff = _rf_ancestral_step(sigma, sigma_next, eta)
+            d = to_d(x, sigma * s_in, denoised)
+            # x0 for the deterministic core: hold it fixed (⇒ Euler-equivalent
+            # reconstruction) unless a usable secant exists, then extrapolate it
+            # toward σ_down, gated to trust only low σ (the SECANT correction).
+            if old_x0 is None or bool((sigma - old_sigma).abs() < 1e-8):
+                x0_eff = denoised
+            else:
+                x0_slope = (denoised - old_x0) / (sigma - old_sigma)
+                x0_pred = denoised + x0_slope * (sigma_down - sigma)
+                r = ((sigma_down - sigma).abs() / sigma).clamp(0.0, 1.0)
+                reliable = (1.0 - sigma).clamp(0.0, 1.0)
+                beta = float(curvature) * (1.0 - r) * reliable
+                x0_eff = (1.0 - beta) * denoised + beta * x0_pred
+            # Deterministic rectified-flow reconstruct to σ_down holding ε fixed
+            # (ε = x + (1−σ)·d), then the annealed ancestral re-noise to σ_next.
+            eps_i = x + (1.0 - sigma) * d
+            x = (1.0 - sigma_down) * x0_eff + sigma_down * eps_i
+            if eta > 0 and s_noise > 0:
+                x = (alpha_next / alpha_down) * x + _noise_like(x, generator) * s_noise * renoise_coeff
+        old_x0 = denoised
+        old_sigma = sigma
+    return x
+
+
 def sample_heunpp2(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None) -> torch.Tensor:
     """Heun++ — a higher-order Heun that, away from the schedule endpoint, takes a
     third evaluation and blends the three derivatives with sigma-proportional
@@ -1102,6 +1179,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "lcm": sample_lcm,
     "ddpm": sample_ddpm,
     "secant": sample_secant,
+    "secant_anneal": sample_secant_anneal,
 }
 
 
