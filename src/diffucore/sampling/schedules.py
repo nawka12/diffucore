@@ -29,6 +29,7 @@ __all__ = [
     "normal_schedule",
     "ddim_uniform_schedule",
     "linear_quadratic_schedule",
+    "smoothstep_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
 ]
@@ -299,6 +300,27 @@ def linear_quadratic_schedule(schedule, steps: int, *, threshold_noise: float = 
     return torch.tensor(normalized, device=device, dtype=dtype) * sigma_max
 
 
+def smoothstep_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """U-shaped (endpoint-dense) flow schedule: smoothstep-eased ``t`` mapped
+    through the model's shift.
+
+    ``t`` is warped by ``u = t²·(3 − 2t)`` (the smoothstep polynomial, whose
+    derivative vanishes at both ends) before the rectified-flow σ(t) map, so
+    steps cluster near σ = 1 *and* near σ = 0 with a sparser middle — unlike
+    ``linear_quadratic``, which spends its density budget at σ ≈ 1 only and
+    ends on a large final jump. Designed to pair with σ-annealed ancestral
+    samplers (``euler_ancestral_anneal``): the dense high-σ region feeds the
+    stochastic burn-in, the dense low-σ tail feeds the near-deterministic
+    detail refinement. Returns ``steps + 1`` descending sigmas ending at 0."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    t = torch.arange(steps, 0, -1, device=device, dtype=torch.float32) / steps
+    u = t * t * (3.0 - 2.0 * t)
+    sigmas = schedule.t_to_sigma(u * schedule.multiplier).to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
 # Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
 # / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
 # routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
@@ -309,6 +331,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "simple": simple_schedule,
     "normal": normal_schedule,
     "linear_quadratic": linear_quadratic_schedule,
+    "smoothstep": smoothstep_schedule,
 }
 
 

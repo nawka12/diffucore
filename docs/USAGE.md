@@ -51,7 +51,7 @@ image = TextToImage(model)(
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
   `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
   (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`, `simple`,
-  `normal`, `kl_optimal`, `linear_quadratic` (Anima); `flux` (default), `flow`,
+  `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep` (Anima); `flux` (default), `flow`,
   `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
   `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
   pipelines' σ_max = 1 init assumes).
@@ -60,6 +60,8 @@ image = TextToImage(model)(
   no shift control, so plain `flow` always runs shift=3.0). `oss` is a
   pre-calibrated optimal-stepsize schedule — calibrate it from the UI's OSS
   panel (or headless via `calibrate_oss.py`), once per steps/resolution/shift.
+  `smoothstep` (Anima) is U-shaped — dense near σ = 1 *and* σ = 0 — designed
+  to pair with `euler_ancestral_anneal` on rectified-flow merges.
 
 ### Anima (DiT)
 

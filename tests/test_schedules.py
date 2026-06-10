@@ -121,10 +121,26 @@ def test_linear_quadratic_endpoints_and_descent():
     assert abs(sig[0].item() - 1.0) < 1e-6             # starts at σ_max (==1 for flow)
 
 
+def test_smoothstep_endpoints_descent_and_u_shape():
+    sig = S.smoothstep_schedule(_flow_view(), 28)
+    assert sig.shape[0] == 29
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] > sig[1:])
+    assert abs(sig[0].item() - 1.0) < 1e-6             # starts at σ_max (==1 for flow)
+    # U-shaped density: steps cluster at BOTH ends — the first and last σ gaps
+    # are smaller than the largest mid-schedule gap (the low-σ end less so,
+    # since the shift=3 map trades some low-σ density for the high end).
+    gaps = sig[:-2] - sig[1:-1]                        # exclude the final →0 jump
+    assert gaps[0] < gaps.max() / 10
+    assert gaps[-1] < gaps.max() / 2
+    # ...and the low-σ tail is dense, unlike linear_quadratic's big final jump.
+    assert sig[-2].item() < 0.02
+
+
 def test_flow_table_schedule_dispatches_all_names():
     # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
-    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic", "kl_optimal"):
+    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic", "smoothstep", "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name

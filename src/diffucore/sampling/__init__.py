@@ -13,6 +13,7 @@ from .schedules import (
     normal_schedule,
     ddim_uniform_schedule,
     linear_quadratic_schedule,
+    smoothstep_schedule,
     flow_table_schedule,
     FlowSamplingView,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "normal_schedule",
     "ddim_uniform_schedule",
     "linear_quadratic_schedule",
+    "smoothstep_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
     "optimal_step_schedule",
