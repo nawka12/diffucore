@@ -107,12 +107,12 @@ def pipe():
     return TextToImage(bundle)
 
 
-def _gen(pipe, *, seed: int, prompt: str = "a fox in a forest", steps: int = 2):
+def _gen(pipe, *, seed: int, prompt: str = "a fox in a forest", steps: int = 2, **kw):
     return pipe(
         prompt, negative_prompt="blurry",
         steps=steps, cfg_scale=4.0,
         width=128, height=128,
-        seed=seed,
+        seed=seed, **kw,
     )
 
 
@@ -134,6 +134,20 @@ def test_anima_seed_reproducible(pipe):
     c = np.asarray(_gen(pipe, seed=456))
     assert np.array_equal(a, b), "same seed must yield identical pixels"
     assert not np.array_equal(a, c), "different seed must yield different pixels"
+
+
+def test_anima_scheduler_choice_changes_output(pipe):
+    """Regression: the t2i wrapper coerced any scheduler outside a stale
+    hardcoded allowlist to "flow", silently ignoring the selection (normal,
+    kl_optimal, linear_quadratic, smoothstep all ran as "flow"). Same seed
+    with different schedulers must produce different pixels. steps=3 because
+    at steps=2 smoothstep's σ run coincides with flow's by construction."""
+    flow = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="flow"))
+    lq = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="linear_quadratic"))
+    ss = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="smoothstep"))
+    assert not np.array_equal(flow, lq)
+    assert not np.array_equal(flow, ss)
+    assert not np.array_equal(lq, ss)
 
 
 def test_anima_calibrate_oss_produces_valid_schedule(pipe):

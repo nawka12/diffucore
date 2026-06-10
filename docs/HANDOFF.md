@@ -298,6 +298,15 @@ Learned while expanding the sampler / scheduler set (`samplers.py`, `schedules.p
   object. For Anima (no discrete table) a `FlowSamplingView` mirrors ComfyUI's
   `ModelSamplingDiscreteFlow` (a 1000-entry flow σ table + invertible timestep
   map). `_base._sigmas` dispatches these via `_SCHEDULE_FROM_MODEL`.
+- **Coerce schedulers against the pipeline's canonical set, never a local copy.**
+  The t2i wrapper (`text_to_image.py`) kept its own hardcoded Anima scheduler
+  tuple that predated the scheduler expansion, so `normal` / `kl_optimal` /
+  `linear_quadratic` / `smoothstep` were silently coerced to `"flow"` in t2i —
+  every scheduler A/B compared flow to flow (i2i/inpaint, which coerce against
+  `_ANIMA_SCHEDULERS`, were unaffected). Fixed to use `_ANIMA_SCHEDULERS`;
+  `test_anima_scheduler_choice_changes_output` (weights-gated) now asserts the
+  scheduler choice actually changes pixels. When comparing generations, hash the
+  images before judging differences by eye.
 - **SECANT is σ-space native, no λ mapping needed.** Where DPM++/ER-SDE all need
   the `_half_log_snr` + first-σ offset hack to handle Anima's bounded σ ∈ (0, 1],
   `sample_secant` operates in σ directly: it linearly extrapolates `x0` along the

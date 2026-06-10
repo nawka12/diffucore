@@ -18,7 +18,7 @@ import torch
 from PIL import Image
 
 from ..runtime import perf_context
-from ._anima import anima_text_to_image
+from ._anima import anima_text_to_image, _ANIMA_SCHEDULERS
 from ._flux import flux_text_to_image, _FLUX_SCHEDULERS
 from ._base import PipelineInfo, _Pipeline
 
@@ -49,7 +49,7 @@ class TextToImage(_Pipeline):
         if self.model.spec.architecture == "anima":
             # The default scheduler ("karras") and other SD-only schedules don't
             # apply to a flow model; fall back to the rectified-flow schedule.
-            anima_scheduler = scheduler if scheduler in ("flow", "flow_dyn", "oss", "sgm_uniform", "simple") else "flow"
+            anima_scheduler = scheduler if scheduler in _ANIMA_SCHEDULERS else "flow"
             return anima_text_to_image(
                 self.model, prompt, negative_prompt,
                 steps=steps, cfg_scale=cfg_scale, shift=shift,
