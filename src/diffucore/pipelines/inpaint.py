@@ -49,6 +49,8 @@ class Inpaint(_Pipeline):
         sampler: str = "euler",
         scheduler: str = "karras",
         seed: int | None = None,
+        teacache_thresh: float = 0.0,
+        teacache_coefficients: "list[float] | None" = None,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
@@ -69,6 +71,7 @@ class Inpaint(_Pipeline):
                 width=width or self.model.spec.image_size,
                 height=height or self.model.spec.image_size,
                 sampler=sampler, scheduler=scheduler, seed=seed,
+                teacache_thresh=teacache_thresh, teacache_coefficients=teacache_coefficients,
                 progress_callback=progress_callback, preview_callback=preview_callback,
                 return_info=return_info,
             )

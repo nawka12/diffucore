@@ -244,6 +244,19 @@ The remaining extensions (each its own slice):
   than ComfyUI's Brownian-tree noise — correct and seed-reproducible, but not
   bit-identical to a ComfyUI render, and avoiding a `torchsde` dependency.
   Sampler convergence (VE + flow) and the new schedules are unit-tested on CPU.
+- **TeaCache (Anima) — done.** Timestep-embedding-aware cache (Liu et al., 2024,
+  arXiv:2411.19108): on a step whose block-0 timestep-modulated input drifts
+  little from the last computed step, the 28-block stack is skipped and its cached
+  residual reused. One cache stream per CFG branch (cond/uncond are separate Anima
+  forwards). `teacache_thresh > 0` directly bounds the accumulated per-step rel-L1
+  between recomputes (identity rescale); the first step and any threshold-crossing
+  step always recompute, so `0` (off) is bit-exact to a plain run. An optional
+  `anima_calibrate_teacache` fits a per-architecture polynomial rescale, but it is
+  kept unwired — the UI exposes the raw threshold by design (direct speed/fidelity
+  knob). Verified on `anima-base-v1.0` (RTX 2060): with secant_anneal/beta/32 steps,
+  thresh 0.3 ≈ 4× fewer DiT-block evals at <1/255 mean pixel change; the fragile
+  case (dpmpp_2m/flow/25 steps) tolerates only ≤0.005. Skip/transparency logic
+  unit-tested on CPU (no checkpoint).
 
 ## Verification notes
 

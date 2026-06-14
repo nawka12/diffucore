@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -389,6 +389,19 @@ class _Block(nn.Module):
         x = x + ml_g.to(residual_dtype) * h
         return x
 
+    def modulated_self_attn_input(
+        self, x: torch.Tensor, emb: torch.Tensor, adaln_lora: torch.Tensor
+    ) -> torch.Tensor:
+        """The timestep-modulated tokens entering self-attention — TeaCache's
+        cheap proxy for "has the model's input changed". Reproduces exactly the
+        self-attn modulation from :meth:`forward` (adaLN affine over the
+        normalized tokens) without the attention/MLP that follow."""
+        sa = self.adaln_modulation_self_attn(emb) + adaln_lora
+        sa_s, sa_sc, _ = sa.chunk(3, dim=-1)
+        sa_s = rearrange(sa_s, "b t d -> b t 1 1 d")
+        sa_sc = rearrange(sa_sc, "b t d -> b t 1 1 d")
+        return self.layer_norm_self_attn(x) * (1 + sa_sc) + sa_s
+
 
 # --------------------------------------------------------------------------- #
 # final layer
@@ -422,6 +435,81 @@ class _FinalLayer(nn.Module):
         scale = rearrange(scale, "b t d -> b t 1 1 d")
         h = self.layer_norm(x) * (1 + scale) + shift
         return self.linear(h)
+
+
+# --------------------------------------------------------------------------- #
+# TeaCache
+# --------------------------------------------------------------------------- #
+
+class TeaCache:
+    """Timestep-Embedding-Aware Cache for one DiT denoising stream
+    (Liu et al., 2024, arXiv:2411.19108).
+
+    The transformer blocks are the bulk of a DiT forward, yet their output
+    changes slowly between adjacent timesteps. TeaCache caches the blocks'
+    *residual* (``stack(x) - x``) and, on a step where the timestep-modulated
+    input has drifted little from the last computed step, reuses that residual
+    instead of running the blocks — a ~28×-cheaper step.
+
+    "Little" is measured as the accumulated rescaled relative-L1 change of the
+    block-0 modulated input; once it crosses ``rel_l1_thresh`` a real recompute
+    is forced and the accumulator resets. Larger threshold = more skipped steps
+    = faster but lower fidelity.
+
+    One instance tracks one stream. Classifier-free guidance needs two (the
+    conditioned and unconditioned passes are separate Anima forwards whose
+    modulated inputs coincide, so a shared accumulator would read zero drift
+    between them).
+
+    ``coefficients`` are a polynomial (highest-degree first, ``numpy.poly1d``
+    convention) that rescales the raw relative-L1 into an output-change
+    estimate. They are model-specific and require offline calibration; Anima
+    has none published, so the default is the identity ``f(x) = x``.
+    """
+
+    def __init__(self, rel_l1_thresh: float, coefficients: Sequence[float] = (1.0, 0.0),
+                 *, record: bool = False):
+        self.rel_l1_thresh = float(rel_l1_thresh)
+        self.coefficients = tuple(float(c) for c in coefficients)
+        self.record = record
+        self.prev_modulated: Optional[torch.Tensor] = None
+        self.prev_residual: Optional[torch.Tensor] = None
+        self.accumulated = 0.0
+        self.calls = 0   # forwards seen
+        self.skips = 0   # forwards whose blocks were reused from cache
+        self.rel_history: list[float] = []   # raw per-step rel-L1 (record mode)
+
+    def _rescale(self, x: float) -> float:
+        out = 0.0
+        for c in self.coefficients:  # Horner, poly1d order (highest degree first)
+            out = out * x + c
+        return out
+
+    def should_compute(self, modulated: torch.Tensor) -> bool:
+        """Decide whether this step must run the blocks, and fold ``modulated``
+        into the accumulator. The first call (no history) always computes.
+
+        In ``record`` mode the accumulator/threshold are bypassed: every step
+        computes and the raw relative-L1 is logged to ``rel_history`` — that's
+        the ``x`` of the (input-drift -> output-drift) fit done by calibration.
+        """
+        self.calls += 1
+        if self.prev_modulated is None:
+            self.accumulated = 0.0
+            self.prev_modulated = modulated
+            return True
+        denom = self.prev_modulated.abs().mean().clamp_min(1e-8)
+        rel = ((modulated - self.prev_modulated).abs().mean() / denom).item()
+        self.prev_modulated = modulated
+        if self.record:
+            self.rel_history.append(rel)
+            return True
+        self.accumulated += self._rescale(rel)
+        if self.accumulated < self.rel_l1_thresh:
+            self.skips += 1
+            return False
+        self.accumulated = 0.0
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -481,6 +569,7 @@ class CosmosDiT(nn.Module):
         context: torch.Tensor,           # (B, L, crossattn_emb_channels)
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        teacache: Optional["TeaCache"] = None,
     ) -> torch.Tensor:
         orig_shape = list(x.shape)
         x = _pad_to_patch_size(x, (self.cfg.patch_temporal, self.cfg.patch_spatial, self.cfg.patch_spatial))
@@ -505,8 +594,21 @@ class CosmosDiT(nn.Module):
         if x_B_T_H_W_D.dtype == torch.float16:
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
-        for block in self.blocks:
-            x_B_T_H_W_D = block(x_B_T_H_W_D, emb_B_T_D, context, rope_emb, adaln_lora_B_T_3D)
+        # TeaCache: on a low-drift step, reuse the cached block residual instead
+        # of running the 28-block stack. The timestep embedding (above) and the
+        # final layer (below) are cheap and always run; only the blocks skip.
+        compute = teacache.should_compute(
+            self.blocks[0].modulated_self_attn_input(x_B_T_H_W_D, emb_B_T_D, adaln_lora_B_T_3D)
+        ) if teacache is not None else True
+
+        if not compute:
+            x_B_T_H_W_D = x_B_T_H_W_D + teacache.prev_residual
+        else:
+            residual_in = x_B_T_H_W_D
+            for block in self.blocks:
+                x_B_T_H_W_D = block(x_B_T_H_W_D, emb_B_T_D, context, rope_emb, adaln_lora_B_T_3D)
+            if teacache is not None:
+                teacache.prev_residual = x_B_T_H_W_D - residual_in
 
         out = self.final_layer(x_B_T_H_W_D.to(context.dtype), emb_B_T_D, adaln_lora_B_T_3D)
         out = self._unpatchify(out)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]
@@ -563,7 +665,8 @@ class AnimaDiT(CosmosDiT):
         t5xxl_weights: Optional[torch.Tensor] = None,
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        teacache: Optional["TeaCache"] = None,
     ) -> torch.Tensor:
         if t5xxl_ids is not None:
             context = self.preprocess_text_embeds(context, t5xxl_ids, t5xxl_weights=t5xxl_weights)
-        return super().forward(x, timesteps, context, fps=fps, padding_mask=padding_mask)
+        return super().forward(x, timesteps, context, fps=fps, padding_mask=padding_mask, teacache=teacache)

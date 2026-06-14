@@ -221,6 +221,16 @@ O(tokens²), blowing the budget; use `compile=True` alone. `channels_last` /
 `compile` help most on Ampere+; on Turing the cuDNN NCHW path is already
 near-optimal. See [Performance](#performance).
 
+**TeaCache (Anima, opt-in).** Pass `teacache_thresh > 0` to any Anima pipeline
+(`TextToImage` / `ImageToImage` / `Inpaint`) to skip the 28-block transformer on
+steps whose timestep-modulated input drifts little from the last computed step,
+reusing the cached block residual (Liu et al., 2024). The threshold directly
+bounds the accumulated per-step change between recomputes — higher = more skipping
+= faster but lower fidelity; `0` (default) is off and bit-exact to a plain run.
+The safe value depends on sampler and step count: high step counts with
+single-step / secant-family samplers stay near-lossless to ~0.3–0.5, while
+few-step multistep samplers (`dpmpp_2m`) need ≤0.01. Tune by eye — start low.
+
 ## Supported models
 
 | Family | Native res | Modes | Notes |

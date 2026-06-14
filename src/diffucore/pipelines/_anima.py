@@ -19,12 +19,13 @@ backbone in an adapter.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
 import torch
 from PIL import Image
 
+from ..models.anima_dit import TeaCache
 from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
 from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
@@ -74,6 +75,17 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(img[0].permute(1, 2, 0).cpu().numpy())
 
 
+def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float):
+    """Build the per-CFG-branch TeaCache streams (or ``(None, None)`` when off).
+    The uncond stream is omitted when CFG is disabled (single forward per step)."""
+    if thresh <= 0:
+        return None, None
+    args = (thresh,) if coeffs is None else (thresh, coeffs)
+    cond = TeaCache(*args)
+    uncond = TeaCache(*args) if cfg_scale != 1.0 else None
+    return cond, uncond
+
+
 def anima_text_to_image(
     model: "ModelBundle",
     prompt: str,
@@ -89,6 +101,8 @@ def anima_text_to_image(
     scheduler: str = "flow",
     curvature: float = 0.25,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
+    teacache_thresh: float = 0.0,
+    teacache_coefficients: "Sequence[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -107,6 +121,12 @@ def anima_text_to_image(
     count, ignoring the passed-in ``shift``), ``"oss"`` (a pre-calibrated
     optimal-stepsize schedule supplied via ``oss_sigmas``), ``"sgm_uniform"`` or
     ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
+
+    ``teacache_thresh`` > 0 enables TeaCache (arXiv:2411.19108): steps whose
+    accumulated rescaled relative-L1 drift stays under the threshold reuse the
+    cached transformer-block residual instead of recomputing it. Larger = more
+    skipping = faster but lower fidelity; 0 disables. Uncalibrated on Anima
+    (identity rescale), so tune the threshold empirically.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -159,6 +179,10 @@ def anima_text_to_image(
 
         # ---- 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
+        # TeaCache: one cache stream per CFG branch (cond/uncond are separate
+        # forwards whose modulated inputs coincide, so they can't share one).
+        # ``teacache_coefficients`` rescales the raw drift (identity if None).
+        tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
@@ -170,11 +194,11 @@ def anima_text_to_image(
                         x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
                         t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
-                        v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                        v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
                         if cfg_scale == 1.0:
                             v = v_cond
                         else:
-                            v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                            v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
                         # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
@@ -188,11 +212,11 @@ def anima_text_to_image(
                     CONST x0 estimate ``x − σ·v`` in fp32 for the solver math."""
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
-                    v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                    v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
                     if cfg_scale == 1.0:
                         v = v_cond
                     else:
-                        v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                        v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
                     return x_in.float() - sig * v.float()
@@ -237,6 +261,8 @@ def anima_img2img(
     seed: int | None = None,
     curvature: float = 0.25,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
+    teacache_thresh: float = 0.0,
+    teacache_coefficients: "Sequence[float] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -318,17 +344,19 @@ def anima_img2img(
 
         # ---- 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
+        # TeaCache: one cache stream per CFG branch (see anima_text_to_image).
+        tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
-                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
                 if cfg_scale == 1.0:
                     v = v_cond
                 else:
-                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 x0 = x_in.float() - sig * v.float()
@@ -432,3 +460,86 @@ def anima_calibrate_oss(
             )
 
     return [float(s) for s in sigmas.tolist()]
+
+
+def anima_calibrate_teacache(
+    model: "ModelBundle",
+    prompt: str,
+    negative_prompt: str = "",
+    *,
+    steps: int = 50,
+    width: int = 1024,
+    height: int = 1024,
+    shift: float = 3.0,
+    cfg_scale: float = 4.0,
+    seed: int = 0,
+    degree: int = 4,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[float]:
+    """Fit TeaCache rescaling coefficients for this Anima model (arXiv:2411.19108).
+
+    Runs one full euler trajectory and records, per step, the pair
+    ``(x = rel-L1 drift of the block-0 timestep-modulated input,
+       y = rel-L1 drift of the conditioned velocity output)`` — then least-squares
+    fits a degree-``degree`` polynomial ``y ≈ f(x)``. That polynomial is what
+    rescales raw input drift into an output-change estimate so the accumulated
+    threshold means the same thing across step counts and resolutions.
+
+    The fit is a property of the **architecture**, not the prompt/seed, so one
+    calibration transfers across Anima checkpoints and settings. Run at a high
+    ``steps`` (dense σ sampling) so the curve covers lower step counts too.
+    Returns coefficients highest-degree-first (``numpy.polyfit`` / ``poly1d``
+    order), ready to hand to :class:`~diffucore.models.anima_dit.TeaCache`.
+    """
+    if width % 16 or height % 16:
+        raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
+    if steps < degree + 2:
+        raise ValueError(f"steps ({steps}) too small to fit degree {degree}; use >= {degree + 2}")
+    policy = model.policy
+    device, dtype = policy.device, policy.compute_dtype
+
+    with perf_context(policy):
+        cond_tok = model.tokenizer(prompt)
+        uncond_tok = model.tokenizer(negative_prompt)
+        with staged([model.text_encoder], device, policy.offload_idle):
+            cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
+            uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
+        cond_t5 = cond_tok.t5_ids.to(device)
+        uncond_t5 = uncond_tok.t5_ids.to(device)
+
+        sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        h_lat, w_lat = height // 8, width // 8
+        gen = torch.Generator(device=device).manual_seed(seed)
+        x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
+
+        # Recording stream on the cond branch: never skips, logs raw input rel-L1.
+        tc_cond = TeaCache(0.0, record=True)
+        out_rel: list[float] = []   # y: rel-L1 drift of the cond velocity output
+        prev_v = None
+
+        backbone = model.backbone
+        with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+            total = len(sigmas) - 1
+            with _step_progress(total, progress_callback) as on_step:
+                for i in range(total):
+                    sigma, sigma_next = sigmas[i], sigmas[i + 1]
+                    x_5d = x.unsqueeze(2)
+                    t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
+                    v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
+                    if prev_v is not None:
+                        denom = prev_v.abs().mean().clamp_min(1e-8)
+                        out_rel.append(((v_cond - prev_v).abs().mean() / denom).item())
+                    prev_v = v_cond
+                    if cfg_scale == 1.0:
+                        v = v_cond
+                    else:
+                        v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                        v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                    x = x + (sigma_next - sigma).to(dtype) * v
+                    on_step(i, sigma, x, None)
+
+    # tc_cond.rel_history and out_rel are both step-2..N, so already aligned.
+    xs = np.asarray(tc_cond.rel_history, dtype=np.float64)
+    ys = np.asarray(out_rel, dtype=np.float64)
+    coeffs = np.polyfit(xs, ys, degree)
+    return [float(c) for c in coeffs]
