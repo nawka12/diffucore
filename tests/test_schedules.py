@@ -185,6 +185,24 @@ def test_flow_table_schedule_dispatches_all_names():
         assert abs(sig[0].item() - 1.0) < 1e-3, name   # flow init assumes σ_max == 1
 
 
+def test_flow_table_schedule_forwards_knobs():
+    # beta α/β and linear_quadratic threshold_noise must reach their schedulers;
+    # the defaults reproduce the no-knob call (so generation is unchanged when the
+    # settings panel is untouched), and a knob-agnostic scheduler ignores them.
+    base_beta = S.flow_table_schedule("beta", shift=3.0, steps=12)
+    assert torch.allclose(base_beta, S.flow_table_schedule("beta", shift=3.0, steps=12, alpha=0.6, beta=0.6))
+    assert not torch.allclose(base_beta, S.flow_table_schedule("beta", shift=3.0, steps=12, alpha=0.3, beta=0.9))
+
+    base_lq = S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12)
+    assert torch.allclose(base_lq, S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12, threshold_noise=0.025))
+    assert not torch.allclose(base_lq, S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12, threshold_noise=0.2))
+
+    assert torch.allclose(
+        S.flow_table_schedule("sgm_uniform", shift=3.0, steps=12),
+        S.flow_table_schedule("sgm_uniform", shift=3.0, steps=12, alpha=0.1, beta=0.9, threshold_noise=0.5),
+    )
+
+
 def test_flow_table_schedule_rejects_ddim_uniform():
     import pytest
 

@@ -389,12 +389,18 @@ _FLOW_TABLE_SCHEDULERS = {
 
 
 def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
+                        alpha: float = 0.6, beta: float = 0.6,
+                        threshold_noise: float = 0.025,
                         device: torch.device | str = "cpu",
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Build a flow sigma schedule for the table/timestep-based schedulers by
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
     model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``linear_quadratic``,
-    ``smoothstep``, ``beta`` and ``kl_optimal``."""
+    ``smoothstep``, ``beta`` and ``kl_optimal``.
+
+    ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint density;
+    ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee. Both
+    are ignored by the schedulers that don't take them."""
     view = FlowSamplingView(shift, device=device, dtype=dtype)
     if scheduler == "kl_optimal":
         return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),
@@ -403,4 +409,9 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
         fn = _FLOW_TABLE_SCHEDULERS[scheduler]
     except KeyError:
         raise ValueError(f"unknown flow table scheduler {scheduler!r}") from None
-    return fn(view, steps, device=device, dtype=dtype)
+    extra = {}
+    if scheduler == "beta":
+        extra = {"alpha": alpha, "beta": beta}
+    elif scheduler == "linear_quadratic":
+        extra = {"threshold_noise": threshold_noise}
+    return fn(view, steps, device=device, dtype=dtype, **extra)

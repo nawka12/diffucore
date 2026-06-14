@@ -100,6 +100,10 @@ def anima_text_to_image(
     sampler: str = "euler",
     scheduler: str = "flow",
     curvature: float = 0.25,
+    eta_max: float = 1.0,
+    beta_alpha: float = 0.6,
+    beta_beta: float = 0.6,
+    lq_threshold: float = 0.025,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
@@ -171,7 +175,9 @@ def anima_text_to_image(
             s = torch.as_tensor(oss_sigmas, device=device, dtype=torch.float32)
             sigmas = s if float(s[-1]) == 0.0 else append_zero(s)
         else:
-            sigmas = flow_table_schedule(scheduler, shift, steps, device=device, dtype=torch.float32)
+            sigmas = flow_table_schedule(scheduler, shift, steps, alpha=beta_alpha,
+                                         beta=beta_beta, threshold_noise=lq_threshold,
+                                         device=device, dtype=torch.float32)
         h_lat, w_lat = height // 8, width // 8
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
@@ -227,6 +233,8 @@ def anima_text_to_image(
                 if sampler in ("secant", "secant_anneal"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
+                if sampler in ("euler_ancestral_anneal", "secant_anneal"):
+                    kwargs["eta_max"] = eta_max
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
@@ -260,6 +268,10 @@ def anima_img2img(
     scheduler: str = "flow",
     seed: int | None = None,
     curvature: float = 0.25,
+    eta_max: float = 1.0,
+    beta_alpha: float = 0.6,
+    beta_beta: float = 0.6,
+    lq_threshold: float = 0.025,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
@@ -320,7 +332,9 @@ def anima_img2img(
             s = torch.as_tensor(oss_sigmas, device=device, dtype=torch.float32)
             sigmas = s if float(s[-1]) == 0.0 else append_zero(s)
         else:
-            sigmas = flow_table_schedule(scheduler, shift, sched_steps, device=device, dtype=torch.float32)
+            sigmas = flow_table_schedule(scheduler, shift, sched_steps, alpha=beta_alpha,
+                                         beta=beta_beta, threshold_noise=lq_threshold,
+                                         device=device, dtype=torch.float32)
 
         # ---- 3. encode init → DiT-space latent z0; build strength-noised start
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
@@ -370,6 +384,8 @@ def anima_img2img(
             if sampler in ("secant", "secant_anneal"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
+            if sampler in ("euler_ancestral_anneal", "secant_anneal"):
+                kwargs["eta_max"] = eta_max
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
