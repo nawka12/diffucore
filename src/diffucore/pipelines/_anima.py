@@ -159,7 +159,9 @@ def anima_text_to_image(
 
         # ---- 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
-        with torch.no_grad(), staged([backbone], device, policy.offload_unet):
+        # staged() OUTSIDE inference_mode: offloaded weights moved under inference
+        # mode become inference tensors that break later in-place LoRA (add_/copy_).
+        with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             if sampler == "euler":
                 total = len(sigmas) - 1
                 with _step_progress(total, progress_callback, preview_callback) as on_step:
@@ -316,7 +318,9 @@ def anima_img2img(
 
         # ---- 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
-        with torch.no_grad(), staged([backbone], device, policy.offload_unet):
+        # staged() OUTSIDE inference_mode: offloaded weights moved under inference
+        # mode become inference tensors that break later in-place LoRA (add_/copy_).
+        with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
@@ -407,7 +411,9 @@ def anima_calibrate_oss(
         candidate = flow_matching_schedule(grid, shift=shift, device=device, dtype=torch.float32)[:-1]
 
         backbone = model.backbone
-        with torch.no_grad(), staged([backbone], device, policy.offload_unet):
+        # staged() OUTSIDE inference_mode: offloaded weights moved under inference
+        # mode become inference tensors that break later in-place LoRA (add_/copy_).
+        with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)

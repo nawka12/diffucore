@@ -221,8 +221,11 @@ class _Pipeline:
         # step. Cheap one-shot reorder; semantically a no-op.
         if policy.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
-        with torch.no_grad():
-            with staged([self.model.backbone], policy.device, policy.offload_unet):
+        with staged([self.model.backbone], policy.device, policy.offload_unet):
+            # inference_mode INSIDE staged: weights move (.to) in normal mode so
+            # they stay normal tensors for later in-place LoRA; only the forward
+            # runs under inference_mode.
+            with torch.inference_mode():
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
 
