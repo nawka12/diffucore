@@ -34,12 +34,12 @@ class DevicePolicy:
       * ``"encoders"`` — keep the UNet resident; only park the ~2 GB of text
         encoders + VAE between stages. Frees most of the headroom for ~0 copy cost
         (the cheap 80/20 — see ``docs/RUNTIME_SPEC.md`` R4).
-      * ``"stream"`` — FLUX-only. Park the encoders + VAE like ``"encoders"``, and
-        additionally *stream the DiT blocks*: keep the small modules
-        (embedders / final layer) resident and shuttle each transformer block onto
-        the GPU just for its own forward. The only mode that fits the ~23 GB FLUX.1
-        transformer on a 24 GB card (whole-module staging OOMs — there's no room
-        for activations once the backbone is resident). See ``stream_blocks``.
+      * ``"stream"`` — park the encoders + VAE like ``"encoders"``, and additionally
+        *stream the backbone's blocks*: keep the small modules (embedders / final
+        layer) resident and shuttle each block onto the GPU just for its own
+        forward. Fits a backbone where whole-module staging OOMs — the ~23 GB
+        FLUX.1 transformer on a 24 GB card, and the SD/SDXL UNet or Anima DiT on
+        a ~4 GB card (the analog of ComfyUI's --lowvram). See ``stream_blocks``.
     """
 
     device: torch.device
@@ -98,8 +98,9 @@ class DevicePolicy:
 
     @property
     def offload_stream(self) -> bool:
-        """Stream the FLUX DiT blocks per-forward (see ``stream_blocks``). Distinct
-        from ``offload_unet``: the backbone is never moved as one ~23 GB blob."""
+        """Stream the backbone's blocks per-forward — the FLUX DiT, the SD/SDXL
+        UNet, or the Anima DiT (see ``stream_blocks``). Distinct from
+        ``offload_unet``: the backbone is never moved as one blob."""
         return self.offload == "stream"
 
     @classmethod
@@ -222,22 +223,32 @@ def on_device(module, device):
             torch.cuda.empty_cache()
 
 
-def stream_blocks(backbone, block_attrs, device, offload_device=_CPU):
-    """Per-block sequential offload for a block-list backbone (the FLUX DiT).
+def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_resident=()):
+    """Per-block sequential offload for a block-list backbone (FLUX DiT, SD/SDXL UNet, Anima DiT).
 
     Keeps every *non-block* submodule (img/txt projections, time/vector/guidance
     embedders, the final layer, shared modulators) resident on ``device``, parks
-    the heavy transformer blocks on ``offload_device``, and registers forward
-    hooks that bring each block onto ``device`` only for its own forward, then
-    move it back. Resident VRAM is the small modules plus at most one block —
-    enough to fit FLUX.1's ~23 GB transformer (57 blocks) on a 24 GB GPU, where
-    moving the whole module at once leaves no room for activations.
+    the heavy blocks on ``offload_device``, and registers forward hooks that bring
+    each block onto ``device`` only for its own forward, then move it back.
+    Resident VRAM is the small modules plus at most one block — enough to fit
+    FLUX.1's ~23 GB transformer (57 blocks) on a 24 GB GPU, or SDXL's ~2.6 GB
+    UNet (or Anima's ~4 GB DiT) on a 4 GB GPU, where moving the whole module at
+    once leaves no room for activations.
 
     Numerically transparent: relocating weights doesn't change results, and the
-    blocks run in the same order. ``block_attrs`` names the ``nn.ModuleList``
-    attributes to stream (``("double_blocks", "single_blocks")`` for FLUX).
-    Returns the number of streamed blocks.
+    blocks run in the same order. ``block_attrs`` names the attributes to stream;
+    each must be iterable of submodules — an ``nn.ModuleList``
+    (``("double_blocks", "single_blocks")`` for FLUX, ``("blocks",)`` for Anima)
+    or an ``nn.Sequential`` (the UNet's ``middle_block``, streamed at sub-layer
+    granularity, in ``("input_blocks", "middle_block", "output_blocks")``).
+
+    ``keep_resident`` is an iterable of block modules to leave resident on
+    ``device`` instead of streaming — for blocks whose weights are read outside
+    their own ``__call__`` (so the hooks wouldn't fire). Anima passes block 0,
+    which TeaCache probes via ``modulated_self_attn_input``. Returns the number
+    of *streamed* blocks (kept-resident ones are excluded).
     """
+    keep = {id(m) for m in keep_resident}
     for name, child in backbone.named_children():
         if name not in block_attrs:
             child.to(device)
@@ -251,6 +262,9 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU):
     n = 0
     for attr in block_attrs:
         for block in getattr(backbone, attr):
+            if id(block) in keep:
+                block.to(device)
+                continue
             block.to(offload_device)
             block.register_forward_pre_hook(pre)
             block.register_forward_hook(post)

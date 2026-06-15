@@ -24,7 +24,8 @@ supported models, and performance numbers. For install and status, see the
   SECANT, and more (full list under [Usage](#choosing-samplers--schedulers)). The
   DPM++, ER-SDE, and SECANT samplers are flow-aware, so they drive Anima too.
 - **Runs on modest GPUs** — sequential CPU offload + tiled VAE fit SDXL into
-  ~6.6 GB; FLUX.1's ~23 GB transformer streams block-by-block onto a 24 GB card.
+  ~6.6 GB; block streaming (`offload="stream"`) drops it further so SDXL or Anima
+  fit a ~4 GB card, and FLUX.1's ~23 GB transformer fits a 24 GB card.
 - **Seed-reproducible** — same seed, same image, every run.
 - **From scratch** — every backbone is implemented from the original papers and
   verified against reference implementations (text encoders and the SD1.5 UNet
@@ -121,11 +122,20 @@ For FLUX.2, use the **ComfyUI-format single files** for the VAE and text encoder
 ships those two in diffusers layout, which this loader's single-file path doesn't
 consume; the transformer single-file loads as-is.
 
-**Fitting FLUX.1 on a 24 GB GPU.** The FLUX.1 transformer is ~23 GB in bf16, so
-keeping it resident leaves no room for activations. Use `offload="stream"`: the
-small modules stay resident and each DiT block is streamed onto the GPU just for
-its own forward. Peak VRAM drops to ~22 GB and a 1024² schnell image fits a
-24 GB card.
+**Fitting a big backbone on a small GPU (`offload="stream"`).** When the backbone
+can't share the GPU with its own activations, stream its blocks: the small
+modules stay resident and each block is shuttled onto the GPU just for its own
+forward, the ComfyUI `--lowvram` analog. Works for every backbone —
+- **FLUX.1** (~23 GB transformer): peak VRAM drops to ~22 GB, so a 1024² schnell
+  image fits a 24 GB card (whole-module staging OOMs).
+- **SD/SDXL** (UNet, `("input_blocks", "middle_block", "output_blocks")`) and
+  **Anima** (DiT, `("blocks",)`): fit a ~4 GB card where `offload="full"`
+  (whole-UNet staging) OOMs once 1024² activations land on top.
+
+It's the slowest mode (weights cross PCIe each step), so reserve it for cards
+that can't fit the backbone otherwise. The example below is FLUX.1; SD/SDXL and
+Anima take the same `offload="stream"` policy through `load_checkpoint` /
+`load_anima_checkpoint`.
 
 ```python
 from diffucore import load_flux_checkpoint, TextToImage

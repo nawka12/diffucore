@@ -119,7 +119,17 @@ def load_checkpoint(
         backbone = _load_sub(UNetModel(sdxl_unet_config()), state_dict, _UNET_PREFIX)
 
     text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
-    backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+    if policy.offload_stream:
+        # Park the whole UNet on CPU and stream its blocks (down / mid / up) onto
+        # the GPU one at a time per forward, keeping only the small modules
+        # (time/label embed, final conv) resident — the SD/SDXL analog of ComfyUI's
+        # --lowvram. Fits SDXL's ~2.6 GB UNet on a 4 GB card, where whole-module
+        # staging ("full") OOMs once 1024² activations land on top of it.
+        backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
+        stream_blocks(backbone, ("input_blocks", "middle_block", "output_blocks"),
+                      policy.device, policy.offload_device)
+    else:
+        backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
     # NHWC for the conv backbones when opted in. cuDNN picks faster channels-last
     # kernels on Ampere+ fp16. Text encoders and 1D-attention modules stay default.
@@ -194,7 +204,16 @@ def load_anima_checkpoint(
               if k.startswith(_ANIMA_DIT_PREFIX)}
     backbone = AnimaDiT()
     backbone.load_state_dict(sd_dit, strict=True)
-    backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+    if policy.offload_stream:
+        # Stream the DiT blocks (the SD/FLUX --lowvram analog) so Anima's ~4 GB
+        # DiT fits a small card. Keep block 0 resident: TeaCache probes its
+        # modulated_self_attn_input directly (outside the block's __call__, so the
+        # stream hooks don't fire), and that probe must find its weights on the GPU.
+        backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
+        stream_blocks(backbone, ("blocks",), policy.device, policy.offload_device,
+                      keep_resident=(backbone.blocks[0],))
+    else:
+        backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
     backbone = maybe_compile_backbone(backbone, policy)
 
