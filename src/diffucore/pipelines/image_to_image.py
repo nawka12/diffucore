@@ -44,6 +44,7 @@ class ImageToImage(_Pipeline):
         lq_threshold: float = 0.025,
         teacache_thresh: float = 0.0,
         teacache_coefficients: "list[float] | None" = None,
+        deepcache_interval: int = 1,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
@@ -101,7 +102,8 @@ class ImageToImage(_Pipeline):
             noise = torch.randn(z0.shape, generator=generator, device=device, dtype=compute_dtype)
             x = z0 + noise * sigmas[0]
 
-            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback, preview_callback)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback,
+                              preview_callback, deepcache_interval)
             image, vae_decode_mode = self._decode(x0, policy, width, height)
             info = PipelineInfo(vae_decode_mode=vae_decode_mode)
             return (image, info) if return_info else image

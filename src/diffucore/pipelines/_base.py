@@ -19,7 +19,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from ..conditioning import Conditioner, SDXLConditioner
-from ..models.unet import timestep_embedding
+from ..models.unet import DeepCache, timestep_embedding
 from ..runtime import DevicePolicy, can_decode_untiled, staged, tiled_vae_decode
 from ..sampling import (
     CFGDenoiser,
@@ -215,19 +215,30 @@ class _Pipeline:
             dtype=dtype,
         )
 
-    def _sample(self, sampler, cfg, x, sigmas, policy, progress_callback=None, preview_callback=None):
+    def _sample(self, sampler, cfg, x, sigmas, policy, progress_callback=None,
+                preview_callback=None, deepcache_interval=1):
         # Match the input layout to the (NHWC) UNet weights when channels_last is
         # on, so cuDNN runs entirely in channels-last instead of transposing each
         # step. Cheap one-shot reorder; semantically a no-op.
         if policy.channels_last:
             x = x.contiguous(memory_format=torch.channels_last)
+        # DeepCache (SD/SDXL UNet only): reuse deep features across steps. Attach
+        # a fresh cache to the backbone for this run; > 1 enables it. Detached in
+        # the finally so it never leaks into a later (cache-off) generation.
+        cache = DeepCache(deepcache_interval) if deepcache_interval > 1 else None
         with staged([self.model.backbone], policy.device, policy.offload_unet):
             # inference_mode INSIDE staged: weights move (.to) in normal mode so
             # they stay normal tensors for later in-place LoRA; only the forward
             # runs under inference_mode.
             with torch.inference_mode():
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
-                    return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
+                    if cache is not None:
+                        self.model.backbone._deepcache = cache
+                    try:
+                        return get_sampler(sampler)(cfg, x, sigmas, callback=on_step)
+                    finally:
+                        if cache is not None:
+                            self.model.backbone._deepcache = None
 
     # --- decode --------------------------------------------------------------
     def _decode(self, x0, policy, width, height) -> tuple[Image.Image, str]:

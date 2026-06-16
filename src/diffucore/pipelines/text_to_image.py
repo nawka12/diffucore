@@ -49,6 +49,7 @@ class TextToImage(_Pipeline):
         oss_sigmas: "torch.Tensor | list[float] | None" = None,
         teacache_thresh: float = 0.0,
         teacache_coefficients: "list[float] | None" = None,
+        deepcache_interval: int = 1,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
@@ -109,7 +110,8 @@ class TextToImage(_Pipeline):
                 generator=generator, device=device, dtype=compute_dtype,
             ) * sigmas[0]
 
-            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback, preview_callback)
+            x0 = self._sample(sampler, cfg, x, sigmas, policy, progress_callback,
+                              preview_callback, deepcache_interval)
             image, vae_decode_mode = self._decode(x0, policy, width, height)
             info = PipelineInfo(vae_decode_mode=vae_decode_mode)
             return (image, info) if return_info else image

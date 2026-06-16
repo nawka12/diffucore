@@ -242,6 +242,43 @@ class Upsample(nn.Module):
         return self.conv(F.interpolate(x, scale_factor=2.0, mode="nearest"))
 
 
+class DeepCache:
+    """DeepCache (Ma et al., 2024, arXiv:2312.00858) for the SD/SDXL UNet.
+
+    A U-Net's deep, low-resolution features change slowly between adjacent
+    denoising steps, while the shallow high-resolution blocks carry the fast-
+    changing fine detail. On a *cached* step we reuse the cached deep feature
+    (the up-path activation at the outermost split) and recompute only the
+    shallow level-0 blocks — a much cheaper step. Every ``interval``-th model
+    evaluation runs the full UNet and refreshes the cache; ``interval == 1``
+    disables caching (every step full).
+
+    One instance per generation. It counts *model evaluations*, so a CFG step
+    that batches cond+uncond into one forward counts as one. The first call (no
+    cached feature yet) always computes.
+
+    Unlike Anima's :class:`~diffucore.models.anima_dit.TeaCache`, the schedule
+    here is a fixed interval rather than an adaptive rel-L1 threshold: the UNet
+    has no single residual stream to probe, so DeepCache exploits the encoder/
+    decoder skip structure instead.
+    """
+
+    def __init__(self, interval: int):
+        self.interval = max(1, int(interval))
+        self.calls = 0          # model evaluations seen
+        self.skips = 0          # evaluations served from cache (deep blocks reused)
+        self.deep_feature: torch.Tensor | None = None
+
+    def should_compute(self) -> bool:
+        """Whether this evaluation runs the full UNet (vs. reusing the cache).
+        Advances the per-evaluation counter."""
+        full = self.deep_feature is None or self.calls % self.interval == 0
+        self.calls += 1
+        if not full:
+            self.skips += 1
+        return full
+
+
 class UNetModel(nn.Module):
     def __init__(self, config: UNetConfig | None = None):
         super().__init__()
@@ -334,6 +371,13 @@ class UNetModel(nn.Module):
             ds *= 2
         return depths
 
+    def _deepcache_split(self) -> int:
+        """Index of the first *shallow* output block — the splice point. Blocks
+        before it (the deep up-path) are cached; from it on (the level-0 output
+        blocks, which consume the freshly recomputed level-0 skips) are always
+        recomputed. Mirror of the level-0 input blocks ``input_blocks[:nrb+1]``."""
+        return len(self.input_blocks) - 1 - self.config.num_res_blocks
+
     def forward(
         self,
         x: torch.Tensor,
@@ -346,13 +390,33 @@ class UNetModel(nn.Module):
         if self.label_emb is not None:
             emb = emb + self.label_emb(y.to(x.dtype))
 
+        # DeepCache: on a cached step, recompute only the shallow level-0 blocks
+        # and splice in the cached deep feature; skip the encoder downsamples,
+        # the middle block, and the deep output blocks entirely.
+        cache = getattr(self, "_deepcache", None)
+        if cache is not None and not cache.should_compute():
+            split = self._deepcache_split()
+            hs = []
+            h = x
+            for module in self.input_blocks[: self.config.num_res_blocks + 1]:
+                h = module(h, emb, context)
+                hs.append(h)
+            h = cache.deep_feature
+            for module in self.output_blocks[split:]:
+                h = torch.cat([h, hs.pop()], dim=1)
+                h = module(h, emb, context)
+            return self.out(h)
+
+        split = self._deepcache_split() if cache is not None else -1
         hs = []
         h = x
         for module in self.input_blocks:
             h = module(h, emb, context)
             hs.append(h)
         h = self.middle_block(h, emb, context)
-        for module in self.output_blocks:
+        for j, module in enumerate(self.output_blocks):
+            if j == split:  # capture the deep feature before the shallow up-path
+                cache.deep_feature = h
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context)
         return self.out(h)
