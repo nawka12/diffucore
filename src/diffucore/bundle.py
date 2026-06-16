@@ -12,6 +12,7 @@ takes all three paths and returns the same :class:`ModelBundle` type as
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -176,9 +177,17 @@ def load_anima_checkpoint(
     if policy is None:
         policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
 
+    # Progress markers to the server's stdout: the load reads three multi-GB files
+    # and builds a 2B-param module with no other output, so the last line printed
+    # tells you which stage is slow (or stuck).
+    _t0 = time.perf_counter()
+    def _stage(msg: str) -> None:
+        print(f"[load] (+{time.perf_counter() - _t0:.1f}s) {msg}", flush=True)
+
     # Detection runs on the DiT file (the VAE/TE have their own keys and are
     # already known by name). It validates the file is Anima before we build
     # the 2B-param module.
+    _stage("detecting architecture")
     spec = detect_architecture(read_header(dit_path))
     if spec.architecture != "anima":
         raise ValueError(
@@ -189,19 +198,23 @@ def load_anima_checkpoint(
     unet_target = policy.offload_device if policy.offload_unet else policy.device
 
     # VAE: independent file with no key prefix.
+    _stage("loading VAE weights")
     vae = QwenImageVAE()
     vae.load_state_dict(load_state_dict(vae_path, device="cpu"), strict=True)
     vae = vae.to(idle_target, policy.vae_dtype).eval()
 
     # Text encoder: independent Qwen3 file, keys at ``model.*``.
+    _stage("loading text encoder (Qwen3) weights")
     qwen3 = Qwen3TextEncoder()
     qwen3.load_state_dict(load_state_dict(te_path, device="cpu"), strict=True)
     qwen3 = qwen3.to(idle_target, policy.compute_dtype).eval()
 
     # DiT (incl. the LLM-Adapter under ``llm_adapter``): keys live under ``net.*``.
+    _stage("loading DiT weights (largest file)")
     sd_dit = load_state_dict(dit_path, device="cpu")
     sd_dit = {k[len(_ANIMA_DIT_PREFIX):]: v for k, v in sd_dit.items()
               if k.startswith(_ANIMA_DIT_PREFIX)}
+    _stage("building DiT backbone (2B params)")
     backbone = AnimaDiT()
     backbone.load_state_dict(sd_dit, strict=True)
     if policy.offload_stream:
@@ -209,13 +222,17 @@ def load_anima_checkpoint(
         # DiT fits a small card. Keep block 0 resident: TeaCache probes its
         # modulated_self_attn_input directly (outside the block's __call__, so the
         # stream hooks don't fire), and that probe must find its weights on the GPU.
+        _stage("streaming DiT blocks to GPU (low-VRAM mode)")
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("blocks",), policy.device, policy.offload_device,
                       keep_resident=(backbone.blocks[0],))
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
+    if policy.compile:
+        _stage("compiling backbone (torch.compile warmup — may take minutes)")
     backbone = maybe_compile_backbone(backbone, policy)
+    _stage("model ready")
 
     tokenizer = AnimaTokenizer()
 
