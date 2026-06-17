@@ -52,6 +52,7 @@ __all__ = [
     "sample_ddpm",
     "sample_secant",
     "sample_secant_anneal",
+    "sample_dpmpp_2m_anneal",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -752,6 +753,76 @@ def sample_secant_anneal(
     return x
 
 
+def sample_dpmpp_2m_anneal(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "flow",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """DPM-Solver++(2M) with a σ-annealed ancestral noise level (rectified-flow only).
+
+    The "good and fast" counterpart to :func:`sample_secant_anneal`: it differs
+    from that sampler in exactly one way — the deterministic core is the DPM++(2M)
+    flow exponential integrator (:func:`sample_dpmpp_2m_sde`'s midpoint form: a
+    2nd-order multistep in half-logSNR space, one evaluation per step) instead of
+    the σ-secant. The σ-secant *gates itself off* at low step counts (its
+    correction weight ``∝ (1 − |Δσ|/σ)`` collapses as Δσ grows), so it degrades to
+    1st-order Euler exactly when steps are scarce; the 2M core stays genuinely
+    2nd-order there, which is where the step savings come from.
+
+    The annealed ancestral burn-in is identical to
+    :func:`sample_euler_ancestral_anneal`: ``eta_i = eta_max·σ_i`` — near-full
+    stochastic re-noise at high σ (averaging out an imperfect / merged velocity
+    field) tapering to a deterministic step as σ→0. Pairs with a high-σ-dense flow
+    schedule (``beta`` / ``flow`` / ``smoothstep``), same as its siblings.
+
+    ``eta_max=0`` makes every step deterministic, recovering the DPM++(2M) flow
+    multistep exactly — bit-identical to ``dpmpp_2m_sde`` with ``eta=0`` (the same
+    flow half-logSNR map, midpoint form). It is *not* bit-identical to the
+    standalone ``dpmpp_2m``, which applies the VE logSNR map to flow as-is; this
+    uses the rectified-flow half-logSNR, the correct one for a CONST model.
+    ``shift`` offsets the first σ off 1.0 for that map."""
+    if model_type != "flow":
+        raise ValueError("dpmpp_2m_anneal is rectified-flow only (model_type='flow')")
+    if len(sigmas) <= 1:
+        return x
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    old_denoised = None
+    h, h_last = None, None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            # σ-annealed ancestral fraction (eta = eta_max·σ, as in
+            # euler_ancestral_anneal): full burn-in at σ≈1, deterministic as σ→0.
+            eta = eta_max * float(sigma.clamp(max=1.0))
+            lambda_s, lambda_t = lambda_fn(sigma), lambda_fn(sigma_next)
+            h = lambda_t - lambda_s
+            h_eta = h * (eta + 1)
+            alpha_t = sigma_next * lambda_t.exp()
+            x = sigma_next / sigma * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
+            if old_denoised is not None:
+                rr = h_last / h
+                x = x + 0.5 * alpha_t * (-h_eta).expm1().neg() * (1 / rr) * (denoised - old_denoised)
+            if eta > 0 and s_noise > 0:
+                x = x + _noise_like(x, generator) * sigma_next * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+        old_denoised = denoised
+        h_last = h
+    return x
+
+
 def sample_heunpp2(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None) -> torch.Tensor:
     """Heun++ — a higher-order Heun that, away from the schedule endpoint, takes a
     third evaluation and blends the three derivatives with sigma-proportional
@@ -1180,6 +1251,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "ddpm": sample_ddpm,
     "secant": sample_secant,
     "secant_anneal": sample_secant_anneal,
+    "dpmpp_2m_anneal": sample_dpmpp_2m_anneal,
 }
 
 

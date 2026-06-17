@@ -464,6 +464,72 @@ def test_secant_anneal_registered_in_sampler_table():
     assert K.get_sampler("secant_anneal") is K.sample_secant_anneal
 
 
+# ── DPM++(2M)-ANNEAL ──────────────────────────────────────────────────
+
+
+def test_dpmpp_2m_anneal_flow_only():
+    with pytest.raises(ValueError):
+        K.sample_dpmpp_2m_anneal(
+            const_denoiser(torch.zeros(1, 4, 4, 4)), torch.randn(1, 4, 4, 4),
+            S.flow_matching_schedule(8, shift=3.0), model_type="ve",
+        )
+
+
+def test_dpmpp_2m_anneal_constant_x0_ends_clean():
+    # Stochastic burn-in at high σ, but the final step (σ_next == 0) snaps to the
+    # constant prediction.
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 16, 4, 4)
+    out = K.sample_dpmpp_2m_anneal(
+        const_denoiser(target), x_init.clone(), sigmas,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_dpmpp_2m_anneal_eta_max_zero_equals_dpmpp_2m_sde_flow():
+    # eta_max=0 ⇒ eta=0 every step ⇒ no re-noise ⇒ the update is exactly the
+    # deterministic DPM++(2M) flow multistep (dpmpp_2m_sde with eta=0, same
+    # half-logSNR map and shift). A σ-dependent denoiser exercises the 2nd-order
+    # correction term.
+    torch.manual_seed(2)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    sde0 = _last_nonzero_latent(K.sample_dpmpp_2m_sde, model, x_init, sigmas,
+                                eta=0.0, model_type="flow", shift=3.0)
+    anz = _last_nonzero_latent(K.sample_dpmpp_2m_anneal, model, x_init, sigmas,
+                               eta_max=0.0, model_type="flow", shift=3.0)
+    assert torch.isfinite(anz).all()
+    assert torch.allclose(anz, sde0, atol=1e-4)
+
+
+def test_dpmpp_2m_anneal_seed_reproducible_and_stochastic():
+    # Same seed ⇒ identical trajectory; the annealed burn-in (eta_max>0) must
+    # actually change it versus the deterministic (eta_max=0) run.
+    target = torch.zeros(1, 8, 4, 4)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 8, 4, 4)
+
+    def run(**kw):
+        return _last_nonzero_latent(K.sample_dpmpp_2m_anneal, const_denoiser(target),
+                                    x_init, sigmas, model_type="flow", shift=3.0, **kw)
+
+    a = run(generator=torch.Generator().manual_seed(3))
+    b = run(generator=torch.Generator().manual_seed(3))
+    det = run(eta_max=0.0)
+    assert torch.equal(a, b)
+    assert not torch.allclose(a, det, atol=1e-5)
+
+
+def test_dpmpp_2m_anneal_registered_in_sampler_table():
+    assert K.get_sampler("dpmpp_2m_anneal") is K.sample_dpmpp_2m_anneal
+
+
 def test_all_registered_samplers_resolve():
     for name, fn in K.SAMPLERS.items():
         assert K.get_sampler(name) is fn

@@ -50,7 +50,13 @@ image = TextToImage(model)(
   `er_sde`, `lcm`, `secant`, plus `ddpm` (SD/SDXL only — a VP/VE sampler) and
   `secant_anneal` (Anima only — σ-annealed ancestral burn-in at high σ handing
   off to `secant`'s 2nd-order x0 refinement as σ→0; spans `euler_ancestral_anneal`
-  at `curvature=0` and deterministic `secant` at `eta_max=0`).
+  at `curvature=0` and deterministic `secant` at `eta_max=0`), and
+  `dpmpp_2m_anneal` (Anima only — the "good and fast" sibling: `euler_ancestral_anneal`'s
+  same σ-annealed burn-in (`eta = eta_max·σ`) but with the DPM++(2M) flow multistep
+  as the deterministic core instead of plain Euler / the secant. The 2M core stays
+  genuinely 2nd-order at low step counts — where the secant self-gates back to Euler —
+  so it reaches the same quality in fewer steps; `eta_max=0` is the deterministic
+  2M flow solver. Pair with `beta`/`flow` like its siblings).
   Ancestral samplers are rectified-flow-aware on Anima/FLUX.
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
   `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
