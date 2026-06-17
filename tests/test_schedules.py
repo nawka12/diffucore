@@ -229,3 +229,30 @@ def test_flow_matching_dynamic_shift_monotonic_and_anchor():
     sig = S.flow_matching_schedule(20, shift=s_mid)
     assert sig[-1].item() == 0.0
     assert torch.all(sig[:-1] >= sig[1:])
+
+
+def test_flow_budget_schedule_linear_spacing():
+    """Linear-σ spacing: uniform Δσ between consecutive steps, trailing 0."""
+    sig = S.flow_budget_schedule(18, 0.002, 80.0)
+    assert sig.shape[0] == 19
+    assert sig[-1].item() == 0.0
+    assert abs(sig[0].item() - 80.0) < 1e-4
+    assert abs(sig[-2].item() - 0.002) < 1e-4
+    inner = sig[:-1]
+    diffs = inner[:-1] - inner[1:]
+    assert torch.allclose(diffs, diffs.mean().expand_as(diffs), atol=1e-4)
+
+
+def test_flow_budget_schedule_flow_range():
+    """Works on the flow σ∈[0,1] range (Anima/FLUX) the same as VE."""
+    sig = S.flow_budget_schedule(20, 1.0 / 1000, 1.0)
+    assert sig.shape[0] == 21
+    assert sig[-1].item() == 0.0
+    assert abs(sig[0].item() - 1.0) < 1e-6
+    assert torch.all(sig[:-1] >= sig[1:])
+
+
+def test_flow_budget_schedule_invalid_steps():
+    import pytest
+    with pytest.raises(ValueError):
+        S.flow_budget_schedule(0, 0.1, 1.0)

@@ -15,6 +15,7 @@ from .schedules import (
     linear_quadratic_schedule,
     smoothstep_schedule,
     beta_schedule,
+    flow_budget_schedule,
     flow_table_schedule,
     FlowSamplingView,
 )
@@ -58,6 +59,7 @@ from .samplers import (
     sample_ddpm,
     sample_secant,
     sample_secant_anneal,
+    sample_flow_budget,
     get_sampler,
     SAMPLERS,
 )
@@ -77,6 +79,7 @@ __all__ = [
     "linear_quadratic_schedule",
     "smoothstep_schedule",
     "beta_schedule",
+    "flow_budget_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
     "optimal_step_schedule",
@@ -116,6 +119,7 @@ __all__ = [
     "sample_ddpm",
     "sample_secant",
     "sample_secant_anneal",
+    "sample_flow_budget",
     "get_sampler",
     "SAMPLERS",
 ]

@@ -28,6 +28,7 @@ from ..sampling import (
     VScaling,
     ddim_uniform_schedule,
     exponential_schedule,
+    flow_budget_schedule,
     get_sampler,
     karras_schedule,
     kl_optimal_schedule,
@@ -46,6 +47,7 @@ _SCHEDULERS = {
     "exponential": exponential_schedule,
     "polyexponential": polyexponential_schedule,
     "kl_optimal": kl_optimal_schedule,
+    "flow_budget": flow_budget_schedule,
 }
 
 # Schedulers that read the model's discrete sigma table / timestep map rather

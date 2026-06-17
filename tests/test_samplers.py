@@ -467,3 +467,93 @@ def test_secant_anneal_registered_in_sampler_table():
 def test_all_registered_samplers_resolve():
     for name, fn in K.SAMPLERS.items():
         assert K.get_sampler(name) is fn
+
+
+# ── flow_budget (sd-flow adaptive 4-tier sampler) ──────────────────────────
+
+
+def test_accumulate_budget_classifies_all_tiers():
+    """With enough steps the budget walk naturally visits all 4 tiers; with
+    very few it may not, and the starvation-protection pass forces the missing
+    ones in."""
+    sig = S.flow_budget_schedule(30, 0.002, 80.0)
+    tiers = K._accumulate_budget(sig)
+    assert len(tiers) == 30
+    assert all(0 <= t <= 3 for t in tiers)
+    # Every tier present after starvation protection.
+    assert set(tiers) == {0, 1, 2, 3}
+
+
+def test_accumulate_budget_starvation_forces_missing_tier():
+    """A 2-step schedule can't naturally span all 4 tiers; starvation
+    protection still ensures each appears at least once."""
+    sig = S.flow_budget_schedule(2, 0.1, 1.0)
+    tiers = K._accumulate_budget(sig)
+    assert len(tiers) == 2
+    # Only 2 steps → only 2 distinct tiers can appear, but they should be
+    # different (the protection pass reassigns to missing tiers first).
+    assert len(set(tiers)) == 2
+
+
+def test_flow_budget_ends_at_clean_sample_ve():
+    target = torch.zeros(1, 3, 4, 4)
+    sigmas = S.flow_budget_schedule(20, 0.03, 14.6)
+    x_init = torch.randn(1, 3, 4, 4) * sigmas[0]
+    out = K.sample_flow_budget(const_denoiser(target), x_init, sigmas)
+    assert torch.allclose(out, target, atol=1e-4)
+    assert torch.isfinite(out).all()
+
+
+def test_flow_budget_ends_at_clean_sample_flow():
+    target = torch.zeros(1, 3, 4, 4)
+    sigmas = S.flow_budget_schedule(18, 1.0 / 1000, 1.0)
+    x_init = torch.randn(1, 3, 4, 4) * sigmas[0]
+    g = torch.Generator().manual_seed(0)
+    out = K.sample_flow_budget(const_denoiser(target), x_init, sigmas,
+                               model_type="flow", generator=g)
+    assert torch.allclose(out, target, atol=1e-4)
+    assert torch.isfinite(out).all()
+
+
+def test_flow_budget_priority_tier_matches_euler():
+    """When all tiers are forced to PRIORITY (0), the DDIM/Euler step must
+    match plain Euler exactly (they're algebraically identical)."""
+    target = torch.full((1, 3, 4, 4), 0.4)
+    sigmas = S.karras_schedule(15, 0.03, 14.6)
+    x_init = torch.randn(1, 3, 4, 4) * sigmas[0]
+    tiers = [0] * (len(sigmas) - 1)
+    out_fb = K.sample_flow_budget(const_denoiser(target), x_init.clone(), sigmas,
+                                  step_tiers=tiers)
+    out_eu = K.sample_euler(const_denoiser(target), x_init.clone(), sigmas)
+    assert torch.allclose(out_fb, out_eu, atol=1e-5)
+
+
+def test_flow_budget_deficit_tier_matches_heun():
+    """When all tiers are forced to DEFICIT (3), the Heun step must match
+    plain Heun exactly."""
+    target = torch.full((1, 3, 4, 4), -0.3)
+    sigmas = S.karras_schedule(10, 0.03, 14.6)
+    x_init = torch.randn(1, 3, 4, 4) * sigmas[0]
+    tiers = [3] * (len(sigmas) - 1)
+    out_fb = K.sample_flow_budget(const_denoiser(target), x_init.clone(), sigmas,
+                                  step_tiers=tiers)
+    out_heun = K.sample_heun(const_denoiser(target), x_init.clone(), sigmas)
+    assert torch.allclose(out_fb, out_heun, atol=1e-5)
+
+
+def test_flow_budget_seed_reproducible():
+    """Same seed + same sigmas ⇒ identical trajectory (the ancestral LOW tier
+    is the only stochastic branch)."""
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = S.flow_budget_schedule(24, 0.002, 80.0)
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+
+    def run():
+        g = torch.Generator().manual_seed(42)
+        return K.sample_flow_budget(const_denoiser(target), x_init.clone(), sigmas,
+                                    generator=g)
+    assert torch.equal(run(), run())
+
+
+def test_flow_budget_registered_in_sampler_table():
+    assert K.get_sampler("flow_budget") is K.sample_flow_budget

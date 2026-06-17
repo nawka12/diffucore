@@ -32,6 +32,7 @@ from PIL import Image
 from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
 from ._base import PipelineInfo, _step_progress, preprocess_image
 from ..sampling import (
+    flow_budget_schedule,
     flow_matching_schedule,
     flow_table_schedule,
     get_sampler,
@@ -41,16 +42,20 @@ _FLUX_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
     "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
-    "gradient_estimation", "lms", "lcm", "secant",
+    "gradient_estimation", "lms", "lcm", "secant", "flow_budget",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
+    "flow_budget",
 }
 # "ddim_uniform" omitted on flow: it starts below σ_max, clashing with the
 # pure-noise init. See schedules._FLOW_TABLE_SCHEDULERS.
+# "flow_budget" is sd-flow's linear-σ schedule + adaptive 4-tier solver; the
+# DDIM/Euler/Heun tiers all reduce to the CONST rectified-flow update, so it
+# works on FLUX the same as Anima.
 _FLUX_SCHEDULERS = (
-    "flux", "flow", "sgm_uniform", "simple",
+    "flux", "flow", "flow_budget", "sgm_uniform", "simple",
     "normal", "kl_optimal", "linear_quadratic",
 )
 
@@ -212,6 +217,9 @@ def flux_text_to_image(
         elif scheduler == "flow":
             eff_shift = shift
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_budget":
+            sigmas = flow_budget_schedule(steps, 1.0 / 1000, 1.0,
+                                          device=device, dtype=torch.float32)
         else:
             sigmas = flow_table_schedule(scheduler, eff_shift, steps, device=device, dtype=torch.float32)
 
@@ -357,6 +365,9 @@ def flux_img2img(
         elif scheduler == "flow":
             eff_shift = shift
             sigmas = flow_matching_schedule(sched_steps, shift=shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_budget":
+            sigmas = flow_budget_schedule(sched_steps, 1.0 / 1000, 1.0,
+                                          device=device, dtype=torch.float32)
         else:
             sigmas = flow_table_schedule(scheduler, eff_shift, sched_steps, device=device, dtype=torch.float32)
         sigmas = sigmas[-(steps + 1):]

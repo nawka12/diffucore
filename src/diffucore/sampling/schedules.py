@@ -31,6 +31,7 @@ __all__ = [
     "linear_quadratic_schedule",
     "smoothstep_schedule",
     "beta_schedule",
+    "flow_budget_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
 ]
@@ -371,6 +372,37 @@ def beta_schedule(schedule, steps: int, *, alpha: float = 0.6, beta: float = 0.6
     t = (1.0 - _beta_inv_cdf(q, alpha, beta)).clamp(min=1.0 / schedule.multiplier)
     sigmas = schedule.t_to_sigma(t.to(torch.float32) * schedule.multiplier).to(device=device, dtype=dtype)
     return append_zero(sigmas)
+
+
+def flow_budget_schedule(
+    steps: int,
+    sigma_min: float,
+    sigma_max: float,
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Linear-σ schedule for the adaptive :func:`sample_flow_budget` sampler
+    (sd-flow's ``FlowSigmaSchedule``, adapted from the scx_flow CPU scheduler's
+    budget-driven tier system).
+
+    Returns ``steps + 1`` descending sigmas ending at 0 — plain linear spacing
+    from ``sigma_max`` to ``sigma_min`` with a trailing 0. The per-step
+    *budget tier* classification (PRIORITY / NORMAL / LOW / DEFICIT) that
+    drives the sampler's adaptive solver dispatch is computed inside
+    :func:`sample_flow_budget` from these sigmas, not here.
+
+    Unlike :func:`flow_matching_schedule` this uses plain linear σ spacing
+    (no rectified-flow shift map) per sd-flow's design — the adaptive
+    per-step solver allocation (Heun on under-served regions, DDIM/Euler on
+    well-covered ones) compensates for the non-shifted schedule. Works for
+    any σ range: VE (SD/SDXL, ``σ_max≈80``) and rectified-flow (Anima/FLUX,
+    ``σ_max=1``) alike, since the budget refill is normalized by ``σ_max``.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    base = torch.linspace(sigma_max, sigma_min, steps, device=device, dtype=dtype)
+    return append_zero(base)
 
 
 # Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``

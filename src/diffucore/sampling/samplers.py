@@ -52,6 +52,7 @@ __all__ = [
     "sample_ddpm",
     "sample_secant",
     "sample_secant_anneal",
+    "sample_flow_budget",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -1155,6 +1156,168 @@ def sample_ddpm(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
     return x
 
 
+# ── flow_budget: adaptive per-tier solver (sd-flow / scx_flow adaptation) ─────
+#
+# Ports sd-flow's adaptive ``flow`` sampler (galpt/sd-flow), itself a domain
+# adaptation of the scx_flow Linux CPU scheduler's budget-driven tier system.
+# A running "noise budget" accumulates a positive refill proportional to
+# ``(Δσ·σ_cur)/σ_max²`` at each sigma transition; each step is classified by
+# its accumulated budget into one of 4 tiers that determine the solver:
+#
+#   TIER      | BUDGET  | SOLVER       | NFE | RATIONALE
+#   ----------|---------|--------------|-----|----------
+#   PRIORITY  | >= 1.5  | DDIM/Euler   |  1  | Deterministic, trajectory-preserving.
+#   NORMAL    | >= 1.0  | Euler        |  1  | Standard 1st-order ODE.
+#   LOW       | >= 0.5  | Euler_A      |  1  | Ancestral noise masks error.
+#   DEFICIT   | <  0.5  | Heun         |  2  | Extra compute on under-served regions.
+#
+# The DDIM step (``x₀ + (σ_next/σ)·(x − x₀)``) is algebraically identical to
+# the Euler step (``x + d·(σ_next − σ)``) — both reduce to the closed-form
+# rectified-flow update when the denoiser returns the CONST x0 estimate
+# (``x − σ·v``), so the sampler works on VE (SD/SDXL) and rectified-flow
+# (Anima, FLUX) models alike. The ancestral step uses the rectified-flow
+# split (``_rf_ancestral_step``) when ``model_type="flow"``, the VE split
+# otherwise — matching diffucore's other flow-aware samplers.
+
+_BUDGET_REFILL_SCALE = 4.0
+
+
+def _accumulate_budget(
+    sigmas: torch.Tensor, *,
+    budget_max: float = 2.0,
+    budget_min: float = -0.5,
+    tier_thresholds: tuple[float, float, float] = (1.5, 1.0, 0.5),
+) -> list[int]:
+    """Walk the sigma transitions and classify each step into a budget tier.
+
+    Ports sd-flow's ``BudgetAccumulator``: a running budget that accumulates a
+    positive refill proportional to ``(Δσ·σ_cur)/σ_max²`` at each transition,
+    clamped to ``[budget_min, budget_max]``. Each step is classified by its
+    accumulated budget against the (descending) ``tier_thresholds`` into
+    PRIORITY (0) / NORMAL (1) / LOW (2) / DEFICIT (3). Starvation protection:
+    every tier the natural walk skips is forced onto at least one step.
+    """
+    sigma_max = float(sigmas[0])
+    if sigma_max <= 0:
+        return [3] * (len(sigmas) - 1)
+    p, n, l = tier_thresholds
+    budget = 0.0
+    tiers: list[int] = []
+    for i in range(len(sigmas) - 1):
+        delta = float(sigmas[i] - sigmas[i + 1])
+        refill = (delta / sigma_max) * (float(sigmas[i]) / sigma_max) * _BUDGET_REFILL_SCALE
+        budget = max(budget_min, min(budget_max, budget + refill))
+        if budget >= p:
+            tiers.append(0)
+        elif budget >= n:
+            tiers.append(1)
+        elif budget >= l:
+            tiers.append(2)
+        else:
+            tiers.append(3)
+    # Starvation protection: force ≥1 step per tier that was skipped. sd-flow
+    # segments the σ range into 4 quadrants and reassigns a step from another
+    # tier; this port walks lowest-priority-first and reassigns the first
+    # available step from a different tier.
+    for ti in reversed(range(4)):
+        if ti not in tiers:
+            for i in range(len(tiers)):
+                if tiers[i] != ti:
+                    tiers[i] = ti
+                    break
+    return tiers
+
+
+def sample_flow_budget(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    step_tiers: list[int] | None = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+    callback: Callback = None,
+    budget_max: float = 2.0,
+    budget_min: float = -0.5,
+    tier_thresholds: tuple[float, float, float] = (1.5, 1.0, 0.5),
+) -> torch.Tensor:
+    """Adaptive 4-tier ODE sampler (sd-flow's ``flow`` sampler).
+
+    Each step's solver is chosen by a budget tier computed from the sigma
+    transitions (see :func:`_accumulate_budget`):
+
+        PRIORITY (high budget)  → DDIM/Euler  (deterministic, 1 NFE)
+        NORMAL   (moderate)     → Euler       (deterministic, 1st order ODE)
+        LOW      (low budget)   → Euler-A     (ancestral, 1 NFE)
+        DEFICIT  (budget floor) → Heun        (2nd order, 2 NFE)
+
+    The DDIM and Euler steps are algebraically identical and reduce to the
+    closed-form rectified-flow step under the CONST x0 estimate, so this
+    sampler works on VE and flow models alike. ``model_type="flow"`` uses
+    the rectified-flow ancestral split (``_rf_ancestral_step``) for the LOW
+    tier; ``"ve"`` uses the standard sigma-space split. ``shift`` is accepted
+    for kwarg uniformity (unused — the budget normalization uses ``sigmas[0]``).
+
+    ``step_tiers`` overrides the internally-computed tiers (length must equal
+    ``len(sigmas) - 1``); when ``None`` the tiers are derived from the sigma
+    schedule via :func:`_accumulate_budget` with the given budget parameters.
+    Pair with :func:`flow_budget_schedule` for the intended linear-σ spacing.
+    """
+    del shift
+    s_in = x.new_ones([x.shape[0]])
+    n = len(sigmas) - 1
+    if n < 1:
+        return x
+    if step_tiers is None or len(step_tiers) != n:
+        step_tiers = _accumulate_budget(
+            sigmas, budget_max=budget_max, budget_min=budget_min,
+            tier_thresholds=tier_thresholds,
+        )
+    for i in range(n):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        tier = step_tiers[i]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if tier <= 1:
+            # PRIORITY (DDIM) / NORMAL (Euler) — algebraically identical at 1
+            # NFE: x₀ + (σ_next/σ)·(x − x₀) == x + d·(σ_next − σ).
+            x = denoised + (sigma_next / sigma) * (x - denoised)
+        elif tier == 2:
+            # LOW — Euler ancestral (stochastic).
+            if model_type == "flow":
+                if bool(sigma_next == 0):
+                    x = denoised
+                    continue
+                sigma_down, alpha_next, alpha_down, renoise_coeff = _rf_ancestral_step(
+                    sigma, sigma_next, eta)
+                ratio = sigma_down / sigma
+                x = ratio * x + (1.0 - ratio) * denoised
+                if eta > 0 and s_noise > 0:
+                    x = (alpha_next / alpha_down) * x + _noise_like(x, generator) * s_noise * renoise_coeff
+            else:
+                sigma_down, sigma_up = get_ancestral_step(sigma, sigma_next, eta)
+                d = to_d(x, sigma * s_in, denoised)
+                x = x + d * (sigma_down - sigma)
+                if bool(sigma_up > 0) and s_noise > 0:
+                    x = x + _noise_like(x, generator) * s_noise * sigma_up
+        else:
+            # DEFICIT — Heun (2nd order, 2 NFE).
+            d = to_d(x, sigma * s_in, denoised)
+            dt = sigma_next - sigma
+            if bool(sigma_next == 0):
+                x = x + d * dt
+            else:
+                x_pred = x + d * dt
+                denoised_2 = model(x_pred, sigma_next * s_in)
+                d_2 = to_d(x_pred, sigma_next * s_in, denoised_2)
+                x = x + 0.5 * (d + d_2) * dt
+    return x
+
+
 SAMPLERS: dict[str, Denoiser] = {
     "euler": sample_euler,
     "heun": sample_heun,
@@ -1180,6 +1343,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "ddpm": sample_ddpm,
     "secant": sample_secant,
     "secant_anneal": sample_secant_anneal,
+    "flow_budget": sample_flow_budget,
 }
 
 

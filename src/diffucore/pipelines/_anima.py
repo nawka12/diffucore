@@ -31,6 +31,7 @@ from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
     append_zero,
     calibrate_oss_schedule,
+    flow_budget_schedule,
     flow_matching_schedule,
     flow_matching_dynamic_shift,
     flow_table_schedule,
@@ -44,17 +45,23 @@ _ANIMA_SAMPLERS = {
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
     "res_multistep_ancestral", "gradient_estimation", "lms", "lcm", "secant", "secant_anneal",
+    "flow_budget",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
-    "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
+    "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "flow_budget",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
+# "flow_budget" is sd-flow's linear-σ schedule + adaptive 4-tier solver (see
+# sampling.samplers.sample_flow_budget); the budget refill is normalized by
+# σ_max so it's parameterization-agnostic, and the DDIM/Euler/Heun steps all
+# reduce to the CONST rectified-flow update under the x0 closure.
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
     "normal", "kl_optimal", "linear_quadratic", "smoothstep", "beta",
+    "flow_budget",
 )
 
 if TYPE_CHECKING:
@@ -165,6 +172,12 @@ def anima_text_to_image(
         elif scheduler == "flow_dyn":
             sched_shift = flow_matching_dynamic_shift((height // 16) * (width // 16))
             sigmas = flow_matching_schedule(steps, shift=sched_shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_budget":
+            # sd-flow's linear-σ schedule (no shift map); the adaptive 4-tier
+            # sampler compensates for the non-shifted spacing. σ_max=1 (pure
+            # noise), σ_min=1/multiplier (the FlowSamplingView table floor).
+            sigmas = flow_budget_schedule(steps, 1.0 / 1000, 1.0,
+                                          device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError(
@@ -326,6 +339,9 @@ def anima_img2img(
         elif scheduler == "flow_dyn":
             sched_shift = flow_matching_dynamic_shift((height // 16) * (width // 16))
             sigmas = flow_matching_schedule(sched_steps, shift=sched_shift, device=device, dtype=torch.float32)
+        elif scheduler == "flow_budget":
+            sigmas = flow_budget_schedule(sched_steps, 1.0 / 1000, 1.0,
+                                          device=device, dtype=torch.float32)
         elif scheduler == "oss":
             if oss_sigmas is None:
                 raise ValueError("scheduler='oss' needs a pre-calibrated schedule (oss_sigmas).")
