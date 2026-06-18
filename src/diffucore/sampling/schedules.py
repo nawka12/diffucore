@@ -31,6 +31,7 @@ __all__ = [
     "linear_quadratic_schedule",
     "smoothstep_schedule",
     "beta_schedule",
+    "beta_mix_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
 ]
@@ -373,6 +374,88 @@ def beta_schedule(schedule, steps: int, *, alpha: float = 0.6, beta: float = 0.6
     return append_zero(sigmas)
 
 
+def _beta_mixture_inv_cdf(q: torch.Tensor, weight: float, alpha1: float, beta1: float,
+                          alpha2: float, beta2: float, *, grid: int = 4096) -> torch.Tensor:
+    """Inverse CDF of a two-component Beta mixture
+    ``weight·Beta(α1, β1) + (1−weight)·Beta(α2, β2)``.
+
+    Same midpoint-rule integration + linear-interp inversion scheme as
+    :func:`_beta_inv_cdf`, applied to the *mixture* density. Both edge cells
+    use the exact leading-order mass for each component (the mixture's edge
+    mass is the weight-weighted sum of the two). Returns float64."""
+    edges = torch.linspace(0.0, 1.0, grid + 1, dtype=torch.float64)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    pdf1 = centers ** (alpha1 - 1.0) * (1.0 - centers) ** (beta1 - 1.0)
+    pdf2 = centers ** (alpha2 - 1.0) * (1.0 - centers) ** (beta2 - 1.0)
+    h = 1.0 / grid
+    pdf1[0] = h ** alpha1 / alpha1 / h
+    pdf1[-1] = h ** beta1 / beta1 / h
+    pdf2[0] = h ** alpha2 / alpha2 / h
+    pdf2[-1] = h ** beta2 / beta2 / h
+    pdf = weight * pdf1 + (1.0 - weight) * pdf2
+    cdf = torch.cat([torch.zeros(1, dtype=torch.float64), pdf.cumsum(0)])
+    cdf = cdf / cdf[-1].clone()
+    q = q.to(torch.float64).clamp(0.0, 1.0)
+    idx = torch.searchsorted(cdf, q).clamp(1, grid)
+    c0, c1 = cdf[idx - 1], cdf[idx]
+    w = ((q - c0) / (c1 - c0).clamp_min(1e-300)).clamp(0.0, 1.0)
+    return edges[idx - 1] + w * (edges[idx] - edges[idx - 1])
+
+
+def beta_mix_schedule(schedule, steps: int, *, weight: float = 0.5,
+                           alpha1: float = 0.8, beta1: float = 2.0,
+                           alpha2: float = 3.0, beta2: float = 0.7,
+                           device: torch.device | str = "cpu",
+                           dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Two-component Beta mixture schedule (``beta_mix``).
+
+    A generalization of :func:`beta_schedule` that drops the symmetry
+    constraint: the timestep density is
+    ``weight·Beta(α1, β1) + (1−weight)·Beta(α2, β2)`` in the ``x = 1 − t``
+    variable (so ``x = 0`` is the high-noise end, ``x = 1`` the clean end),
+    then ``t_i = 1 − F_mix⁻¹(i/(n−1))`` is mapped through the model's σ(t).
+    With symmetric ``α = β`` and the two components equal this collapses to
+    the plain Beta schedule; the asymmetry lets the two endpoint peaks
+    differ in shape.
+
+    The defaults follow Lee et al.'s ("Beta Sampling is All You Need",
+    arXiv:2407.12173 Fig. 2d) observation that latent-diffusion models want an
+    *asymmetric* importance curve — more steps at the high-frequency detail
+    (low-σ) end than at the high-noise end — but are tuned for Anima's
+    rectified-flow ``σ(t)`` rather than transcribed literally. The paper's raw
+    LDM params ``Beta(0.5, 2.0) + Beta(3.0, 0.5)`` misbehave under the flow
+    shift map: the two ``x^{-1/2}`` singularities make the t-density nearly
+    *symmetric* (squandering the mixture) and, once pushed through σ(t),
+    over-pack the pure-noise ``σ ≈ 1`` end — where the denoiser changes least —
+    while colliding several steps at the table floor for step counts ≳ 40.
+    The tuned defaults keep a low-frequency peak at ``t ≈ 1``
+    (``Beta(0.8, 2.0)`` — α₁ raised from 0.5 to relieve that over-pack without
+    starving the high-σ end) and a stronger high-frequency peak near ``t ≈ 0``
+    (``Beta(3.0, 0.7)`` — genuinely more concentrated than the noise end, yet
+    clear of the floor: strictly descending through ~117 steps).
+    ``weight = 0.5`` balances the two; symmetric ``Beta(0.6, 0.6)`` (the plain
+    ``beta`` scheduler) instead forces both peaks to equal width.
+
+    Pair with a 2nd-order solver (``dpmpp_2m``, ``heunpp2``) for best
+    effect — step placement and per-step solver order are orthogonal
+    efficiency axes, so the gain compounds. The first sigma is exactly
+    ``σ(1)`` (1.0 for flow — the pure-noise init) and the last nonzero
+    sigma is the table floor ``σ(1/multiplier)``; a trailing 0 is appended.
+    """
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    if not 0.0 < weight < 1.0:
+        raise ValueError("weight must be in (0, 1); 0 or 1 collapses to a "
+                         "single Beta — use the 'beta' scheduler instead")
+    if alpha1 <= 0 or beta1 <= 0 or alpha2 <= 0 or beta2 <= 0:
+        raise ValueError("alpha1, beta1, alpha2, beta2 must all be > 0")
+    q = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    x = _beta_mixture_inv_cdf(q, weight, alpha1, beta1, alpha2, beta2)
+    t = (1.0 - x).clamp(min=1.0 / schedule.multiplier)
+    sigmas = schedule.t_to_sigma(t.to(torch.float32) * schedule.multiplier).to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
 # Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
 # / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
 # routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
@@ -385,22 +468,27 @@ _FLOW_TABLE_SCHEDULERS = {
     "linear_quadratic": linear_quadratic_schedule,
     "smoothstep": smoothstep_schedule,
     "beta": beta_schedule,
+    "beta_mix": beta_mix_schedule,
 }
 
 
 def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
                         alpha: float = 0.6, beta: float = 0.6,
                         threshold_noise: float = 0.025,
+                        bm_weight: float = 0.5,
+                        bm_alpha1: float = 0.8, bm_beta1: float = 2.0,
+                        bm_alpha2: float = 3.0, bm_beta2: float = 0.7,
                         device: torch.device | str = "cpu",
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Build a flow sigma schedule for the table/timestep-based schedulers by
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
     model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``linear_quadratic``,
-    ``smoothstep``, ``beta`` and ``kl_optimal``.
+    ``smoothstep``, ``beta``, ``beta_mix`` and ``kl_optimal``.
 
-    ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint density;
-    ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee. Both
-    are ignored by the schedulers that don't take them."""
+    ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint
+    density; ``bm_*`` tune the ``beta_mix`` two-Beta mixture;
+    ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee.
+    All are ignored by the schedulers that don't take them."""
     view = FlowSamplingView(shift, device=device, dtype=dtype)
     if scheduler == "kl_optimal":
         return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),
@@ -412,6 +500,9 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
     extra = {}
     if scheduler == "beta":
         extra = {"alpha": alpha, "beta": beta}
+    elif scheduler == "beta_mix":
+        extra = {"weight": bm_weight, "alpha1": bm_alpha1, "beta1": bm_beta1,
+                 "alpha2": bm_alpha2, "beta2": bm_beta2}
     elif scheduler == "linear_quadratic":
         extra = {"threshold_noise": threshold_noise}
     return fn(view, steps, device=device, dtype=dtype, **extra)

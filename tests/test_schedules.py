@@ -174,10 +174,76 @@ def test_beta_invalid_args_raise():
         S.beta_schedule(_flow_view(), 10, alpha=0.0)
 
 
+def test_beta_mix_endpoints_descent_and_u_shape():
+    """beta_mix generalizes beta to a two-Beta mixture; with the tuned defaults
+    (w=0.5, Beta(0.8,2.0)+Beta(3.0,0.7)) it stays descending with the same
+    endpoints as beta (σ(1)=1, σ(1/1000)=table floor, trailing 0), and the
+    density is U-shaped — denser at both ends, sparser in the middle — like
+    beta but *asymmetric toward the detail end*: per Lee et al. Fig. 2(d)'s
+    LDM importance curve, the high-freq (low-σ) peak is more concentrated than
+    the high-noise peak."""
+    view = _flow_view()
+    sig = S.beta_mix_schedule(view, 28)
+    assert sig.shape[0] == 29
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] > sig[1:])
+    assert abs(sig[0].item() - 1.0) < 1e-6                       # σ(t=1) == 1
+    assert abs(sig[-2].item() - float(view.sigma_min)) < 1e-4    # table floor
+
+    # U-shaped: both end gaps are smaller than the maximum mid-schedule gap.
+    gaps = sig[:-2] - sig[1:-1]                                  # exclude the →0 jump
+    assert gaps[0] < gaps.max() / 4
+    assert gaps[-1] < gaps.max() / 2
+
+    # Asymmetric toward the detail end — the reason beta_mix exists over the
+    # symmetric `beta`. Judged in *timestep* space: the flow shift map alone
+    # already makes σ-gaps finer at the noise end (dσ/dt is ~9× smaller there),
+    # so the asymmetry the mixture controls is only visible pre-shift.
+    t = view.sigma_to_t(sig[:-1]) / view.multiplier             # drop the →0 sigma
+    tgaps = t[:-1] - t[1:]
+    assert tgaps[-1] < tgaps[0]                                  # clean end denser in t
+
+
+def test_beta_mix_symmetric_params_match_beta():
+    """Sanity: when the two mixture components are identical and equal-weight,
+    beta_mix collapses to plain beta with the same (α, β). Verifies the
+    mixture math is consistent with the single-Beta path."""
+    sig_mix = S.beta_mix_schedule(_flow_view(), 20, weight=0.5,
+                                       alpha1=0.6, beta1=0.6,
+                                       alpha2=0.6, beta2=0.6)
+    sig_beta = S.beta_schedule(_flow_view(), 20, alpha=0.6, beta=0.6)
+    assert torch.allclose(sig_mix, sig_beta, atol=1e-4)
+
+
+def test_beta_mix_invalid_args_raise():
+    import pytest
+
+    with pytest.raises(ValueError):
+        S.beta_mix_schedule(_flow_view(), 0)
+    with pytest.raises(ValueError):
+        S.beta_mix_schedule(_flow_view(), 10, weight=0.0)        # collapses to single
+    with pytest.raises(ValueError):
+        S.beta_mix_schedule(_flow_view(), 10, weight=1.0)
+    with pytest.raises(ValueError):
+        S.beta_mix_schedule(_flow_view(), 10, alpha1=0.0)
+
+
+def test_beta_mix_default_strictly_descending_at_high_step_counts():
+    """The tuned defaults stay strictly descending across the step counts users
+    actually pick. The original SD-literal defaults (β₂=0.5) over-concentrated
+    the detail end so hard that several steps collided at the table floor for
+    step counts ≳ 40 (equal σ = a wasted NFE); the tuned β₂=0.7 stays clear."""
+    view = _flow_view()
+    for steps in (40, 50, 64, 100):
+        sig = S.beta_mix_schedule(view, steps)
+        assert torch.all(sig[:-1] > sig[1:]), f"floor collision at {steps} steps"
+
+
 def test_flow_table_schedule_dispatches_all_names():
     # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
-    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic", "smoothstep", "beta", "kl_optimal"):
+    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic",
+                 "smoothstep", "beta", "beta_mix", "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name
@@ -186,20 +252,35 @@ def test_flow_table_schedule_dispatches_all_names():
 
 
 def test_flow_table_schedule_forwards_knobs():
-    # beta α/β and linear_quadratic threshold_noise must reach their schedulers;
-    # the defaults reproduce the no-knob call (so generation is unchanged when the
-    # settings panel is untouched), and a knob-agnostic scheduler ignores them.
+    # beta α/β, beta_mix w/α₁/β₁/α₂/β₂, and linear_quadratic threshold_noise
+    # must reach their schedulers; the defaults reproduce the no-knob call (so
+    # generation is unchanged when the settings panel is untouched), and a
+    # knob-agnostic scheduler ignores them.
     base_beta = S.flow_table_schedule("beta", shift=3.0, steps=12)
     assert torch.allclose(base_beta, S.flow_table_schedule("beta", shift=3.0, steps=12, alpha=0.6, beta=0.6))
     assert not torch.allclose(base_beta, S.flow_table_schedule("beta", shift=3.0, steps=12, alpha=0.3, beta=0.9))
+
+    base_mix = S.flow_table_schedule("beta_mix", shift=3.0, steps=12)
+    assert torch.allclose(base_mix, S.flow_table_schedule(
+        "beta_mix", shift=3.0, steps=12,
+        bm_weight=0.5, bm_alpha1=0.8, bm_beta1=2.0, bm_alpha2=3.0, bm_beta2=0.7))
+    # Changing any single knob perturbs the schedule (mixture is sensitive to all 5).
+    perturbed = S.flow_table_schedule("beta_mix", shift=3.0, steps=12, bm_weight=0.3)
+    assert not torch.allclose(base_mix, perturbed)
+    perturbed = S.flow_table_schedule("beta_mix", shift=3.0, steps=12, bm_alpha2=5.0)
+    assert not torch.allclose(base_mix, perturbed)
 
     base_lq = S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12)
     assert torch.allclose(base_lq, S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12, threshold_noise=0.025))
     assert not torch.allclose(base_lq, S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12, threshold_noise=0.2))
 
+    # Knob-agnostic schedulers ignore all the per-scheduler knobs.
     assert torch.allclose(
         S.flow_table_schedule("sgm_uniform", shift=3.0, steps=12),
-        S.flow_table_schedule("sgm_uniform", shift=3.0, steps=12, alpha=0.1, beta=0.9, threshold_noise=0.5),
+        S.flow_table_schedule("sgm_uniform", shift=3.0, steps=12,
+                              alpha=0.1, beta=0.9, threshold_noise=0.5,
+                              bm_weight=0.7, bm_alpha1=0.3, bm_beta1=1.0,
+                              bm_alpha2=2.0, bm_beta2=0.4),
     )
 
 

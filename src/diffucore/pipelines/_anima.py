@@ -56,6 +56,7 @@ _FLOW_AWARE_SAMPLERS = {
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
     "normal", "kl_optimal", "linear_quadratic", "smoothstep", "beta",
+    "beta_mix",
 )
 
 if TYPE_CHECKING:
@@ -105,6 +106,9 @@ def anima_text_to_image(
     beta_alpha: float = 0.6,
     beta_beta: float = 0.6,
     lq_threshold: float = 0.025,
+    bm_weight: float = 0.5,
+    bm_alpha1: float = 0.8, bm_beta1: float = 2.0,
+    bm_alpha2: float = 3.0, bm_beta2: float = 0.7,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
@@ -178,6 +182,9 @@ def anima_text_to_image(
         else:
             sigmas = flow_table_schedule(scheduler, shift, steps, alpha=beta_alpha,
                                          beta=beta_beta, threshold_noise=lq_threshold,
+                                         bm_weight=bm_weight, bm_alpha1=bm_alpha1,
+                                         bm_beta1=bm_beta1, bm_alpha2=bm_alpha2,
+                                         bm_beta2=bm_beta2,
                                          device=device, dtype=torch.float32)
         h_lat, w_lat = height // 8, width // 8
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
@@ -276,6 +283,9 @@ def anima_img2img(
     beta_alpha: float = 0.6,
     beta_beta: float = 0.6,
     lq_threshold: float = 0.025,
+    bm_weight: float = 0.5,
+    bm_alpha1: float = 0.8, bm_beta1: float = 2.0,
+    bm_alpha2: float = 3.0, bm_beta2: float = 0.7,
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
@@ -338,6 +348,9 @@ def anima_img2img(
         else:
             sigmas = flow_table_schedule(scheduler, shift, sched_steps, alpha=beta_alpha,
                                          beta=beta_beta, threshold_noise=lq_threshold,
+                                         bm_weight=bm_weight, bm_alpha1=bm_alpha1,
+                                         bm_beta1=bm_beta1, bm_alpha2=bm_alpha2,
+                                         bm_beta2=bm_beta2,
                                          device=device, dtype=torch.float32)
 
         # ---- 3. encode init → DiT-space latent z0; build strength-noised start

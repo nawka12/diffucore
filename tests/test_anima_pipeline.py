@@ -145,9 +145,18 @@ def test_anima_scheduler_choice_changes_output(pipe):
     flow = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="flow"))
     lq = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="linear_quadratic"))
     ss = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="smoothstep"))
+    beta = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="beta"))
+    mix = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="beta_mix"))
     assert not np.array_equal(flow, lq)
     assert not np.array_equal(flow, ss)
     assert not np.array_equal(lq, ss)
+    # beta_mix and beta share the endpoint σ values, so they must each
+    # differ from flow (sanity) and from each other (verifies the mixture's
+    # asymmetric shape actually flows through to pixels, not silently aliased
+    # back to beta or flow).
+    assert not np.array_equal(flow, beta)
+    assert not np.array_equal(flow, mix)
+    assert not np.array_equal(beta, mix)
 
 
 def test_anima_calibrate_oss_produces_valid_schedule(pipe):

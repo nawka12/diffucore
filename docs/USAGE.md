@@ -61,7 +61,8 @@ image = TextToImage(model)(
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
   `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
   (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`, `simple`,
-  `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep`, `beta` (Anima); `flux` (default), `flow`,
+  `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep`, `beta`,
+  `beta_mix` (Anima); `flux` (default), `flow`,
   `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
   `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
   pipelines' σ_max = 1 init assumes).
@@ -75,6 +76,17 @@ image = TextToImage(model)(
   `beta` (Anima) places timesteps at Beta(0.6, 0.6) quantiles before the flow
   shift map — a tunable U-shape (the ComfyUI `beta` schedule, pure-torch) that
   the community favors with DPM++-family samplers.
+  `beta_mix` (Anima) generalizes `beta` to a two-Beta mixture
+  `w·Beta(α₁,β₁) + (1−w)·Beta(α₂,β₂)` so the two endpoint peaks can differ in
+  shape — the symmetric `beta` forces them to match. Defaults `(w, α₁, β₁, α₂,
+  β₂) = (0.5, 0.8, 2.0, 3.0, 0.7)` follow Lee et al. (2024, arXiv:2407.12173
+  Fig. 2d)'s finding that LDMs want an *asymmetric* curve — more steps at the
+  high-freq detail (low-σ) end than at the high-noise end — but are tuned for
+  Anima's flow shift map rather than transcribed literally: the paper's raw
+  `Beta(0.5,2.0)+Beta(3.0,0.5)` come out near-*symmetric* once mapped through
+  σ(t), over-pack the pure-noise σ≈1 end, and collide steps at the σ floor for
+  step counts ≳40. Pair with a 2nd-order solver (`dpmpp_2m`, `heunpp2`) for
+  best effect.
 
 ### Anima (DiT)
 

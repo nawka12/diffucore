@@ -15,6 +15,7 @@ from .schedules import (
     linear_quadratic_schedule,
     smoothstep_schedule,
     beta_schedule,
+    beta_mix_schedule,
     flow_table_schedule,
     FlowSamplingView,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "linear_quadratic_schedule",
     "smoothstep_schedule",
     "beta_schedule",
+    "beta_mix_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
     "optimal_step_schedule",
