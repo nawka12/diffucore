@@ -604,6 +604,203 @@ def sample_dpmpp_3m_sde(
     return x
 
 
+def sample_exp_heun_2_x0(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+    solver_type: str = "phi_2",
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """Exponential Heun, second order, in data-prediction (x0) and half-logSNR
+    time. Deterministic single-step true Heun: predict x0 at the current sigma,
+    take a first-order exponential (DPM-Solver++(1)) step to the next sigma,
+    re-evaluate x0 there, then combine the two estimates with the exponential
+    integrator's phi_1/phi_2 weights. Two model evaluations per step, no history
+    reuse (unlike the multistep :func:`sample_dpmpp_2m`). Flow-aware via the
+    half-logSNR mapping (``model_type``/``shift``).
+
+    This is the deterministic (eta=0), full-step (r=1) special case of the SEEDS
+    exponential SDE solver (Gonzalez et al., "SEEDS: Exponential SDE Solvers for
+    Fast High-Quality Sampling from Diffusion Models", NeurIPS 2023,
+    arXiv:2305.14267), built on the DPM-Solver++ exponential integrator (Lu et
+    al., arXiv:2211.01095). ``solver_type`` picks the corrector: ``"phi_2"``
+    (default) uses the phi_2-weighted Heun combination; ``"phi_1"`` the simpler
+    trapezoidal (phi_1) average of the two x0 estimates."""
+    if len(sigmas) <= 1:
+        return x
+    if solver_type not in ("phi_1", "phi_2"):
+        raise ValueError("solver_type must be 'phi_1' or 'phi_2'")
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+            continue
+        lambda_s, lambda_t = lambda_fn(sigma), lambda_fn(sigma_next)
+        h = lambda_t - lambda_s
+        alpha_t = sigma_next * lambda_t.exp()
+        phi_1 = (-h).expm1()                       # e^{-h} - 1  (== h·phi_1(-h))
+        # Predictor: first-order exponential (DPM++(1)) step to sigma_next.
+        x_pred = (sigma_next / sigma) * x - alpha_t * phi_1 * denoised
+        denoised_2 = model(x_pred, sigma_next * s_in)
+        # Corrector with the second x0 estimate at sigma_next.
+        if solver_type == "phi_1":
+            denoised_d = 0.5 * (denoised + denoised_2)
+            x = (sigma_next / sigma) * x - alpha_t * phi_1 * denoised_d
+        else:
+            phi_2 = (phi_1 + h) / (-h)             # (e^{-h} - 1 + h)/(-h)  (== h·phi_2(-h))
+            b2 = phi_2
+            b1 = phi_1 - b2
+            x = (sigma_next / sigma) * x - alpha_t * (b1 * denoised + b2 * denoised_2)
+    return x
+
+
+def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
+                      sigma_t, lambda_t, s_in, order, variant):
+    """One UniPC predictor + corrector step in data-prediction (x0) form.
+
+    Builds the predictor from the last ``order`` x0 estimates (``model_prev``,
+    newest last) and their half-logSNRs, then re-evaluates the model at the
+    predicted point to apply the corrector. Returns ``(x_t, model_t)``; ``model_t``
+    is the corrector's x0 evaluation at ``sigma_t``, reused as the next step's
+    newest history (so UniPC stays ~1 evaluation per step). ``variant`` selects
+    the ``B(h)`` solver type (``"bh1"``/``"bh2"``)."""
+    device = x.device
+    m0 = model_prev[-1]
+    sigma_prev_0 = sigma_prev[-1]
+    h = lambda_t - lambda_prev[-1]
+    alpha_t = sigma_t * lambda_t.exp()
+
+    rks, D1s = [], []
+    for i in range(1, order):
+        rk = (lambda_prev[-(i + 1)] - lambda_prev[-1]) / h
+        rks.append(rk)
+        D1s.append((model_prev[-(i + 1)] - m0) / rk)
+    rks.append(torch.ones((), device=device, dtype=h.dtype))
+    rks = torch.stack(rks)
+
+    hh = -h                                  # data-prediction (x0) form
+    h_phi_1 = hh.expm1()                     # e^{hh} - 1 == hh·phi_1(hh)
+    h_phi_k = h_phi_1 / hh - 1
+    B_h = hh if variant == "bh1" else hh.expm1()
+
+    R, b = [], []
+    factorial_i = 1
+    for i in range(1, order + 1):
+        R.append(rks ** (i - 1))
+        b.append(h_phi_k * factorial_i / B_h)
+        factorial_i *= (i + 1)
+        h_phi_k = h_phi_k / hh - 1.0 / factorial_i
+    R = torch.stack(R)
+    b = torch.stack(b)
+
+    D1s = torch.stack(D1s, dim=1) if D1s else None   # (B, K, *spatial)
+
+    def combine(rhos, D):
+        rr = rhos.to(D.dtype).view(1, -1, *([1] * (D.ndim - 2)))
+        return (rr * D).sum(dim=1)
+
+    # Predictor: first-order exponential step plus the higher-order residual.
+    x_t_ = (sigma_t / sigma_prev_0) * x - alpha_t * h_phi_1 * m0
+    if D1s is not None:
+        if order == 2:                       # closed form for the 2nd-order case
+            rhos_p = torch.tensor([0.5], device=device, dtype=b.dtype)
+        else:
+            rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1])
+        pred_res = combine(rhos_p, D1s)
+    else:
+        pred_res = 0.0
+    x_t = x_t_ - alpha_t * B_h * pred_res
+
+    # Corrector: re-evaluate x0 at the predicted point and fold it in.
+    model_t = model(x_t, sigma_t * s_in)
+    if order == 1:
+        rhos_c = torch.tensor([0.5], device=device, dtype=b.dtype)
+    else:
+        rhos_c = torch.linalg.solve(R, b)
+    corr_res = combine(rhos_c[:-1], D1s) if D1s is not None else 0.0
+    D1_t = model_t - m0
+    x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+    return x_t, model_t
+
+
+def sample_uni_pc(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+    order: int = 3,
+    variant: str = "bh1",
+    lower_order_final: bool = True,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """UniPC: Unified Predictor-Corrector multistep solver (Zhao et al., "UniPC:
+    A Unified Predictor-Corrector Framework for Fast Sampling of Diffusion
+    Models", NeurIPS 2023, arXiv:2302.04867). Data-prediction (x0) form.
+
+    Each step predicts the next latent from the last ``order`` x0 estimates, then
+    re-evaluates the model once at the prediction to apply the corrector; that
+    evaluation becomes the next step's newest history, so UniPC stays ~one model
+    evaluation per step despite being predictor-corrector. ``variant`` is the
+    ``B(h)`` solver type: ``"bh1"`` or ``"bh2"`` (bh2 often edges ahead at very
+    low step counts). ``lower_order_final`` ramps the order back down over the
+    last steps for stability. Flow-aware via the half-logSNR map
+    (``model_type``/``shift``)."""
+    if len(sigmas) <= 1:
+        return x
+    if variant not in ("bh1", "bh2"):
+        raise ValueError("variant must be 'bh1' or 'bh2'")
+    if order < 1:
+        raise ValueError("order must be >= 1")
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    n = len(sigmas) - 1
+
+    model_prev, sigma_prev, lambda_prev = [], [], []
+
+    def push(sig, m):
+        sigma_prev.append(sig)
+        lambda_prev.append(lambda_fn(sig))
+        model_prev.append(m)
+        if len(model_prev) > order:
+            sigma_prev.pop(0)
+            lambda_prev.pop(0)
+            model_prev.pop(0)
+
+    m0 = model(x, sigmas[0] * s_in)
+    if callback is not None:
+        callback(0, sigmas[0], x, m0)
+    push(sigmas[0], m0)
+
+    for step in range(1, n + 1):
+        sigma_t = sigmas[step]
+        if bool(sigma_t == 0):           # final clean step: land on the x0 estimate
+            x = model_prev[-1]
+            break
+        cur_order = min(order, len(model_prev))
+        if lower_order_final:
+            cur_order = min(cur_order, n - step)   # ramp order down near σ→0
+        x, model_t = _uni_pc_bh_update(
+            model, x, model_prev, sigma_prev, lambda_prev,
+            sigma_t, lambda_fn(sigma_t), s_in, cur_order, variant,
+        )
+        if callback is not None:
+            callback(step, sigma_t, x, model_t)
+        push(sigma_t, model_t)
+    return x
+
+
 def sample_secant(
     model: Denoiser,
     x: torch.Tensor,
@@ -1252,6 +1449,9 @@ SAMPLERS: dict[str, Denoiser] = {
     "secant": sample_secant,
     "secant_anneal": sample_secant_anneal,
     "dpmpp_2m_anneal": sample_dpmpp_2m_anneal,
+    "exp_heun_2_x0": sample_exp_heun_2_x0,
+    "uni_pc": partial(sample_uni_pc, variant="bh1"),
+    "uni_pc_bh2": partial(sample_uni_pc, variant="bh2"),
 }
 
 

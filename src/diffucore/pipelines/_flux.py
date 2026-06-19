@@ -41,7 +41,7 @@ _FLUX_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
     "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
-    "gradient_estimation", "lms", "lcm", "secant",
+    "gradient_estimation", "lms", "lcm", "secant", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
@@ -252,6 +252,8 @@ def flux_text_to_image(
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
                     kwargs = dict(generator=gen, model_type="flow", shift=eff_shift)
+                elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
+                    kwargs = dict(model_type="flow", shift=eff_shift)
                 if sampler == "secant":
                     kwargs.setdefault("generator", gen)
                 with _step_progress(len(sigmas) - 1, progress_callback) as on_step:
@@ -417,6 +419,8 @@ def flux_img2img(
             kwargs = {}
             if sampler in _FLOW_AWARE_SAMPLERS:
                 kwargs = dict(generator=gen, model_type="flow", shift=eff_shift)
+            elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
+                kwargs = dict(model_type="flow", shift=eff_shift)
             if sampler == "secant":
                 kwargs.setdefault("generator", gen)
             with _step_progress(len(sigmas) - 1, progress_callback) as on_step:

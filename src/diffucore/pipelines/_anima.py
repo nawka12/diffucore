@@ -44,7 +44,7 @@ _ANIMA_SAMPLERS = {
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
     "res_multistep_ancestral", "gradient_estimation", "lms", "lcm", "secant", "secant_anneal",
-    "dpmpp_2m_anneal",
+    "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
@@ -238,6 +238,8 @@ def anima_text_to_image(
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
                     kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
+                elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
+                    kwargs = dict(model_type="flow", shift=sched_shift)
                 if sampler in ("secant", "secant_anneal"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
@@ -398,6 +400,8 @@ def anima_img2img(
             kwargs = {}
             if sampler in _FLOW_AWARE_SAMPLERS:
                 kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
+            elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
+                kwargs = dict(model_type="flow", shift=sched_shift)
             if sampler in ("secant", "secant_anneal"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature

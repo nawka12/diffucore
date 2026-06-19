@@ -270,7 +270,8 @@ def test_secant_registered_in_sampler_table():
 
 
 @pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
-                                  "gradient_estimation", "lms"])
+                                  "gradient_estimation", "lms", "exp_heun_2_x0",
+                                  "uni_pc", "uni_pc_bh2"])
 @pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
 def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
     target = torch.full((1, 4, 4, 4), 0.2)
@@ -528,6 +529,177 @@ def test_dpmpp_2m_anneal_seed_reproducible_and_stochastic():
 
 def test_dpmpp_2m_anneal_registered_in_sampler_table():
     assert K.get_sampler("dpmpp_2m_anneal") is K.sample_dpmpp_2m_anneal
+
+
+# ── EXP-HEUN-2-x0 ─────────────────────────────────────────────────────
+
+
+def test_exp_heun_2_x0_constant_x0_matches_dpmpp_2m():
+    # With a constant-x0 denoiser the semilinear ODE has no truncation error, so
+    # every exponential-integrator solver coincides. In ``ve`` mode exp_heun uses
+    # the same half-logSNR map (-log σ) as dpmpp_2m, so they must agree exactly.
+    target = torch.full((1, 4, 8, 8), 0.15)
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 8, 8) * sigmas[0]
+    heun = K.sample_exp_heun_2_x0(const_denoiser(target), x_init.clone(), sigmas)
+    ref = K.sample_dpmpp_2m(const_denoiser(target), x_init.clone(), sigmas)
+    assert torch.isfinite(heun).all()
+    assert torch.allclose(heun, ref, atol=1e-5)
+
+
+def test_exp_heun_2_x0_corrector_is_active():
+    # On a σ-dependent denoiser the second evaluation matters: the phi_2 (Heun)
+    # and phi_1 (trapezoidal) correctors must differ from each other, and the
+    # full method must differ from the multistep dpmpp_2m. A constant-x0 denoiser
+    # would collapse all three together (covered by the test above), so use a
+    # genuinely nonlinear one here.
+    torch.manual_seed(0)
+    target = torch.randn(1, 4, 8, 8)
+
+    def model(x, sigma):
+        s = sigma.view(-1, 1, 1, 1)
+        g = 1.0 / (1.0 + (4.0 * s) ** 2)          # x0 settles toward target as σ→0
+        return g * target + (1.0 - g) * 3.0 * torch.sin(3.0 * x)
+
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 8, 8) * sigmas[0]
+    phi2 = K.sample_exp_heun_2_x0(model, x_init.clone(), sigmas, solver_type="phi_2")
+    phi1 = K.sample_exp_heun_2_x0(model, x_init.clone(), sigmas, solver_type="phi_1")
+    twom = K.sample_dpmpp_2m(model, x_init.clone(), sigmas)
+    assert torch.isfinite(phi2).all()
+    assert not torch.allclose(phi2, phi1, atol=1e-4)   # both correctors wired
+    assert not torch.allclose(phi2, twom, atol=1e-4)   # genuinely a different scheme
+
+
+def test_exp_heun_2_x0_deterministic():
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    a = K.sample_exp_heun_2_x0(const_denoiser(target), x_init.clone(), sigmas)
+    b = K.sample_exp_heun_2_x0(const_denoiser(target), x_init.clone(), sigmas)
+    assert torch.equal(a, b)
+
+
+def test_exp_heun_2_x0_flow_finite_and_lands_clean():
+    # Flow mode offsets the first sigma off 1.0 (where alpha = 1 - σ is 0 and the
+    # half-logSNR is infinite); the whole trajectory must stay finite and land on
+    # the constant prediction.
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    assert sigmas[0].item() == 1.0
+    x_init = torch.randn(1, 16, 4, 4)
+    out = K.sample_exp_heun_2_x0(
+        const_denoiser(target), x_init, sigmas, model_type="flow", shift=3.0,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_exp_heun_2_x0_bad_solver_type_raises():
+    with pytest.raises(ValueError):
+        K.sample_exp_heun_2_x0(
+            const_denoiser(torch.zeros(1, 4, 4, 4)), torch.randn(1, 4, 4, 4),
+            _ve_sigmas(), solver_type="phi_3",
+        )
+
+
+def test_exp_heun_2_x0_registered_in_sampler_table():
+    assert K.get_sampler("exp_heun_2_x0") is K.sample_exp_heun_2_x0
+
+
+# ── UniPC ─────────────────────────────────────────────────────────────
+
+
+def _unipc_sigma_dependent_model(target):
+    # A σ-dependent x0 denoiser so the higher-order predictor/corrector terms are
+    # actually exercised (a constant-x0 denoiser zeros every divided difference,
+    # collapsing all orders to the first-order exponential step).
+    def model(x, sigma):
+        s = sigma.view(-1, 1, 1, 1)
+        g = 1.0 / (1.0 + (4.0 * s) ** 2)          # x0 settles toward target as σ→0
+        return g * target + (1.0 - g) * 3.0 * torch.sin(3.0 * x)
+    return model
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+@pytest.mark.parametrize("variant", ["bh1", "bh2"])
+@pytest.mark.parametrize("model_type,sigmas_fn", [("ve", _ve_sigmas), ("flow", _flow_sigmas)])
+def test_uni_pc_constant_x0_lands_clean(order, variant, model_type, sigmas_fn):
+    # With a constant-x0 denoiser the ODE is exactly linear, so every order/variant
+    # must stay finite and land on the prediction (and the σ→0 snap guarantees the
+    # endpoint).
+    target = torch.full((1, 4, 4, 4), 0.2)
+    sigmas = sigmas_fn()
+    shift = 3.0 if model_type == "flow" else 1.0
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    out = K.sample_uni_pc(
+        const_denoiser(target), x_init.clone(), sigmas,
+        order=order, variant=variant, model_type=model_type, shift=shift,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-3)
+
+
+def test_uni_pc_higher_order_and_variant_are_active():
+    # On a σ-dependent denoiser the higher-order terms must actually change the
+    # result: order 3 differs from order 1, bh1 differs from bh2, and UniPC is a
+    # genuinely different scheme than the dpmpp_2m multistep.
+    torch.manual_seed(0)
+    target = torch.randn(1, 4, 8, 8)
+    model = _unipc_sigma_dependent_model(target)
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 8, 8) * sigmas[0]
+
+    o1 = K.sample_uni_pc(model, x_init.clone(), sigmas, order=1, variant="bh1")
+    o3_bh1 = K.sample_uni_pc(model, x_init.clone(), sigmas, order=3, variant="bh1")
+    o3_bh2 = K.sample_uni_pc(model, x_init.clone(), sigmas, order=3, variant="bh2")
+    twom = K.sample_dpmpp_2m(model, x_init.clone(), sigmas)
+
+    assert torch.isfinite(o3_bh1).all()
+    assert not torch.allclose(o3_bh1, o1, atol=1e-4)       # order actually matters
+    assert not torch.allclose(o3_bh1, o3_bh2, atol=1e-5)   # bh1 vs bh2 both wired
+    assert not torch.allclose(o3_bh1, twom, atol=1e-4)     # distinct from dpmpp_2m
+
+
+def test_uni_pc_deterministic():
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    a = K.sample_uni_pc(const_denoiser(target), x_init.clone(), sigmas)
+    b = K.sample_uni_pc(const_denoiser(target), x_init.clone(), sigmas)
+    assert torch.equal(a, b)
+
+
+def test_uni_pc_flow_finite_and_lands_clean():
+    # Flow mode offsets the first sigma off 1.0 (infinite half-logSNR there); the
+    # whole trajectory must stay finite and land on the constant prediction.
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    assert sigmas[0].item() == 1.0
+    x_init = torch.randn(1, 16, 4, 4)
+    out = K.sample_uni_pc(
+        const_denoiser(target), x_init, sigmas, model_type="flow", shift=3.0,
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_uni_pc_bad_args_raise():
+    sigmas = _ve_sigmas()
+    x = torch.randn(1, 4, 4, 4)
+    with pytest.raises(ValueError):
+        K.sample_uni_pc(const_denoiser(torch.zeros(1, 4, 4, 4)), x, sigmas, variant="bh3")
+    with pytest.raises(ValueError):
+        K.sample_uni_pc(const_denoiser(torch.zeros(1, 4, 4, 4)), x, sigmas, order=0)
+
+
+def test_uni_pc_variants_registered():
+    import functools
+    for name, variant in [("uni_pc", "bh1"), ("uni_pc_bh2", "bh2")]:
+        fn = K.get_sampler(name)
+        assert isinstance(fn, functools.partial)
+        assert fn.func is K.sample_uni_pc
+        assert fn.keywords == {"variant": variant}
 
 
 def test_all_registered_samplers_resolve():
