@@ -702,6 +702,121 @@ def test_uni_pc_variants_registered():
         assert fn.keywords == {"variant": variant}
 
 
+# ── UniPC-ANNEAL ──────────────────────────────────────────────────────
+
+
+def test_uni_pc_anneal_flow_only():
+    with pytest.raises(ValueError):
+        K.sample_uni_pc_anneal(
+            const_denoiser(torch.zeros(1, 4, 4, 4)), torch.randn(1, 4, 4, 4),
+            S.flow_matching_schedule(8, shift=3.0), model_type="ve",
+        )
+
+
+def test_uni_pc_anneal_bad_args_raise():
+    sigmas = S.flow_matching_schedule(8, shift=3.0)
+    x = torch.randn(1, 4, 4, 4)
+    with pytest.raises(ValueError):
+        K.sample_uni_pc_anneal(const_denoiser(torch.zeros(1, 4, 4, 4)), x, sigmas, variant="bh3")
+    with pytest.raises(ValueError):
+        K.sample_uni_pc_anneal(const_denoiser(torch.zeros(1, 4, 4, 4)), x, sigmas, order=0)
+
+
+def test_uni_pc_anneal_constant_x0_ends_clean():
+    # Stochastic burn-in at high σ, but the final step (σ_next == 0) snaps to the
+    # constant prediction.
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 16, 4, 4)
+    out = K.sample_uni_pc_anneal(
+        const_denoiser(target), x_init.clone(), sigmas,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_uni_pc_anneal_eta_max_zero_equals_uni_pc_bh2():
+    # eta_max=0 ⇒ eta=0 every step ⇒ hh=-h, carry factor 1, no re-noise ⇒ the
+    # update reduces to the deterministic UniPC step bit-for-bit (same default
+    # variant bh2 / order 3 / flow map / shift). A σ-dependent denoiser exercises
+    # the higher-order predictor-corrector residual, so the equivalence is not the
+    # trivial first-order one.
+    torch.manual_seed(2)
+    target = torch.randn(1, 4, 8, 8)
+    model = _unipc_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    upc = _last_nonzero_latent(K.sample_uni_pc, model, x_init, sigmas,
+                               variant="bh2", model_type="flow", shift=3.0)
+    anz = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
+                               eta_max=0.0, variant="bh2", model_type="flow", shift=3.0)
+    assert torch.isfinite(anz).all()
+    assert torch.allclose(anz, upc, atol=1e-6)
+
+
+def test_uni_pc_anneal_seed_reproducible_and_stochastic():
+    # Same seed ⇒ identical trajectory; the annealed burn-in (eta_max>0) must
+    # actually change it versus the deterministic (eta_max=0) run.
+    target = torch.zeros(1, 8, 4, 4)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 8, 4, 4)
+
+    def run(**kw):
+        return _last_nonzero_latent(K.sample_uni_pc_anneal, const_denoiser(target),
+                                    x_init, sigmas, model_type="flow", shift=3.0, **kw)
+
+    a = run(generator=torch.Generator().manual_seed(3))
+    b = run(generator=torch.Generator().manual_seed(3))
+    det = run(eta_max=0.0)
+    assert torch.equal(a, b)
+    assert not torch.allclose(a, det, atol=1e-5)
+
+
+def test_uni_pc_anneal_high_eta_stays_finite_with_order_ramp():
+    # The order-ramp-up holds the order near 1 at high σ (where the injected noise
+    # is largest), so even eta_max=1.0 on a σ-dependent denoiser — which exercises
+    # the higher-order divided differences — stays finite and bounded rather than
+    # blowing up. Compared against the deterministic (eta_max=0) run on the same
+    # seed, the burn-in must also actually change the trajectory.
+    torch.manual_seed(5)
+    target = torch.randn(1, 4, 8, 8)
+    model = _unipc_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    hi = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
+                              eta_max=1.0, model_type="flow", shift=3.0,
+                              generator=torch.Generator().manual_seed(0))
+    det = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
+                               eta_max=0.0, model_type="flow", shift=3.0)
+    assert torch.isfinite(hi).all()
+    assert hi.abs().max() < 1e3            # bounded, not amplifying to garbage
+    assert not torch.allclose(hi, det, atol=1e-4)
+
+
+def test_uni_pc_anneal_order_ramp_inactive_when_deterministic():
+    # The ramp is gated on η > 0, so eta_max=0 must be bit-for-bit deterministic
+    # UniPC (bh2) even though the high-order terms (and thus the ramp's target) are
+    # exercised by a σ-dependent denoiser. This guards the degradation invariant
+    # against the order-ramp change.
+    torch.manual_seed(6)
+    target = torch.randn(1, 4, 8, 8)
+    model = _unipc_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+    upc = _last_nonzero_latent(K.sample_uni_pc, model, x_init, sigmas,
+                               variant="bh2", model_type="flow", shift=3.0)
+    anz = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
+                               eta_max=0.0, variant="bh2", model_type="flow", shift=3.0)
+    assert torch.allclose(anz, upc, atol=1e-6)
+
+
+def test_uni_pc_anneal_registered_in_sampler_table():
+    assert K.get_sampler("uni_pc_anneal") is K.sample_uni_pc_anneal
+
+
 def test_all_registered_samplers_resolve():
     for name, fn in K.SAMPLERS.items():
         assert K.get_sampler(name) is fn

@@ -44,12 +44,13 @@ _ANIMA_SAMPLERS = {
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
     "res_multistep_ancestral", "gradient_estimation", "lms", "lcm", "secant", "secant_anneal",
-    "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
+    "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "dpmpp_2m_anneal",
+    "uni_pc_anneal",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
@@ -245,6 +246,9 @@ def anima_text_to_image(
                     kwargs["curvature"] = curvature
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal"):
                     kwargs["eta_max"] = eta_max
+                # uni_pc_anneal intentionally omitted: even with its order-ramp the
+                # shared 1.0 panel default over-softens it (deterministic stays
+                # cleanest), so it ships a low baked-in eta_max (0.2).
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
@@ -407,6 +411,8 @@ def anima_img2img(
                 kwargs["curvature"] = curvature
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal"):
                 kwargs["eta_max"] = eta_max
+            # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
+            # low baked-in eta_max (0.2) instead of the shared 1.0 panel default.
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 

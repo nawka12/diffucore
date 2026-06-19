@@ -53,6 +53,7 @@ __all__ = [
     "sample_secant",
     "sample_secant_anneal",
     "sample_dpmpp_2m_anneal",
+    "sample_uni_pc_anneal",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -664,7 +665,9 @@ def sample_exp_heun_2_x0(
 
 
 def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
-                      sigma_t, lambda_t, s_in, order, variant):
+                      sigma_t, lambda_t, s_in, order, variant,
+                      *, eta: float = 0.0, s_noise: float = 1.0,
+                      generator: Optional[torch.Generator] = None):
     """One UniPC predictor + corrector step in data-prediction (x0) form.
 
     Builds the predictor from the last ``order`` x0 estimates (``model_prev``,
@@ -672,7 +675,16 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
     predicted point to apply the corrector. Returns ``(x_t, model_t)``; ``model_t``
     is the corrector's x0 evaluation at ``sigma_t``, reused as the next step's
     newest history (so UniPC stays ~1 evaluation per step). ``variant`` selects
-    the ``B(h)`` solver type (``"bh1"``/``"bh2"``)."""
+    the ``B(h)`` solver type (``"bh1"``/``"bh2"``).
+
+    ``eta > 0`` turns the step stochastic the same way the exponential multistep
+    SDE solvers (:func:`sample_dpmpp_2m_sde`) do: the exponential weights use the
+    η-folded step ``hh = -h·(1+η)`` (the ``phi``/``B(h)`` terms only — the ``rks``
+    step-size *ratios* are pure geometry and stay on ``h``), the first-order carry
+    is contracted by ``e^{-h·η}``, and Gaussian noise of std
+    ``σ_t·sqrt(-expm1(-2·h·η))·s_noise`` is re-injected after the corrector.
+    ``eta=0`` leaves every term untouched, so the deterministic UniPC step is
+    recovered bit-for-bit (``-h·(1+0)==-h``, ``e^{0}==1``, ``std==0``)."""
     device = x.device
     m0 = model_prev[-1]
     sigma_prev_0 = sigma_prev[-1]
@@ -687,7 +699,7 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
     rks.append(torch.ones((), device=device, dtype=h.dtype))
     rks = torch.stack(rks)
 
-    hh = -h                                  # data-prediction (x0) form
+    hh = -h * (1.0 + eta)                    # data-prediction (x0) form, η-folded
     h_phi_1 = hh.expm1()                     # e^{hh} - 1 == hh·phi_1(hh)
     h_phi_k = h_phi_1 / hh - 1
     B_h = hh if variant == "bh1" else hh.expm1()
@@ -709,7 +721,8 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
         return (rr * D).sum(dim=1)
 
     # Predictor: first-order exponential step plus the higher-order residual.
-    x_t_ = (sigma_t / sigma_prev_0) * x - alpha_t * h_phi_1 * m0
+    # ``e^{-h·η}`` contracts the carry (η=0 ⇒ factor 1, exact UniPC).
+    x_t_ = (sigma_t / sigma_prev_0) * (-h * eta).exp() * x - alpha_t * h_phi_1 * m0
     if D1s is not None:
         if order == 2:                       # closed form for the 2nd-order case
             rhos_p = torch.tensor([0.5], device=device, dtype=b.dtype)
@@ -729,6 +742,11 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
     corr_res = combine(rhos_c[:-1], D1s) if D1s is not None else 0.0
     D1_t = model_t - m0
     x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
+
+    # σ-annealed ancestral re-noise (rectified-flow SDE), as in dpmpp_2m_sde.
+    if eta > 0 and s_noise > 0:
+        std = (-2.0 * h * eta).expm1().neg().sqrt()
+        x_t = x_t + _noise_like(x, generator) * sigma_t * std * s_noise
     return x_t, model_t
 
 
@@ -794,6 +812,131 @@ def sample_uni_pc(
         x, model_t = _uni_pc_bh_update(
             model, x, model_prev, sigma_prev, lambda_prev,
             sigma_t, lambda_fn(sigma_t), s_in, cur_order, variant,
+        )
+        if callback is not None:
+            callback(step, sigma_t, x, model_t)
+        push(sigma_t, model_t)
+    return x
+
+
+def sample_uni_pc_anneal(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 0.2,
+    s_noise: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    order: int = 3,
+    variant: str = "bh2",
+    lower_order_final: bool = True,
+    model_type: str = "flow",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """UniPC predictor-corrector with a σ-annealed ancestral noise level
+    (rectified-flow only).
+
+    The highest-order deterministic core this engine has — UniPC's unified
+    predictor-corrector multistep (:func:`sample_uni_pc`, Zhao et al., NeurIPS
+    2023, arXiv:2302.04867) — fitted with the σ-annealed ancestral burn-in of the
+    ``*_anneal`` family (:func:`sample_dpmpp_2m_anneal`,
+    :func:`sample_euler_ancestral_anneal`). The ancestral fraction is
+    ``eta_i = eta_max·σ_i``: a near-full stochastic re-noise at high σ (which
+    averages out a merged / imperfect velocity field's inconsistencies — the
+    reason the stochastic ``er_sde`` is the robust default on these models)
+    tapering to a deterministic step as σ→0 (so the low-σ detail UniPC resolves
+    so cheaply isn't washed out — the failure mode of constant ``eta``).
+
+    It is the strict upgrade of :func:`sample_dpmpp_2m_anneal`: same σ-annealed
+    burn-in, same flow half-logSNR exponential-integrator family, but the
+    deterministic core is UniPC's arbitrary-order predictor-corrector (which adds
+    a corrector re-evaluation reused as the next step's history, so it stays ~one
+    model evaluation per step) instead of the fixed 2nd-order DPM++(2M) multistep
+    — more accuracy per NFE, which is where the step savings come from. Pairs with
+    a high-σ-dense flow schedule (``beta`` / ``beta_mix`` / ``smoothstep``), same
+    as its siblings.
+
+    The stochasticity is folded in exactly as :func:`sample_dpmpp_2m_sde` folds
+    ``eta`` into an exponential multistep (see :func:`_uni_pc_bh_update`): the
+    ``phi``/``B(h)`` weights use ``hh = -h·(1+η)``, the carry is contracted by
+    ``e^{-h·η}``, and noise of std ``σ_t·sqrt(-expm1(-2·h·η))·s_noise`` is
+    re-injected. ``eta_max=0`` recovers the deterministic UniPC step bit-for-bit
+    (same ``variant``/``order``). ``variant`` is the ``B(h)`` solver type
+    (``"bh1"``/``"bh2"``; ``bh2`` — the default here — often edges ahead at very
+    low step counts); ``lower_order_final`` ramps the order down over the last
+    steps. ``shift`` offsets the first σ off 1.0 for the half-logSNR map.
+
+    To keep that high-order core from amplifying the injected noise, the predictor
+    order is **ramped up with decreasing σ**: while η > 0 the order is held near 1
+    (a noise-robust first-order exponential step, no divided-difference residual)
+    at high σ, rising toward ``order`` as σ→0 where the noise has annealed away and
+    the x0 history is clean. The ramp is gated on η > 0, so the ``eta_max=0``
+    degradation to deterministic UniPC is untouched. It widens the usable noise
+    range markedly: a GPU sweep on Anima collapsed the image to a washed-out ghost
+    at ``eta_max=1.0`` *without* the ramp, but kept a coherent (if softer) image
+    *with* it. Quality is still highest near ``eta_max=0`` (deterministic UniPC is
+    the cleanest), so ``eta_max`` defaults to a low 0.2 and behaves as a small
+    stochastic-diversity dial, with the order-ramp as the safety net against
+    over-cranking rather than a route to a quality gain."""
+    if model_type != "flow":
+        raise ValueError("uni_pc_anneal is rectified-flow only (model_type='flow')")
+    if len(sigmas) <= 1:
+        return x
+    if variant not in ("bh1", "bh2"):
+        raise ValueError("variant must be 'bh1' or 'bh2'")
+    if order < 1:
+        raise ValueError("order must be >= 1")
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    n = len(sigmas) - 1
+
+    model_prev, sigma_prev, lambda_prev = [], [], []
+
+    def push(sig, m):
+        sigma_prev.append(sig)
+        lambda_prev.append(lambda_fn(sig))
+        model_prev.append(m)
+        if len(model_prev) > order:
+            sigma_prev.pop(0)
+            lambda_prev.pop(0)
+            model_prev.pop(0)
+
+    m0 = model(x, sigmas[0] * s_in)
+    if callback is not None:
+        callback(0, sigmas[0], x, m0)
+    push(sigmas[0], m0)
+
+    for step in range(1, n + 1):
+        sigma_t = sigmas[step]
+        if bool(sigma_t == 0):           # final clean step: land on the x0 estimate
+            x = model_prev[-1]
+            break
+        # σ-annealed ancestral fraction (eta = eta_max·σ_cur, as in the *_anneal
+        # family): full burn-in at σ≈1, deterministic as σ→0. σ_cur is where x
+        # currently lives — the newest history sigma.
+        sigma_cur = float(sigma_prev[-1].clamp(0.0, 1.0))
+        eta = eta_max * sigma_cur
+        cur_order = min(order, len(model_prev))
+        if lower_order_final:
+            cur_order = min(cur_order, n - step)   # ramp order down near σ→0
+        # Stochastic order-ramp-UP: UniPC's higher-order terms are divided
+        # differences of the x0 history, which AMPLIFY the ancestral noise injected
+        # at high σ (η = η_max·σ is largest there, and last step's noise lands in
+        # this step's history). While noise is being injected (η > 0) hold the
+        # order low at high σ — a near-1st-order, noise-robust step — and let it
+        # rise toward full order as σ→0, where η, and the noise it leaves behind,
+        # has annealed away and high-order extrapolation is safe. η = 0 (eta_max=0,
+        # or σ→0) leaves the cap at full order, so the deterministic-UniPC
+        # degradation is preserved bit-for-bit. η/η_max = σ, so the ramp is
+        # η_max-independent (it tracks position on the trajectory, not noise scale).
+        if eta > 0:
+            cur_order = min(cur_order, 1 + int((1.0 - sigma_cur) * order))
+        x, model_t = _uni_pc_bh_update(
+            model, x, model_prev, sigma_prev, lambda_prev,
+            sigma_t, lambda_fn(sigma_t), s_in, cur_order, variant,
+            eta=eta, s_noise=s_noise, generator=generator,
         )
         if callback is not None:
             callback(step, sigma_t, x, model_t)
@@ -1452,6 +1595,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "exp_heun_2_x0": sample_exp_heun_2_x0,
     "uni_pc": partial(sample_uni_pc, variant="bh1"),
     "uni_pc_bh2": partial(sample_uni_pc, variant="bh2"),
+    "uni_pc_anneal": sample_uni_pc_anneal,
 }
 
 
