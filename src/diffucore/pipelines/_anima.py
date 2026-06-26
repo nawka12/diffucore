@@ -65,11 +65,17 @@ if TYPE_CHECKING:
 
 
 def _qwen_encode(qwen3, ids, mask, device, dtype):
-    """Run Qwen3 and return its last hidden state in ``dtype``."""
+    """Run the Qwen text encoder and return its last hidden state in ``dtype``.
+
+    Wrapped in ``no_grad`` because encoding is pure inference: without it the
+    Qwen3.5 hybrid encoder's unrolled O(L) SSM scan retains every per-timestep
+    state for a backward that never comes — enough to OOM by itself — and even
+    the plain Qwen3 transformer needlessly holds its activation graph."""
     ids = ids.to(device)
     if mask is not None:
         mask = mask.to(device)
-    out = qwen3(ids, attention_mask=None)   # causal-only fast path; mask handled by padding below
+    with torch.no_grad():
+        out = qwen3(ids, attention_mask=None)   # causal-only fast path; mask handled by padding below
     return out.to(dtype)
 
 

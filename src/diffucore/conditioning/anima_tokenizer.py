@@ -28,6 +28,9 @@ from tokenizers import Tokenizer
 QWEN_PAD_ID = 151643
 
 _QWEN_VOCAB = Path(__file__).with_name("qwen3_tokenizer.json")
+# Qwen3.5's BPE (vocab 248320) for the experimental Qwen3.5-4B encoder — a
+# different vocab from Qwen3 (151936), so the IDs are not interchangeable.
+_QWEN35_VOCAB = Path(__file__).with_name("qwen35_tokenizer.json")
 _T5_VOCAB = Path(__file__).with_name("t5_tokenizer.json")
 
 
@@ -60,6 +63,13 @@ class AnimaTokenizer:
         self.t5_path = str(t5_path or _T5_VOCAB)
         self._qwen = None
         self._t5 = None
+
+    @classmethod
+    def qwen35(cls, t5_path: Optional[str] = None) -> "AnimaTokenizer":
+        """Variant that drives the Qwen3.5 BPE (vocab 248320) for the semantic
+        stream; the T5 target stream is unchanged. Used when the Anima checkpoint
+        ships the experimental Qwen3.5-4B encoder instead of Qwen3-0.6B."""
+        return cls(qwen_path=str(_QWEN35_VOCAB), t5_path=t5_path)
 
     def _ensure_loaded(self, max_length: int):
         if self._qwen is None or self._t5 is None:

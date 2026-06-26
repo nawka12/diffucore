@@ -23,6 +23,7 @@ from .loading import ModelSpec, detect_architecture, load_state_dict, read_heade
 from .models import (
     AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig,
     AnimaDiT, QwenImageVAE, Qwen3TextEncoder, Qwen3Config,
+    Qwen35TextEncoder, Qwen35Config,
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
 )
 from .models.unet import sdxl_unet_config
@@ -203,11 +204,26 @@ def load_anima_checkpoint(
     vae.load_state_dict(load_state_dict(vae_path, device="cpu"), strict=True)
     vae = vae.to(idle_target, policy.vae_dtype).eval()
 
-    # Text encoder: independent Qwen3 file, keys at ``model.*``.
-    _stage("loading text encoder (Qwen3) weights")
-    qwen3 = Qwen3TextEncoder()
-    qwen3.load_state_dict(load_state_dict(te_path, device="cpu"), strict=True)
-    qwen3 = qwen3.to(idle_target, policy.compute_dtype).eval()
+    # Text encoder: independent file. Anima's stock encoder is Qwen3-0.6B; the
+    # experimental cosmos-qwen3.5 swap ships a Qwen3.5 hybrid (SSM+attention)
+    # encoder instead — both the Anima-packaged 4B and the raw 0.8B base. They're
+    # identified by an SSM ``linear_attn`` block; the backbone is extracted by its
+    # ``embed_tokens.weight`` leaf, which strips any ``model.language_model.``
+    # prefix and drops the base model's ``model.visual.*`` / ``mtp.*`` heads. Both
+    # expose a 1024-d output, so the LLM-Adapter and DiT are unchanged; only the
+    # encoder + its BPE vocab differ.
+    te_sd = load_state_dict(te_path, device="cpu")
+    qwen35_sd = _extract_component(te_sd, "embed_tokens.weight")
+    is_qwen35 = qwen35_sd is not None and any("linear_attn.A_log" in k for k in qwen35_sd)
+    if is_qwen35:
+        _stage("loading text encoder (Qwen3.5 hybrid) weights")
+        text_encoder = Qwen35TextEncoder(Qwen35Config.from_state_dict(qwen35_sd))
+        text_encoder.load_state_dict(qwen35_sd, strict=True)
+    else:
+        _stage("loading text encoder (Qwen3) weights")
+        text_encoder = Qwen3TextEncoder()
+        text_encoder.load_state_dict(te_sd, strict=True)
+    text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
 
     # DiT (incl. the LLM-Adapter under ``llm_adapter``): keys live under ``net.*``.
     _stage("loading DiT weights (largest file)")
@@ -234,13 +250,13 @@ def load_anima_checkpoint(
     backbone = maybe_compile_backbone(backbone, policy)
     _stage("model ready")
 
-    tokenizer = AnimaTokenizer()
+    tokenizer = AnimaTokenizer.qwen35() if is_qwen35 else AnimaTokenizer()
 
     return ModelBundle(
         spec=spec,
         schedule=None,                  # flow-matching: σ-schedule built at sample time
         tokenizer=tokenizer,
-        text_encoder=qwen3,
+        text_encoder=text_encoder,
         backbone=backbone,
         vae=vae,
         text_encoder_2=None,

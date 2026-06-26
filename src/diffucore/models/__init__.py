@@ -13,6 +13,7 @@ from .vae import VAEConfig, AutoencoderKL
 from .unet import UNetConfig, UNetModel
 from .qwen_image_vae import QwenImageVAE
 from .qwen3_text import Qwen3Config, Qwen3TextEncoder
+from .qwen35_text import Qwen35Config, Qwen35TextEncoder
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
 from .anima_dit import AnimaDiT, CosmosDiT, CosmosDiTConfig
 from .t5_text import T5Config, T5TextEncoder
@@ -32,6 +33,8 @@ __all__ = [
     "QwenImageVAE",
     "Qwen3Config",
     "Qwen3TextEncoder",
+    "Qwen35Config",
+    "Qwen35TextEncoder",
     "LLMAdapter",
     "LLMAdapterConfig",
     "AnimaDiT",
