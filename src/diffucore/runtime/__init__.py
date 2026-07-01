@@ -47,6 +47,18 @@ class DevicePolicy:
     vae_dtype: torch.dtype = torch.float32
     offload: bool | str = False
     vae_tile: bool = False
+    # --- block-streaming tuning (only read when ``offload == "stream"``).
+    # ``stream_blocks_per_group`` shuttles N consecutive backbone blocks per
+    # on/offload instead of one — fewer, larger host<->device transfers (better
+    # PCIe utilization, fewer syncs) at the cost of N blocks resident instead of
+    # one. 1 = the original one-block-at-a-time behavior. ``stream_prefetch``
+    # overlaps the *next* group's host->device copy with the current group's
+    # compute via a side CUDA stream (weights are immutable during inference, so
+    # the CPU copy is pinned once and reused; offload just drops the GPU copy).
+    # Hides most of the streaming copy latency; holds ~2 groups resident. Both
+    # default off → unchanged behavior.
+    stream_blocks_per_group: int = 1
+    stream_prefetch: bool = False
     # --- opt-in perf flags (PR-A). ``cudnn_benchmark`` defaults **on** because
     # it's bit-exact and gives 3-17 % across SD1.5/SDXL/Anima (measured RTX 2060)
     # for the cost of one autotune step on first call; set False to disable.
@@ -77,6 +89,10 @@ class DevicePolicy:
             raise ValueError(
                 f"offload must be False, True/'full', 'encoders', or 'stream'; "
                 f"got {self.offload!r}"
+            )
+        if self.stream_blocks_per_group < 1:
+            raise ValueError(
+                f"stream_blocks_per_group must be >= 1; got {self.stream_blocks_per_group}"
             )
 
     @property
@@ -223,17 +239,94 @@ def on_device(module, device):
             torch.cuda.empty_cache()
 
 
-def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_resident=()):
-    """Per-block sequential offload for a block-list backbone (FLUX DiT, SD/SDXL UNet, Anima DiT).
+def _stream_tensors(module):
+    """Every owned tensor whose storage block-streaming relocates: parameters
+    first, then persistent buffers (Anima/SD blocks carry only params, but FLUX
+    or a future block may register a buffer). De-duplicated by identity."""
+    seen = set()
+    for t in list(module.parameters(recurse=True)) + list(module.buffers(recurse=True)):
+        if t is not None and id(t) not in seen:
+            seen.add(id(t))
+            yield t
+
+
+class _GroupStreamer:
+    """Double-buffered group streaming on a side CUDA stream (``stream_prefetch``).
+
+    Weights don't change during inference, so the CPU copy is the permanent home:
+    :meth:`_onload` copies a group to the GPU on a side stream — overlapping the
+    *current* group's compute — and :meth:`_offload` just re-points each tensor
+    back at its pinned CPU master and drops the GPU copy (no device->host copy).
+    At most two groups are resident (the running one and the prefetched next), so
+    peak VRAM is ~2 groups regardless of block count. Numerically transparent:
+    only weight *placement* changes.
+    """
+
+    def __init__(self, groups, device, offload_device):
+        self.device = device
+        self.stream = torch.cuda.Stream(device)
+        self.n = len(groups)
+        self.resident = [False] * self.n
+        self.copy_done: list = [None] * self.n
+        # Per group, the (tensor, pinned-CPU-master) pairs to shuttle. Pin the
+        # master so the side-stream H2D copy is truly async (a pageable-memory
+        # copy forces a host sync, defeating the overlap).
+        self.tensors = []
+        for group in groups:
+            entries = []
+            for module in group:
+                for t in _stream_tensors(module):
+                    master = t.data.to(offload_device).pin_memory()
+                    t.data = master
+                    entries.append((t, master))
+            self.tensors.append(entries)
+
+    def _onload(self, gi):
+        if self.resident[gi]:
+            return
+        with torch.cuda.stream(self.stream):
+            for t, master in self.tensors[gi]:
+                t.data = master.to(self.device, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.stream)
+        self.copy_done[gi] = ev
+        self.resident[gi] = True
+
+    def _offload(self, gi):
+        if not self.resident[gi]:
+            return
+        cur = torch.cuda.current_stream(self.device)
+        for t, master in self.tensors[gi]:
+            # Hold the GPU copy alive until the compute stream's kernels that read
+            # it have run — it was allocated on the side stream, so the allocator
+            # wouldn't otherwise guard against reuse by the compute stream.
+            t.data.record_stream(cur)
+            t.data = master
+        self.resident[gi] = False
+        self.copy_done[gi] = None
+
+    def pre(self, gi):
+        self._onload(gi)              # usually a no-op: already prefetched
+        torch.cuda.current_stream(self.device).wait_event(self.copy_done[gi])
+        if gi + 1 < self.n:
+            self._onload(gi + 1)      # prefetch next group during this one's compute
+
+    def post(self, gi):
+        self._offload(gi)
+
+
+def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_resident=(),
+                  num_blocks_per_group=1, prefetch=False):
+    """Grouped sequential offload for a block-list backbone (FLUX DiT, SD/SDXL UNet, Anima DiT).
 
     Keeps every *non-block* submodule (img/txt projections, time/vector/guidance
     embedders, the final layer, shared modulators) resident on ``device``, parks
     the heavy blocks on ``offload_device``, and registers forward hooks that bring
-    each block onto ``device`` only for its own forward, then move it back.
-    Resident VRAM is the small modules plus at most one block — enough to fit
-    FLUX.1's ~23 GB transformer (57 blocks) on a 24 GB GPU, or SDXL's ~2.6 GB
-    UNet (or Anima's ~4 GB DiT) on a 4 GB GPU, where moving the whole module at
-    once leaves no room for activations.
+    each *group* of blocks onto ``device`` only for its own forward, then move it
+    back. Resident VRAM is the small modules plus at most one group (two under
+    ``prefetch``) — enough to fit FLUX.1's ~23 GB transformer (57 blocks) on a
+    24 GB GPU, or SDXL's ~2.6 GB UNet (or Anima's ~4 GB DiT) on a 4 GB GPU, where
+    moving the whole module at once leaves no room for activations.
 
     Numerically transparent: relocating weights doesn't change results, and the
     blocks run in the same order. ``block_attrs`` names the attributes to stream;
@@ -247,28 +340,56 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_re
     their own ``__call__`` (so the hooks wouldn't fire). Anima passes block 0,
     which TeaCache probes via ``modulated_self_attn_input``. Returns the number
     of *streamed* blocks (kept-resident ones are excluded).
+
+    ``num_blocks_per_group`` shuttles that many consecutive blocks per on/offload
+    (grouped within each attr, never across) — fewer, larger transfers for more
+    resident VRAM; 1 is the original one-at-a-time behavior. ``prefetch`` (CUDA
+    only) overlaps the next group's copy with the current group's compute on a
+    side stream — see :class:`_GroupStreamer`.
     """
     keep = {id(m) for m in keep_resident}
     for name, child in backbone.named_children():
         if name not in block_attrs:
             child.to(device)
 
-    def pre(mod, _inp):
-        mod.to(device, non_blocking=True)
-
-    def post(mod, _inp, _out):
-        mod.to(offload_device, non_blocking=True)
-
-    n = 0
+    # Ordered groups of consecutive streamed blocks (grouping resets at each attr
+    # boundary so a group is always contiguous within one container). Kept-
+    # resident blocks are pinned to ``device`` and excluded from the groups.
+    groups, n = [], 0
     for attr in block_attrs:
+        current = []
         for block in getattr(backbone, attr):
             if id(block) in keep:
                 block.to(device)
                 continue
             block.to(offload_device)
-            block.register_forward_pre_hook(pre)
-            block.register_forward_hook(post)
+            current.append(block)
             n += 1
+            if len(current) == num_blocks_per_group:
+                groups.append(current)
+                current = []
+        if current:
+            groups.append(current)
+
+    if prefetch and device.type == "cuda":
+        streamer = _GroupStreamer(groups, device, offload_device)
+        backbone._block_streamer = streamer  # keep the side stream / masters alive
+        for gi, group in enumerate(groups):
+            group[0].register_forward_pre_hook(lambda m, i, gi=gi: streamer.pre(gi))
+            group[-1].register_forward_hook(lambda m, i, o, gi=gi: streamer.post(gi))
+        return n
+
+    for group in groups:
+        def pre(mod, _inp, group=group):
+            for m in group:
+                m.to(device, non_blocking=True)
+
+        def post(mod, _inp, _out, group=group):
+            for m in group:
+                m.to(offload_device, non_blocking=True)
+
+        group[0].register_forward_pre_hook(pre)
+        group[-1].register_forward_hook(post)
     return n
 
 

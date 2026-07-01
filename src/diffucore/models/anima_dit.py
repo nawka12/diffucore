@@ -448,13 +448,27 @@ class TeaCache:
     The transformer blocks are the bulk of a DiT forward, yet their output
     changes slowly between adjacent timesteps. TeaCache caches the blocks'
     *residual* (``stack(x) - x``) and, on a step where the timestep-modulated
-    input has drifted little from the last computed step, reuses that residual
-    instead of running the blocks — a ~28×-cheaper step.
+    input has drifted little from the last computed step, *forecasts* that
+    residual instead of running the blocks — a ~28×-cheaper step.
 
     "Little" is measured as the accumulated rescaled relative-L1 change of the
     block-0 modulated input; once it crosses ``rel_l1_thresh`` a real recompute
     is forced and the accumulator resets. Larger threshold = more skipped steps
     = faster but lower fidelity.
+
+    **Forecast (TaylorSeer, arXiv:2503.06923).** The residual is not frozen on a
+    skipped step: it is Taylor-extrapolated from its own recent history. Each
+    computed step refreshes finite-difference derivatives of the residual over
+    the *activation* steps (the steps that actually ran the blocks); a skipped
+    step ``k`` steps past the last activation returns
+    ``Σ_i residual^(i) · k^i / i!``. ``max_order`` caps the derivative order:
+    ``0`` reproduces the original cache-then-reuse (a held constant), ``1`` a
+    linear extrapolation, higher a polynomial one. Order ``1`` is the default —
+    it tracks the residual's drift between activations, so the same skip
+    *decision* yields a markedly better skip *output* than freezing, with no
+    change to calibration or thresholds (those govern only *when* to skip).
+    Forecasting only engages once ≥2 activations exist; before that (and at
+    order 0) a skip reuses the last residual exactly, as before.
 
     One instance tracks one stream. Classifier-free guidance needs two (the
     conditioned and unconditioned passes are separate Anima forwards whose
@@ -468,16 +482,23 @@ class TeaCache:
     """
 
     def __init__(self, rel_l1_thresh: float, coefficients: Sequence[float] = (1.0, 0.0),
-                 *, record: bool = False):
+                 *, record: bool = False, max_order: int = 1):
         self.rel_l1_thresh = float(rel_l1_thresh)
         self.coefficients = tuple(float(c) for c in coefficients)
         self.record = record
+        self.max_order = int(max_order)
         self.prev_modulated: Optional[torch.Tensor] = None
-        self.prev_residual: Optional[torch.Tensor] = None
         self.accumulated = 0.0
         self.calls = 0   # forwards seen
         self.skips = 0   # forwards whose blocks were reused from cache
         self.rel_history: list[float] = []   # raw per-step rel-L1 (record mode)
+        # Taylor forecast state: ``taylor[i]`` is the i-th finite difference of
+        # the block residual over activation steps (``taylor[0]`` the residual
+        # itself). ``last_activated`` is the ``calls`` index of the last computed
+        # step, so a skip at ``calls`` extrapolates ``calls - last_activated``
+        # steps forward. Empty until the first computed step.
+        self.taylor: dict[int, torch.Tensor] = {}
+        self.last_activated = -1
 
     def _rescale(self, x: float) -> float:
         out = 0.0
@@ -510,6 +531,38 @@ class TeaCache:
             return False
         self.accumulated = 0.0
         return True
+
+    def update(self, residual: torch.Tensor) -> None:
+        """Record a freshly computed block residual and refresh the Taylor
+        finite-difference factors used to forecast skipped steps.
+
+        The i-th factor is the i-th finite difference of the residual over
+        activation steps, divided by the (possibly uneven) step gap between the
+        last two activations — so ``forecast`` reads a per-step derivative. At
+        ``max_order == 0``, or on the first activation, only the 0-th factor (the
+        residual itself) is kept, which makes a subsequent skip reuse it exactly.
+        """
+        dist = self.calls - self.last_activated if self.last_activated >= 0 else 1
+        prev, new = self.taylor, {0: residual}
+        for i in range(self.max_order):
+            if i in prev:
+                new[i + 1] = (new[i] - prev[i]) / dist
+            else:
+                break
+        self.taylor = new
+        self.last_activated = self.calls
+
+    def forecast(self) -> torch.Tensor:
+        """Taylor-extrapolate the block residual to the current (skipped) step
+        from the factors :meth:`update` last recorded. With only the 0-th factor
+        (order 0, or fewer than two activations) this returns the last residual
+        unchanged — the original cache-then-reuse behavior."""
+        k = self.calls - self.last_activated
+        out = None
+        for i, factor in self.taylor.items():
+            term = factor if i == 0 else factor * (k ** i / math.factorial(i))
+            out = term if out is None else out + term
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -602,13 +655,13 @@ class CosmosDiT(nn.Module):
         ) if teacache is not None else True
 
         if not compute:
-            x_B_T_H_W_D = x_B_T_H_W_D + teacache.prev_residual
+            x_B_T_H_W_D = x_B_T_H_W_D + teacache.forecast()
         else:
             residual_in = x_B_T_H_W_D
             for block in self.blocks:
                 x_B_T_H_W_D = block(x_B_T_H_W_D, emb_B_T_D, context, rope_emb, adaln_lora_B_T_3D)
             if teacache is not None:
-                teacache.prev_residual = x_B_T_H_W_D - residual_in
+                teacache.update(x_B_T_H_W_D - residual_in)
 
         out = self.final_layer(x_B_T_H_W_D.to(context.dtype), emb_B_T_D, adaln_lora_B_T_3D)
         out = self._unpatchify(out)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]

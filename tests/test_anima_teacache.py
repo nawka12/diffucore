@@ -105,6 +105,69 @@ def test_fitted_coefficients_round_trip_through_rescale():
         assert abs(tc._rescale(float(x)) - y) < 1e-6
 
 
+def test_default_order_is_linear_forecast():
+    """The default cache forecasts (order 1), not freezes."""
+    assert TeaCache(rel_l1_thresh=1.0).max_order == 1
+
+
+def test_order0_reuses_last_residual_exactly():
+    """``max_order=0`` is the original cache-then-reuse: a skip returns the last
+    computed residual unchanged, however many steps have passed."""
+    tc = TeaCache(rel_l1_thresh=1.0, max_order=0)
+    r = torch.tensor([2.0, -4.0, 7.0])
+    tc.calls = 1
+    tc.update(r)                 # single activation at step 1
+    for step in (2, 5, 9):       # every later skip reuses r exactly
+        tc.calls = step
+        assert torch.equal(tc.forecast(), r)
+
+
+def test_single_activation_forecast_reuses_last_residual():
+    """Order 1 can't extrapolate from one data point, so the first skips after a
+    lone activation still reuse the residual (matches order-0 until a 2nd
+    activation gives a slope)."""
+    tc = TeaCache(rel_l1_thresh=1.0, max_order=1)
+    r = torch.tensor([1.0, 2.0])
+    tc.calls = 1
+    tc.update(r)
+    tc.calls = 3
+    assert torch.equal(tc.forecast(), r)
+
+
+def test_order1_linear_extrapolation_over_uneven_gap():
+    """Two activations set a per-step slope ``(r1-r0)/gap``; later skips are the
+    linear extrapolation ``r1 + slope·(step - last_activation)`` — and the gap is
+    the actual (uneven) activation spacing, not a fixed 1."""
+    tc = TeaCache(rel_l1_thresh=1.0, max_order=1)
+    r0 = torch.tensor([0.0, 0.0])
+    r1 = torch.tensor([2.0, 4.0])       # activation gap = 2 steps → slope [1, 2]
+    tc.calls = 1
+    tc.update(r0)
+    tc.calls = 3
+    tc.update(r1)
+    tc.calls = 4                         # 1 step past the last activation
+    assert torch.allclose(tc.forecast(), torch.tensor([3.0, 6.0]))
+    tc.calls = 5                         # 2 steps past
+    assert torch.allclose(tc.forecast(), torch.tensor([4.0, 8.0]))
+
+
+def test_higher_order_reduces_error_on_a_curved_residual():
+    """On a residual that curves in the step index, each extra Taylor order
+    tracks it better: order 0 (freeze) is worst, order 2 best. (The Taylor form
+    ``Σ rⁱ·kⁱ/i!`` is an approximation, not an exact polynomial fit — hence a
+    shrinking error rather than zero.)"""
+    f = lambda s: torch.tensor([float(s * s)])   # residual curves as step²
+    def error_at_order(order):
+        tc = TeaCache(rel_l1_thresh=1.0, max_order=order)
+        for step in (1, 2, 3):
+            tc.calls = step
+            tc.update(f(step))
+        tc.calls = 4                             # forecast one step past step 3
+        return float((tc.forecast() - f(4)).abs())
+    e0, e1, e2 = error_at_order(0), error_at_order(1), error_at_order(2)
+    assert e2 < e1 < e0
+
+
 def test_threshold_forces_recompute_and_resets():
     """With the default identity coefficients the accumulator is the running sum
     of per-step relative-L1 distances; a small step skips, and a large step that

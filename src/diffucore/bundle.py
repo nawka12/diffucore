@@ -129,7 +129,9 @@ def load_checkpoint(
         # staging ("full") OOMs once 1024² activations land on top of it.
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("input_blocks", "middle_block", "output_blocks"),
-                      policy.device, policy.offload_device)
+                      policy.device, policy.offload_device,
+                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      prefetch=policy.stream_prefetch)
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
@@ -241,7 +243,9 @@ def load_anima_checkpoint(
         _stage("streaming DiT blocks to GPU (low-VRAM mode)")
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("blocks",), policy.device, policy.offload_device,
-                      keep_resident=(backbone.blocks[0],))
+                      keep_resident=(backbone.blocks[0],),
+                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      prefetch=policy.stream_prefetch)
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
@@ -474,7 +478,9 @@ def load_flux_checkpoint(
         # modules resident and stream the blocks (fits FLUX.1 on a 24 GB card).
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("double_blocks", "single_blocks"),
-                      policy.device, policy.offload_device)
+                      policy.device, policy.offload_device,
+                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      prefetch=policy.stream_prefetch)
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
     backbone = maybe_compile_backbone(backbone, policy)

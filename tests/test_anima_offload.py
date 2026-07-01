@@ -39,6 +39,64 @@ def test_stream_blocks_anima_transparent_keeps_block0_resident():
     assert torch.allclose(ref, out, atol=1e-6)
 
 
+def test_stream_blocks_grouped_transparent_keeps_block0_resident():
+    """``num_blocks_per_group`` shuttles blocks in chunks but is still transparent
+    and still returns the streamed-block count (kept-resident block 0 excluded)."""
+    model, cfg = _tiny_dit()
+    x = _inputs(cfg)
+    with torch.no_grad():
+        ref = model(**x)
+
+    n = stream_blocks(model, ("blocks",), torch.device("cpu"), torch.device("cpu"),
+                      keep_resident=(model.blocks[0],), num_blocks_per_group=2)
+    assert n == cfg.num_blocks - 1
+
+    with torch.no_grad():
+        out = model(**x)
+    assert torch.allclose(ref, out, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stream_blocks_prefetch_matches_resident_on_cuda():
+    """Side-stream prefetch is numerically transparent across repeated forwards
+    (repeats shake out any cross-stream free/reuse hazard), and parks the streamed
+    blocks back on CPU with block 0 kept resident."""
+    dev = torch.device("cuda")
+    model, cfg = _tiny_dit()
+    x = _inputs(cfg, device="cuda")
+    with torch.no_grad():
+        ref = model.to(dev)(**x)
+
+    model = model.cpu()
+    stream_blocks(model, ("blocks",), dev, torch.device("cpu"),
+                  keep_resident=(model.blocks[0],), prefetch=True)
+    with torch.no_grad():
+        for _ in range(3):
+            out = model(**x)
+            assert torch.allclose(ref, out, atol=1e-4)
+    assert next(model.blocks[-1].parameters()).device.type == "cpu"
+    assert next(model.blocks[0].parameters()).device.type == "cuda"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_stream_blocks_prefetch_grouped_with_teacache_on_cuda():
+    """Prefetch + grouping + TeaCache together: block 0 stays resident for the
+    TeaCache probe while the grouped rest streams via the side stream."""
+    dev = torch.device("cuda")
+    model, cfg = _tiny_dit()
+    x = _inputs(cfg, device="cuda")
+    with torch.no_grad():
+        ref = model.to(dev)(**x)
+
+    model = model.cpu()
+    stream_blocks(model, ("blocks",), dev, torch.device("cpu"),
+                  keep_resident=(model.blocks[0],), num_blocks_per_group=2, prefetch=True)
+    tc = TeaCache(0.1)
+    with torch.no_grad():
+        out = model(**x, teacache=tc)   # would raise if block 0 were parked on CPU
+    assert torch.allclose(ref, out, atol=1e-4)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_stream_blocks_anima_matches_resident_on_cuda():
     dev = torch.device("cuda")
