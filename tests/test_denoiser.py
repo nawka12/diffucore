@@ -1,7 +1,14 @@
+import math
+
+import pytest
 import torch
 
 from diffucore.sampling.parameterization import EpsScaling, DiscreteSchedule, make_betas
-from diffucore.sampling.denoiser import ModelDenoiser, CFGDenoiser
+from diffucore.sampling.denoiser import (
+    CFGDenoiser,
+    ModelDenoiser,
+    guidance_interval_bounds,
+)
 
 
 def _schedule():
@@ -45,6 +52,45 @@ def test_cfg_endpoints_and_linearity():
     assert torch.allclose(cfg0(x, sigma), uncond_x0, atol=1e-5)
     assert torch.allclose(cfg1(x, sigma), cond_x0, atol=1e-5)
     assert torch.allclose(cfg2(x, sigma), uncond_x0 + 2.0 * (cond_x0 - uncond_x0), atol=1e-5)
+
+
+def test_guidance_interval_bounds_mapping():
+    sigmas = torch.tensor([10.0, 8.0, 6.0, 4.0, 2.0, 0.0])  # 5 steps
+    assert guidance_interval_bounds(sigmas, 0.0, 1.0) == (-math.inf, math.inf)
+    lo, hi = guidance_interval_bounds(sigmas, 0.2, 0.8)
+    assert hi == 8.0  # step 1 of 5 → sigmas[1]
+    assert lo == 2.0  # step 4 of 5 → sigmas[4]
+    with pytest.raises(ValueError):
+        guidance_interval_bounds(sigmas, 0.8, 0.2)
+
+
+def test_cfg_guidance_interval_skips_uncond():
+    calls = []
+
+    def backbone(model_input, t, bias):
+        calls.append(1)
+        return torch.full_like(model_input, bias)
+
+    den = ModelDenoiser(backbone, EpsScaling(), _schedule())
+    x = torch.randn(1, 4, 8, 8)
+    cond, uncond = {"bias": 1.0}, {"bias": 0.0}
+
+    banded = CFGDenoiser(den, cond, uncond, scale=7.0, sigma_lo=1.0, sigma_hi=5.0)
+    plain = CFGDenoiser(den, cond, uncond, scale=7.0)
+    cond_only = CFGDenoiser(den, cond, uncond, scale=1.0)
+
+    # In-band sigma: guided estimate, identical to unbounded CFG (two forwards).
+    calls.clear()
+    in_band = banded(x, torch.tensor([2.0]))
+    assert len(calls) == 2
+    assert torch.allclose(in_band, plain(x, torch.tensor([2.0])))
+
+    # Above hi and at lo (exclusive): cond-only estimate, single forward each.
+    for sigma in (torch.tensor([7.0]), torch.tensor([1.0])):
+        calls.clear()
+        out = banded(x, sigma)
+        assert len(calls) == 1
+        assert torch.allclose(out, cond_only(x, sigma))
 
 
 def test_cfg_rescale():

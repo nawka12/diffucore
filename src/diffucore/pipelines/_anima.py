@@ -35,6 +35,7 @@ from ..sampling import (
     flow_matching_dynamic_shift,
     flow_table_schedule,
     get_sampler,
+    guidance_interval_bounds,
 )
 
 # Samplers Anima can drive (all routed through a CONST x0 denoiser closure).
@@ -102,6 +103,8 @@ def anima_text_to_image(
     *,
     steps: int = 20,
     cfg_scale: float = 4.0,
+    cfg_interval_start: float = 0.0,
+    cfg_interval_end: float = 1.0,
     shift: float = 3.0,
     width: int = 1024,
     height: int = 1024,
@@ -127,7 +130,10 @@ def anima_text_to_image(
 
     ``shift`` controls the SD3-style rectified-flow schedule (Anima's training
     default is 3.0). ``cfg_scale`` is the CFG strength; the Anima ComfyUI
-    workflow defaults to ~4.0.
+    workflow defaults to ~4.0. ``cfg_interval_start``/``cfg_interval_end``
+    restrict CFG to that fraction of the run (Kynkäänniemi et al., 2024) — the
+    uncond forward is skipped outside the band, saving a full backbone pass per
+    skipped step; the ``(0, 1)`` default guides every step.
 
     ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
     closed-form rectified-flow step; the rest run through the shared sampler
@@ -198,6 +204,10 @@ def anima_text_to_image(
         x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
         # With σ_max == 1 the initial state is exactly pure noise (no rescale).
 
+        # Guidance interval: CFG only while σ in (lo, hi]; the uncond forward is
+        # skipped outside the band (see guidance_interval_bounds). (0, 1) = always.
+        cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
+
         # ---- 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
         # TeaCache: one cache stream per CFG branch (cond/uncond are separate
@@ -216,9 +226,15 @@ def anima_text_to_image(
                         t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
                         v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
-                        if cfg_scale == 1.0:
+                        if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
                             v = v_cond
                         else:
+                            # CUDA Graphs (reduce-overhead) returns a view of the
+                            # graph's static output buffer, which the uncond replay
+                            # below overwrites — clone the cond output first
+                            # (PyTorch's documented fix for sequential invocations).
+                            if policy.cuda_graphs:
+                                v_cond = v_cond.clone()
                             v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
@@ -234,9 +250,11 @@ def anima_text_to_image(
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
                     v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
-                    if cfg_scale == 1.0:
+                    if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                         v = v_cond
                     else:
+                        if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see euler path)
+                            v_cond = v_cond.clone()
                         v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
@@ -284,6 +302,8 @@ def anima_img2img(
     strength: float = 0.75,
     steps: int = 20,
     cfg_scale: float = 4.0,
+    cfg_interval_start: float = 0.0,
+    cfg_interval_end: float = 1.0,
     shift: float = 3.0,
     width: int = 1024,
     height: int = 1024,
@@ -385,6 +405,10 @@ def anima_img2img(
             mask_lat = torch.from_numpy(np.asarray(m, dtype=np.float32) / 255.0)[None, None].to(device)
         z0_f = z0.float()
 
+        # Guidance interval over the sliced schedule (the steps that actually
+        # run); the uncond forward is skipped outside (lo, hi]. (0, 1) = always.
+        cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
+
         # ---- 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
         # TeaCache: one cache stream per CFG branch (see anima_text_to_image).
@@ -396,9 +420,11 @@ def anima_img2img(
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
                 v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
-                if cfg_scale == 1.0:
+                if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                     v = v_cond
                 else:
+                    if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
+                        v_cond = v_cond.clone()
                     v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
@@ -501,6 +527,8 @@ def anima_calibrate_oss(
                 if cfg_scale == 1.0:
                     v = v_cond
                 else:
+                    if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
+                        v_cond = v_cond.clone()
                     v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
@@ -578,6 +606,11 @@ def anima_calibrate_teacache(
                     x_5d = x.unsqueeze(2)
                     t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
                     v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
+                    if policy.cuda_graphs:
+                        # prev_v is read on the NEXT step, after every intervening
+                        # replay has overwritten the graph's static output buffer —
+                        # clone at production (also covers the uncond replay below).
+                        v_cond = v_cond.clone()
                     if prev_v is not None:
                         denom = prev_v.abs().mean().clamp_min(1e-8)
                         out_rel.append(((v_cond - prev_v).abs().mean() / denom).item())

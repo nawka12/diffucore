@@ -69,6 +69,12 @@ class DevicePolicy:
     cudnn_benchmark: bool = True
     tf32: bool = False
     channels_last: bool = False
+    # ``fp16_accumulation`` lets cuBLAS accumulate fp16 matmuls in fp16 instead
+    # of fp32 (torch >= 2.7). Consumer tensor cores run fp16-accumulate at 2x
+    # the fp32-accumulate rate, so this speeds up the fp16 backbone directly —
+    # measured x1.6 on DiT-shaped GEMMs on an RTX 2060. Not bit-exact (reduced
+    # accumulation precision), so opt-in only. No-op on torch < 2.7.
+    fp16_accumulation: bool = False
     # --- opt-in compile (PR-B). When True, the backbone (SD/SDXL UNet or Anima
     # DiT) is wrapped with ``torch.compile(dynamic=True)`` at load. Pays a one-
     # time warmup on the first call (10-60s depending on platform), persisted
@@ -186,24 +192,36 @@ def perf_context(policy: "DevicePolicy"):
     shape; helpful for the SD/SDXL UNet (fixed shapes per run, so the autotune
     cost is paid once). ``tf32`` enables TF32 on Ampere+ for fp32 matmul and
     cuDNN — affects only fp32 paths (the VAE), fp16 weights are unchanged.
+    ``fp16_accumulation`` accumulates fp16 matmuls in fp16 (see DevicePolicy);
+    silently skipped on torch < 2.7, which lacks the backend flag.
     """
-    if not (policy.cudnn_benchmark or policy.tf32):
+    fp16_acc = policy.fp16_accumulation and hasattr(
+        torch.backends.cuda.matmul, "allow_fp16_accumulation"
+    )
+    if not (policy.cudnn_benchmark or policy.tf32 or fp16_acc):
         yield
         return
     prev_bench = torch.backends.cudnn.benchmark
     prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
     prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    prev_fp16_acc = (
+        torch.backends.cuda.matmul.allow_fp16_accumulation if fp16_acc else None
+    )
     try:
         if policy.cudnn_benchmark:
             torch.backends.cudnn.benchmark = True
         if policy.tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+        if fp16_acc:
+            torch.backends.cuda.matmul.allow_fp16_accumulation = True
         yield
     finally:
         torch.backends.cudnn.benchmark = prev_bench
         torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
         torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+        if fp16_acc:
+            torch.backends.cuda.matmul.allow_fp16_accumulation = prev_fp16_acc
 
 
 @contextmanager

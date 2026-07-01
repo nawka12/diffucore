@@ -281,25 +281,27 @@ selected `tiled_vae_decode`, and `"untiled"` when the pipeline called
 > `cudnn_benchmark + compile + cuda_graphs`; SDXL 19.8 s → 16.9 s (1.17×) with
 > `cudnn_benchmark` alone (bit-exact).
 
-Five flags on `DevicePolicy`. `cudnn_benchmark` defaults **on** (bit-exact,
-free win, measured 3-17 % across the lineup). The other four default off and
+Six flags on `DevicePolicy`. `cudnn_benchmark` defaults **on** (bit-exact,
+free win, measured 3-17 % across the lineup). The other five default off and
 opt in only:
 
 | Flag | Default | What it does | Cost | Bit-exact? |
 |---|---|---|---|---|
 | `cudnn_benchmark` | **True** | Enables cuDNN's per-shape kernel autotune for the run | one-step autotune on first call | yes (kernel choice doesn't change values) |
 | `tf32` | False | TF32 matmul + cuDNN on Ampere+ for **fp32 paths only** | tiny precision loss in fp32 ops | no (~1e-3 relative) |
+| `fp16_accumulation` | False | cuBLAS accumulates fp16 matmuls in fp16 (torch ≥ 2.7; consumer tensor cores run fp16-accumulate at 2× the fp32-accumulate rate — ×1.6 on DiT-shaped GEMMs, ×1.17 end-to-end Anima, measured RTX 2060) | reduced accumulation precision in every fp16 matmul | no (trajectory diverges from step 1; quality on par in A/B) |
 | `channels_last` | False | Converts SD UNet + AutoencoderKL to NHWC | one layout reorder at load + per-step input reorder | within fp16 tolerance (different kernel paths) |
 | `compile` | False | Wraps the backbone with `torch.compile(dynamic=True)` | one-time warmup ~30-180 s, paid at load | within fp16 tolerance (Inductor codegen) |
-| `cuda_graphs` | False | Switches compile to `mode="reduce-overhead", dynamic=False` — Inductor captures a CUDA Graph and replays it each step | re-records on any shape change (resolution, LPW chunk count) | within fp16 tolerance — *more* deterministic than compile alone (54.7 dB vs 29 dB on Anima) |
+| `cuda_graphs` | False | Switches compile to `mode="reduce-overhead", dynamic=False` — Inductor captures a CUDA Graph and replays it each step | re-records on any shape change (resolution, LPW chunk count); incompatible with TeaCache (its cached tensors live in the graph's static buffers); tensors read after a subsequent replay must be cloned first (Anima's sequential-CFG `v_cond` is) | within fp16 tolerance — *more* deterministic than compile alone (54.7 dB vs 29 dB on Anima) |
 
 ### Mechanism
 
 `runtime.perf_context(policy)` is a context manager wrapping each pipeline call;
 it flips `torch.backends.cudnn.benchmark` / `cuda.matmul.allow_tf32` /
-`cudnn.allow_tf32` for the run and restores the previous values on exit. A
-**no-op** when both flags are off — the global state is read but never written,
-so the bit-exact path is preserved.
+`cudnn.allow_tf32` / `cuda.matmul.allow_fp16_accumulation` for the run and
+restores the previous values on exit. A **no-op** when all flags are off — the
+global state is read but never written, so the bit-exact path is preserved.
+`fp16_accumulation` is silently skipped on torch < 2.7 (no backend flag).
 
 `runtime.to_channels_last(module)` calls `.to(memory_format=torch.channels_last)`
 on the module. Applied to the SD/SDXL UNet and AutoencoderKL at bundle load.

@@ -9,6 +9,7 @@ stays a thin wrapper. Placement (offload / tiling) is read from the bundle's
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -29,6 +30,7 @@ from ..sampling import (
     ddim_uniform_schedule,
     exponential_schedule,
     get_sampler,
+    guidance_interval_bounds,
     karras_schedule,
     kl_optimal_schedule,
     linear_quadratic_schedule,
@@ -187,14 +189,21 @@ class _Pipeline:
         return torch.cat([pooled, size_emb.to(pooled.dtype)], dim=-1)
 
     # --- sampling ------------------------------------------------------------
-    def _denoiser(self, cond, uncond, cfg_scale, cfg_rescale=None):
+    def _denoiser(self, cond, uncond, cfg_scale, cfg_rescale=None,
+                  sigmas=None, cfg_interval=(0.0, 1.0)):
         # ZTSNR checkpoints default to CFG rescale 0.7 (Lin et al.); everything else
         # to plain CFG. Pass an explicit ``cfg_rescale`` to override either way.
         if cfg_rescale is None:
             cfg_rescale = 0.7 if self.model.spec.zero_terminal_snr else 0.0
         scaling = VScaling() if self.model.spec.prediction == "v" else EpsScaling()
         denoiser = ModelDenoiser(self.model.backbone, scaling, self.model.schedule)
-        return CFGDenoiser(denoiser, cond, uncond, scale=cfg_scale, rescale=cfg_rescale)
+        # Guidance interval: skip the uncond forward outside the band. Bounds are
+        # computed from the run's actual (sliced) schedule; ``sigmas=None`` or the
+        # (0, 1) default leaves guidance on at every step.
+        lo, hi = (guidance_interval_bounds(sigmas, *cfg_interval)
+                  if sigmas is not None else (-math.inf, math.inf))
+        return CFGDenoiser(denoiser, cond, uncond, scale=cfg_scale, rescale=cfg_rescale,
+                           sigma_lo=lo, sigma_hi=hi)
 
     def _sigmas(self, scheduler, steps, device, dtype):
         """The full descending sigma schedule ([steps + 1] values, ending at 0)."""

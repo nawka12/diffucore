@@ -33,7 +33,7 @@ from .parameterization import (
     VScaling,
     FlowMatchingConstScaling,
 )
-from .denoiser import ModelDenoiser, CFGDenoiser, MaskedDenoiser
+from .denoiser import ModelDenoiser, CFGDenoiser, MaskedDenoiser, guidance_interval_bounds
 from .samplers import (
     to_d,
     get_ancestral_step,
@@ -96,6 +96,7 @@ __all__ = [
     "ModelDenoiser",
     "CFGDenoiser",
     "MaskedDenoiser",
+    "guidance_interval_bounds",
     "to_d",
     "get_ancestral_step",
     "sample_euler",

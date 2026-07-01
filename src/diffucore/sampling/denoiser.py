@@ -9,11 +9,31 @@ conditioned and unconditioned predictions and extrapolating between them.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable
 
 import torch
 
 from .parameterization import DiscreteSchedule, Scaling
+
+
+def guidance_interval_bounds(sigmas, start: float, end: float) -> tuple[float, float]:
+    """Map a step-fraction guidance interval onto absolute sigma bounds.
+
+    Applying CFG only in a middle band of the schedule (Kynkäänniemi et al.,
+    2024) keeps its quality benefit while skipping the uncond forward outside
+    the band. ``start``/``end`` are fractions of the sampling run: CFG is active
+    for steps ``start*n <= i < end*n`` of the ``n``-step descending ``sigmas``
+    schedule. Returns ``(lo, hi)`` such that CFG applies while ``lo < sigma <=
+    hi`` — a sigma-space test, so mid-step evaluations by higher-order samplers
+    land in the right band too. ``(0, 1)`` returns ``(-inf, inf)`` (always on).
+    """
+    if not 0.0 <= start < end <= 1.0:
+        raise ValueError(f"need 0 <= start < end <= 1; got {start}, {end}")
+    n = len(sigmas) - 1
+    hi = math.inf if start <= 0.0 else float(sigmas[min(n, round(start * n))])
+    lo = -math.inf if end >= 1.0 else float(sigmas[min(n, round(end * n))])
+    return lo, hi
 
 
 class ModelDenoiser:
@@ -51,17 +71,25 @@ class CFGDenoiser:
 
     Cond and uncond are batched into a single backbone forward (tensors stacked
     along the batch axis) so the model sees half as many invocations per step.
+
+    ``sigma_lo``/``sigma_hi`` restrict guidance to sigmas in ``(lo, hi]`` (see
+    :func:`guidance_interval_bounds`); outside the band only the conditioned
+    forward runs — half the backbone work for those steps. Defaults are
+    unbounded (guidance at every step, the previous behavior).
     """
 
-    def __init__(self, denoiser: ModelDenoiser, cond: dict, uncond: dict, scale: float, rescale: float = 0.0):
+    def __init__(self, denoiser: ModelDenoiser, cond: dict, uncond: dict, scale: float, rescale: float = 0.0,
+                 sigma_lo: float = -math.inf, sigma_hi: float = math.inf):
         self.denoiser = denoiser
         self.cond = cond
         self.uncond = uncond
         self.scale = scale
         self.rescale = rescale
+        self.sigma_lo = sigma_lo
+        self.sigma_hi = sigma_hi
 
     def __call__(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        if self.scale == 1.0:
+        if self.scale == 1.0 or not (self.sigma_lo < float(sigma.max()) <= self.sigma_hi):
             return self.denoiser(x, sigma, **self.cond)
         # Batch cond+uncond into one forward when values are tensors (the common
         # production case). Fall back to separate forwards for non-tensor values

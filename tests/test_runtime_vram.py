@@ -197,6 +197,24 @@ def test_perf_context_sets_and_restores_when_on():
         torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
 
+def test_perf_context_fp16_accumulation_sets_and_restores():
+    """fp16_accumulation defaults off; when on, perf_context flips the cuBLAS
+    fp16-accumulate flag inside the context and restores it on exit."""
+    assert DevicePolicy(device=torch.device("cpu")).fp16_accumulation is False
+    if not hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
+        pytest.skip("torch < 2.7: no allow_fp16_accumulation backend flag")
+    p = DevicePolicy(device=torch.device("cpu"), cudnn_benchmark=False,
+                     fp16_accumulation=True)
+    prev = torch.backends.cuda.matmul.allow_fp16_accumulation
+    try:
+        torch.backends.cuda.matmul.allow_fp16_accumulation = False
+        with perf_context(p):
+            assert torch.backends.cuda.matmul.allow_fp16_accumulation is True
+        assert torch.backends.cuda.matmul.allow_fp16_accumulation is False
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation = prev
+
+
 def test_compile_flag_defaults_off():
     """``compile`` must default off so the current behavior is unchanged."""
     p = DevicePolicy(device=torch.device("cpu"))

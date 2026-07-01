@@ -44,6 +44,8 @@ class Inpaint(_Pipeline):
         steps: int = 20,
         cfg_scale: float = 7.0,
         cfg_rescale: float | None = None,
+        cfg_interval_start: float = 0.0,
+        cfg_interval_end: float = 1.0,
         width: int | None = None,
         height: int | None = None,
         sampler: str = "euler",
@@ -80,6 +82,7 @@ class Inpaint(_Pipeline):
                 width=width or self.model.spec.image_size,
                 height=height or self.model.spec.image_size,
                 sampler=sampler, scheduler=scheduler, seed=seed,
+                cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
                 curvature=curvature, eta_max=eta_max, beta_alpha=beta_alpha,
                 beta_beta=beta_beta, lq_threshold=lq_threshold,
                 bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,
@@ -111,10 +114,13 @@ class Inpaint(_Pipeline):
 
         with perf_context(policy):
             cond, uncond = self._encode_prompts(prompt, negative_prompt, width, height, policy)
-            cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale)
 
             sigmas = self._sigmas(scheduler, steps, device, compute_dtype)
             sigmas = sigmas[img2img_start(steps, strength):]
+            # Denoiser built after the strength slice so the guidance-interval
+            # fractions span the steps that actually run.
+            cfg = self._denoiser(cond, uncond, cfg_scale, cfg_rescale, sigmas=sigmas,
+                                 cfg_interval=(cfg_interval_start, cfg_interval_end))
 
             generator = torch.Generator(device=device)
             if seed is not None:
