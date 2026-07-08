@@ -186,12 +186,25 @@ def flux_text_to_image(
         raise ValueError(f"width/height must be divisible by {geom['downscale']}; got {width}x{height}")
 
     with perf_context(policy):
-        # ---- 1+2. tokenize + encode (text encoders staged on device when offloading)
-        text_mods = [model.text_encoder]
-        if model.text_encoder_2 is not None:
-            text_mods.append(model.text_encoder_2)
-        with staged(text_mods, device, policy.offload_idle):
-            context, pooled = _encode_text(model, prompt, device, dtype)
+        # ---- 1+2. tokenize + encode (text encoders staged on device when offloading).
+        # Conditioning cache: keyed on the prompt (FLUX is guidance-distilled, no
+        # negative), a repeat skips the encode and — the big win — the T5-XXL /
+        # Mistral PCIe staging. The check sits before staged() so a hit never brings
+        # the encoder onto the GPU.
+        cache = model.cond_cache
+        cached_ctx = cache.get((prompt,)) if cache is not None else None
+        if cached_ctx is None:
+            text_mods = [model.text_encoder]
+            if model.text_encoder_2 is not None:
+                text_mods.append(model.text_encoder_2)
+            with staged(text_mods, device, policy.offload_idle):
+                context, pooled = _encode_text(model, prompt, device, dtype)
+            if cache is not None:
+                cache.put((prompt,), {"context": context.detach().to("cpu"),
+                                      "pooled": None if pooled is None else pooled.detach().to("cpu")})
+        else:
+            context = cached_ctx["context"].to(device)
+            pooled = None if cached_ctx["pooled"] is None else cached_ctx["pooled"].to(device)
 
         h_lat, w_lat = height // geom["downscale"], width // geom["downscale"]
         patch = geom["patch"]
@@ -330,12 +343,24 @@ def flux_img2img(
         raise ValueError(f"width/height must be divisible by {geom['downscale']}; got {width}x{height}")
 
     with perf_context(policy):
-        # ---- 1. tokenize + encode (text encoders staged on device when offloading)
-        text_mods = [model.text_encoder]
-        if model.text_encoder_2 is not None:
-            text_mods.append(model.text_encoder_2)
-        with staged(text_mods, device, policy.offload_idle):
-            context, pooled = _encode_text(model, prompt, device, dtype)
+        # ---- 1. tokenize + encode (text encoders staged on device when offloading).
+        # Conditioning cache keyed on the prompt (shares t2i's entries). See
+        # flux_text_to_image; the check sits before staged() so a hit skips the
+        # T5-XXL / Mistral staging.
+        cache = model.cond_cache
+        cached_ctx = cache.get((prompt,)) if cache is not None else None
+        if cached_ctx is None:
+            text_mods = [model.text_encoder]
+            if model.text_encoder_2 is not None:
+                text_mods.append(model.text_encoder_2)
+            with staged(text_mods, device, policy.offload_idle):
+                context, pooled = _encode_text(model, prompt, device, dtype)
+            if cache is not None:
+                cache.put((prompt,), {"context": context.detach().to("cpu"),
+                                      "pooled": None if pooled is None else pooled.detach().to("cpu")})
+        else:
+            context = cached_ctx["context"].to(device)
+            pooled = None if cached_ctx["pooled"] is None else cached_ctx["pooled"].to(device)
 
         h_lat, w_lat = height // geom["downscale"], width // geom["downscale"]
         patch = geom["patch"]

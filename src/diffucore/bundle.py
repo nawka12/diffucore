@@ -60,6 +60,7 @@ class ModelBundle:
     vae: object                     # models.AutoencoderKL
     text_encoder_2: object = None   # SDXL only: OpenCLIPTextEncoder (bigG)
     policy: DevicePolicy = None      # placement authority; None -> all-resident
+    cond_cache: object = None        # optional runtime.ConditioningCache; None -> no caching (today's behavior)
 
 
 def load_checkpoint(

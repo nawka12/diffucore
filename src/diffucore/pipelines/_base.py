@@ -153,9 +153,27 @@ class _Pipeline:
     # --- conditioning --------------------------------------------------------
     def _encode_prompts(self, prompt, negative_prompt, width, height, policy):
         """Cond/uncond kwarg dicts for the backbone, with the text encoder(s)
-        staged onto the GPU for the duration when offloading."""
-        with staged(self._text_modules(), policy.device, policy.offload_idle):
-            return self._conditioning(prompt, negative_prompt, width, height, policy.device)
+        staged onto the GPU for the duration when offloading.
+
+        The resolution-independent half (context, and SDXL's pooled vector) is
+        cached on the bundle when a ``cond_cache`` is present, so a repeat prompt
+        skips both the encode and — under offload — the encoder's PCIe staging. The
+        check sits before ``staged()`` so a hit never brings the encoder onto the
+        GPU. SDXL's size-conditioning ``y`` depends on width/height, so it is
+        assembled fresh each call and kept out of the cache."""
+        cache = self.model.cond_cache
+        # clip_skip is fixed at 1 here, so (prompt, negative) fully keys the value;
+        # add clip_skip to the key if it ever becomes a runtime argument.
+        key = (prompt, negative_prompt)
+        enc = cache.get(key) if cache is not None else None
+        if enc is None:
+            with staged(self._text_modules(), policy.device, policy.offload_idle):
+                enc = self._encode_conditioning(prompt, negative_prompt)
+            if cache is not None:
+                cache.put(key, {k: v.detach().to("cpu") for k, v in enc.items()})
+        else:
+            enc = {k: v.to(policy.device) for k, v in enc.items()}
+        return self._assemble_conditioning(enc, width, height, policy.device)
 
     def _text_modules(self):
         """The text encoder(s) resident during the conditioning stage."""
@@ -164,22 +182,30 @@ class _Pipeline:
             mods.append(self.model.text_encoder_2)
         return mods
 
-    def _conditioning(self, prompt, negative_prompt, width, height, device):
-        """Build the cond/uncond kwarg dicts forwarded to the backbone. SDXL adds
-        a pooled-text + size-conditioning ``y`` vector alongside the context."""
+    def _encode_conditioning(self, prompt, negative_prompt):
+        """The resolution-independent (cacheable) half of conditioning: the context
+        per branch, plus SDXL's pooled text vector. SDXL's chunk-matching runs here
+        — it depends only on the prompt pair, not on width/height."""
         model = self.model
         if model.spec.architecture == "sdxl":
             conditioner = SDXLConditioner(model.tokenizer, model.text_encoder, model.text_encoder_2)
             ctx_c, pooled_c = conditioner(prompt, batch=1)
             ctx_u, pooled_u = conditioner(negative_prompt, batch=1)
             ctx_c, ctx_u = _match_context_chunks(ctx_c, ctx_u, conditioner)
+            return {"ctx_c": ctx_c, "pooled_c": pooled_c, "ctx_u": ctx_u, "pooled_u": pooled_u}
+        conditioner = Conditioner(model.tokenizer, model.text_encoder, clip_skip=1)
+        return {"ctx_c": conditioner(prompt, batch=1), "ctx_u": conditioner(negative_prompt, batch=1)}
+
+    def _assemble_conditioning(self, enc, width, height, device):
+        """Build the cond/uncond backbone kwargs from an encode. SDXL adds the
+        size-conditioning ``y`` (pooled text + time_ids), which depends on
+        width/height and so is (re)built here rather than cached."""
+        if self.model.spec.architecture == "sdxl":
             # time_ids = (orig_h, orig_w, crop_top, crop_left, target_h, target_w)
             time_ids = torch.tensor([height, width, 0, 0, height, width], device=device)
-            return ({"context": ctx_c, "y": self._sdxl_y(pooled_c, time_ids)},
-                    {"context": ctx_u, "y": self._sdxl_y(pooled_u, time_ids)})
-
-        conditioner = Conditioner(model.tokenizer, model.text_encoder, clip_skip=1)
-        return {"context": conditioner(prompt, batch=1)}, {"context": conditioner(negative_prompt, batch=1)}
+            return ({"context": enc["ctx_c"], "y": self._sdxl_y(enc["pooled_c"], time_ids)},
+                    {"context": enc["ctx_u"], "y": self._sdxl_y(enc["pooled_u"], time_ids)})
+        return {"context": enc["ctx_c"]}, {"context": enc["ctx_u"]}
 
     @staticmethod
     def _sdxl_y(pooled, time_ids):

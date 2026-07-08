@@ -162,19 +162,30 @@ def anima_text_to_image(
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
 
     with perf_context(policy):
-        # ---- 1. tokenize cond + uncond
-        cond_tok = model.tokenizer(prompt)
-        uncond_tok = model.tokenizer(negative_prompt)
+        # Conditioning cache: the post-adapter context depends only on the prompt
+        # pair, so a repeat (seed hunting, X/Y/Z sweeps) skips tokenize + encode +
+        # the LLM-Adapter — and, under offload, the Qwen encoder's PCIe round-trip.
+        # The check sits before staged() so a hit never brings the encoder onto the
+        # GPU. The cached value (post-adapter cond/uncond ctx) is produced inside
+        # the backbone staged() block below, where the adapter runs today.
+        cache = model.cond_cache
+        cache_key = (prompt, negative_prompt)
+        cached_ctx = cache.get(cache_key) if cache is not None else None
 
-        # ---- 2. encode with Qwen3 (staged onto device when offloading)
-        with staged([model.text_encoder], device, policy.offload_idle):
-            qwen_dtype = next(model.text_encoder.parameters()).dtype
-            cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
-            uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
-            del qwen_dtype  # silence unused warning if the Qwen3 dtype probe ever shifts
+        if cached_ctx is None:
+            # ---- 1. tokenize cond + uncond
+            cond_tok = model.tokenizer(prompt)
+            uncond_tok = model.tokenizer(negative_prompt)
 
-        cond_t5 = cond_tok.t5_ids.to(device)
-        uncond_t5 = uncond_tok.t5_ids.to(device)
+            # ---- 2. encode with Qwen3 (staged onto device when offloading)
+            with staged([model.text_encoder], device, policy.offload_idle):
+                qwen_dtype = next(model.text_encoder.parameters()).dtype
+                cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
+                uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
+                del qwen_dtype  # silence unused warning if the Qwen3 dtype probe ever shifts
+
+            cond_t5 = cond_tok.t5_ids.to(device)
+            uncond_t5 = uncond_tok.t5_ids.to(device)
 
         # ---- 3. σ schedule, init noise
         sched_shift = shift
@@ -220,9 +231,17 @@ def anima_text_to_image(
             # The LLM-Adapter output depends only on the prompt: run it once per
             # generation and feed the DiT the prepared context (t5xxl_ids=None),
             # instead of re-running the adapter inside every backbone forward
-            # (per step, per CFG branch).
-            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
-            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+            # (per step, per CFG branch). On a cache hit both contexts come straight
+            # off CPU (adapter skipped too); on a miss we compute and cache them.
+            if cached_ctx is None:
+                cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+                uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+                if cache is not None:
+                    cache.put(cache_key, {"cond_ctx": cond_ctx.detach().to("cpu"),
+                                          "uncond_ctx": uncond_ctx.detach().to("cpu")})
+            else:
+                cond_ctx = cached_ctx["cond_ctx"].to(device)
+                uncond_ctx = cached_ctx["uncond_ctx"].to(device)
             if sampler == "euler":
                 total = len(sigmas) - 1
                 with _step_progress(total, progress_callback, preview_callback) as on_step:
@@ -357,14 +376,19 @@ def anima_img2img(
     device, dtype = policy.device, policy.compute_dtype
 
     with perf_context(policy):
-        # ---- 1. tokenize + encode cond/uncond (same as t2i)
-        cond_tok = model.tokenizer(prompt)
-        uncond_tok = model.tokenizer(negative_prompt)
-        with staged([model.text_encoder], device, policy.offload_idle):
-            cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
-            uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
-        cond_t5 = cond_tok.t5_ids.to(device)
-        uncond_t5 = uncond_tok.t5_ids.to(device)
+        # ---- 1. tokenize + encode cond/uncond (same as t2i, and shares its cache —
+        # the post-adapter context is resolution-independent). See anima_text_to_image.
+        cache = model.cond_cache
+        cache_key = (prompt, negative_prompt)
+        cached_ctx = cache.get(cache_key) if cache is not None else None
+        if cached_ctx is None:
+            cond_tok = model.tokenizer(prompt)
+            uncond_tok = model.tokenizer(negative_prompt)
+            with staged([model.text_encoder], device, policy.offload_idle):
+                cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
+                uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
+            cond_t5 = cond_tok.t5_ids.to(device)
+            uncond_t5 = uncond_tok.t5_ids.to(device)
 
         # ---- 2. σ schedule. img2img/inpaint follow ComfyUI's KSampler denoise
         # convention (Anima's reference): build the schedule at int(steps/strength)
@@ -422,9 +446,17 @@ def anima_img2img(
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
-            # Adapter runs once per generation, not per forward (see t2i).
-            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
-            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+            # Adapter runs once per generation, not per forward (see t2i); the
+            # post-adapter context is cached across repeats (shared with t2i).
+            if cached_ctx is None:
+                cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+                uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+                if cache is not None:
+                    cache.put(cache_key, {"cond_ctx": cond_ctx.detach().to("cpu"),
+                                          "uncond_ctx": uncond_ctx.detach().to("cpu")})
+            else:
+                cond_ctx = cached_ctx["cond_ctx"].to(device)
+                uncond_ctx = cached_ctx["uncond_ctx"].to(device)
 
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)

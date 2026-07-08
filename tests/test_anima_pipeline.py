@@ -146,6 +146,58 @@ def test_adapter_runs_once_per_branch(pipe, monkeypatch):
     assert len(calls) == 2
 
 
+def test_cond_cache_skips_reencode_and_adapter(pipe, monkeypatch):
+    """With a conditioning cache attached, repeating the same (prompt, negative)
+    runs zero text-encoder forwards and zero LLM-Adapter calls; a changed negative
+    misses and re-encodes both branches."""
+    from diffucore import ConditioningCache
+    from diffucore.models.anima_dit import AnimaDiT
+    import diffucore.pipelines._anima as anima_mod
+
+    encode_calls, adapter_calls = [], []
+    orig_encode = anima_mod._qwen_encode
+    orig_adapter = AnimaDiT.preprocess_text_embeds
+
+    def counting_encode(*a, **k):
+        encode_calls.append(1)
+        return orig_encode(*a, **k)
+
+    def counting_adapter(self, *a, **k):
+        adapter_calls.append(1)
+        return orig_adapter(self, *a, **k)
+
+    monkeypatch.setattr(anima_mod, "_qwen_encode", counting_encode)
+    monkeypatch.setattr(AnimaDiT, "preprocess_text_embeds", counting_adapter)
+
+    pipe.model.cond_cache = ConditioningCache()
+    try:
+        _gen(pipe, seed=0, steps=2)                          # cold: encode + adapt cond & uncond
+        assert len(encode_calls) == 2 and len(adapter_calls) == 2
+        _gen(pipe, seed=1, steps=2)                          # same prompt/negative -> full hit
+        assert len(encode_calls) == 2 and len(adapter_calls) == 2
+        pipe("a fox in a forest", negative_prompt="a different negative",
+             steps=2, cfg_scale=4.0, width=128, height=128, seed=0)  # new negative -> miss
+        assert len(encode_calls) == 4 and len(adapter_calls) == 4
+    finally:
+        pipe.model.cond_cache = None
+
+
+def test_cond_cache_bit_identical(pipe):
+    """A warm-cache generation is byte-identical to the uncached one: the cached
+    tensors are the exact fp16 values, round-tripped losslessly through CPU."""
+    from diffucore import ConditioningCache
+
+    pipe.model.cond_cache = None
+    cold = np.asarray(_gen(pipe, seed=123, steps=3))
+    try:
+        pipe.model.cond_cache = ConditioningCache()
+        _gen(pipe, seed=123, steps=3)                        # populate (miss)
+        warm = np.asarray(_gen(pipe, seed=123, steps=3))     # hit
+        assert np.array_equal(cold, warm)
+    finally:
+        pipe.model.cond_cache = None
+
+
 def test_anima_seed_reproducible(pipe):
     a = np.asarray(_gen(pipe, seed=123))
     b = np.asarray(_gen(pipe, seed=123))

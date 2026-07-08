@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .cond_cache import ConditioningCache
+
 _CPU = torch.device("cpu")
 
 
@@ -551,4 +553,4 @@ def can_decode_untiled(
     return fits
 
 
-__all__ = ["DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last"]
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last"]
