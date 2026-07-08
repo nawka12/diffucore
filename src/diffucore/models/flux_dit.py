@@ -43,6 +43,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from ._attention import attention_bhld
+
 
 @dataclass
 class FluxConfig:
@@ -203,10 +205,10 @@ def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pe: torch.Tensor,
+              backend: str = "sdpa") -> torch.Tensor:
     q, k = apply_rope(q, k, pe)
-    x = F.scaled_dot_product_attention(q, k, v)
-    return rearrange(x, "B H L D -> B L (H D)")
+    return attention_bhld(q, k, v, backend)
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +278,9 @@ class DoubleStreamBlock(nn.Module):
         super().__init__()
         mlp_hidden = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in
+        # (see models/_attention.py). Plain attribute — no state-dict impact.
+        self.attn_backend = "sdpa"
         self.modulation = modulation
         if modulation:
             self.img_mod = Modulation(hidden_size, double=True)
@@ -309,7 +314,7 @@ class DoubleStreamBlock(nn.Module):
         q = torch.cat((txt_q, img_q), dim=2)
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
-        attn = attention(q, k, v, pe=pe)
+        attn = attention(q, k, v, pe=pe, backend=self.attn_backend)
         txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
 
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
@@ -325,6 +330,9 @@ class SingleStreamBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in
+        # (see models/_attention.py). Plain attribute — no state-dict impact.
+        self.attn_backend = "sdpa"
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # SiLU-gated MLP needs twice the first-linear width (it halves on gating).
         self.mlp_first = self.mlp_hidden_dim * 2 if mlp_silu_act else self.mlp_hidden_dim
@@ -346,7 +354,7 @@ class SingleStreamBlock(nn.Module):
         )
         q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
         q, k = self.norm(q, k, v)
-        attn = attention(q, k, v, pe=pe)
+        attn = attention(q, k, v, pe=pe, backend=self.attn_backend)
         out = self.linear2(torch.cat((attn, self.mlp_act(mlp)), dim=2))
         return x + mod.gate * out
 

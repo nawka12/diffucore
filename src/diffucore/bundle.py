@@ -26,6 +26,7 @@ from .models import (
     Qwen35TextEncoder, Qwen35Config,
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
 )
+from .models._attention import resolve_attention_backend, set_attention_backend
 from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
@@ -249,6 +250,14 @@ def load_anima_checkpoint(
                       prefetch=policy.stream_prefetch)
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+
+    # Attention dispatch (models/_attention.py): resolve the policy's kernel
+    # choice once and stamp the DiT's attention modules. "sdpa" (default)
+    # stamps nothing — the modules already default to it.
+    attn_backend = resolve_attention_backend(policy)
+    if attn_backend != "sdpa":
+        set_attention_backend(backbone, attn_backend)
+        _stage(f"attention backend: {attn_backend}")
 
     if policy.compile:
         _stage("compiling backbone (torch.compile warmup — may take minutes)")
@@ -484,6 +493,11 @@ def load_flux_checkpoint(
                       prefetch=policy.stream_prefetch)
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+    # Attention dispatch: resolve the policy's kernel choice once and stamp the
+    # DiT blocks ("sdpa" stamps nothing — the modules already default to it).
+    attn_backend = resolve_attention_backend(policy)
+    if attn_backend != "sdpa":
+        set_attention_backend(backbone, attn_backend)
     backbone = maybe_compile_backbone(backbone, policy)
 
     # ---- VAE (config inferred from the weights: 16-ch/8× for FLUX.1, 128-ch/16×

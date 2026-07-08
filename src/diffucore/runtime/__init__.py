@@ -77,6 +77,17 @@ class DevicePolicy:
     # measured x1.6 on DiT-shaped GEMMs on an RTX 2060. Not bit-exact (reduced
     # accumulation precision), so opt-in only. No-op on torch < 2.7.
     fp16_accumulation: bool = False
+    # ``attention`` picks the DiT attention kernel (Anima + FLUX only; the conv
+    # UNets ignore it). "sdpa" = today's kernel, bit-exact default. "fa2_turing"
+    # = the optional FlashAttention-2 sm75 port (locally built
+    # ``flash_attn_turing`` package): fp16-only, Turing-only, ×1.3–1.6 over the
+    # mem-efficient kernel SDPA falls back to there; raises at load when any
+    # requirement is unmet. "auto" = fa2_turing iff every requirement holds,
+    # else silently sdpa — never an error, and never a change on sm80+ GPUs
+    # (their native flash SDPA already runs). Not bit-exact (different
+    # accumulation order), so opt-in only. Incompatible with ``compile``
+    # (an unregistered custom op graph-breaks in every block).
+    attention: str = "sdpa"
     # --- opt-in compile (PR-B). When True, the backbone (SD/SDXL UNet or Anima
     # DiT) is wrapped with ``torch.compile(dynamic=True)`` at load. Pays a one-
     # time warmup on the first call (10-60s depending on platform), persisted
@@ -101,6 +112,11 @@ class DevicePolicy:
         if self.stream_blocks_per_group < 1:
             raise ValueError(
                 f"stream_blocks_per_group must be >= 1; got {self.stream_blocks_per_group}"
+            )
+        if self.attention not in ("sdpa", "auto", "fa2_turing"):
+            raise ValueError(
+                f"attention must be 'sdpa', 'auto', or 'fa2_turing'; "
+                f"got {self.attention!r}"
             )
 
     @property

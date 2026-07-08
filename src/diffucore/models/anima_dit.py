@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
+from ._attention import attention_blhd
 from ._norm import RMSNorm
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
 
@@ -283,6 +284,9 @@ class _Attention(nn.Module):
         self.output_proj = nn.Linear(inner, query_dim, bias=False)
         self.q_norm = RMSNorm(head_dim, eps=eps)
         self.k_norm = RMSNorm(head_dim, eps=eps)
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in
+        # (see models/_attention.py). Plain attribute — no state-dict impact.
+        self.attn_backend = "sdpa"
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor], rope_emb: Optional[torch.Tensor]) -> torch.Tensor:
         ctx = x if context is None else context
@@ -297,12 +301,10 @@ class _Attention(nn.Module):
         # SDPA: this attention is not validated against an oracle in DT5;
         # using SDPA here is a perf win that DT7 will check end-to-end. For
         # MLP-free (large head_dim, image-style) attention the math/flash
-        # paths land at the same answer within fp16 tolerance.
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v)
-        out = out.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)
+        # paths land at the same answer within fp16 tolerance. The dispatch
+        # runs that same SDPA by default; "fa2_turing" swaps in the sm75
+        # FlashAttention-2 port when the loader stamped it.
+        out = attention_blhd(q, k, v, self.attn_backend)
         return self.output_proj(out)
 
 
