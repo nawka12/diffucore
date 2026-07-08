@@ -87,6 +87,20 @@ def test_dit_t5xxl_path_routes_through_adapter(loaded_dit):
     assert not torch.equal(a, b)
 
 
+def test_rope_cache_lives_on_compute_device():
+    """The RoPE table is cached on the device it was built for, so a cache hit
+    returns the same tensor with no copy — it used to be parked on CPU and
+    re-uploaded (4 MB H2D at 1024²) on every forward."""
+    from diffucore.models.anima_dit import _VideoRoPE3D
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    rope = _VideoRoPE3D(CosmosDiTConfig()).to(device)
+    x = torch.empty(1, 1, 8, 8, 2048, device=device)
+    a = rope(x)
+    b = rope(x)
+    assert rope._rope_cache[1].device.type == device.type
+    assert b is a
+
+
 # --- 3. conditioning sensitivity (catches "ignored input" bugs) ------------
 
 def test_dit_sensitive_to_timesteps(loaded_dit):

@@ -5,8 +5,8 @@ threading flow-matching state through the SD/SDXL ``_Pipeline`` scaffolding:
 
   prompt  -> AnimaTokenizer (Qwen2 + T5)
           -> Qwen3 (source hidden states)
-          -> AnimaDiT.forward(..., context=qwen_hidden, t5xxl_ids=t5_ids)
-              (DiT runs the LLM-Adapter internally on its first call)
+          -> AnimaDiT.preprocess_text_embeds (LLM-Adapter, once per generation)
+          -> AnimaDiT.forward(..., context=prepared_ctx) each step
           -> flow-matching σ schedule + CONST scaling + Euler integration
           -> QwenImageVAE.process_out then VAE.decode
 
@@ -217,6 +217,12 @@ def anima_text_to_image(
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+            # The LLM-Adapter output depends only on the prompt: run it once per
+            # generation and feed the DiT the prepared context (t5xxl_ids=None),
+            # instead of re-running the adapter inside every backbone forward
+            # (per step, per CFG branch).
+            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
             if sampler == "euler":
                 total = len(sigmas) - 1
                 with _step_progress(total, progress_callback, preview_callback) as on_step:
@@ -225,7 +231,7 @@ def anima_text_to_image(
                         x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
                         t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
-                        v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
+                        v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
                         if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
                             v = v_cond
                         else:
@@ -235,7 +241,7 @@ def anima_text_to_image(
                             # (PyTorch's documented fix for sequential invocations).
                             if policy.cuda_graphs:
                                 v_cond = v_cond.clone()
-                            v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
+                            v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
                         # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
@@ -249,13 +255,13 @@ def anima_text_to_image(
                     CONST x0 estimate ``x − σ·v`` in fp32 for the solver math."""
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
-                    v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
+                    v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
                     if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                         v = v_cond
                     else:
                         if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see euler path)
                             v_cond = v_cond.clone()
-                        v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
+                        v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
                     return x_in.float() - sig * v.float()
@@ -416,16 +422,20 @@ def anima_img2img(
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+            # Adapter runs once per generation, not per forward (see t2i).
+            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
-                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
+                v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
                 if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                     v = v_cond
                 else:
                     if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
                         v_cond = v_cond.clone()
-                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5, teacache=tc_uncond).squeeze(2)
+                    v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 x0 = x_in.float() - sig * v.float()
@@ -520,16 +530,20 @@ def anima_calibrate_oss(
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+            # Adapter runs once per calibration, not per forward (see t2i).
+            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
-                v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5).squeeze(2)
+                v_cond = backbone(x_5d, t, cond_ctx).squeeze(2)
                 if cfg_scale == 1.0:
                     v = v_cond
                 else:
                     if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
                         v_cond = v_cond.clone()
-                    v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                    v_uncond = backbone(x_5d, t, uncond_ctx).squeeze(2)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 return x_in.float() - sig * v.float()
@@ -599,13 +613,16 @@ def anima_calibrate_teacache(
 
         backbone = model.backbone
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+            # Adapter runs once per calibration, not per forward (see t2i).
+            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
             total = len(sigmas) - 1
             with _step_progress(total, progress_callback) as on_step:
                 for i in range(total):
                     sigma, sigma_next = sigmas[i], sigmas[i + 1]
                     x_5d = x.unsqueeze(2)
                     t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
-                    v_cond = backbone(x_5d, t, cond_hidden, t5xxl_ids=cond_t5, teacache=tc_cond).squeeze(2)
+                    v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
                     if policy.cuda_graphs:
                         # prev_v is read on the NEXT step, after every intervening
                         # replay has overwritten the graph's static output buffer —
@@ -618,7 +635,7 @@ def anima_calibrate_teacache(
                     if cfg_scale == 1.0:
                         v = v_cond
                     else:
-                        v_uncond = backbone(x_5d, t, uncond_hidden, t5xxl_ids=uncond_t5).squeeze(2)
+                        v_uncond = backbone(x_5d, t, uncond_ctx).squeeze(2)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     x = x + (sigma_next - sigma).to(dtype) * v
                     on_step(i, sigma, x, None)

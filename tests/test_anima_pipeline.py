@@ -128,6 +128,24 @@ def test_anima_produces_rgb_image(pipe):
     assert arr.std() > 1.0
 
 
+def test_adapter_runs_once_per_branch(pipe, monkeypatch):
+    """The LLM-Adapter's output depends only on the prompt, so a CFG generation
+    must run it exactly twice (cond + uncond) — not once per backbone forward
+    (per step, per branch), which is what it regressed from."""
+    from diffucore.models.anima_dit import AnimaDiT
+
+    calls = []
+    orig = AnimaDiT.preprocess_text_embeds
+
+    def counting(self, *args, **kwargs):
+        calls.append(1)
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(AnimaDiT, "preprocess_text_embeds", counting)
+    _gen(pipe, seed=0, steps=3)
+    assert len(calls) == 2
+
+
 def test_anima_seed_reproducible(pipe):
     a = np.asarray(_gen(pipe, seed=123))
     b = np.asarray(_gen(pipe, seed=123))

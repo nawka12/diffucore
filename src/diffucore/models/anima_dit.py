@@ -200,10 +200,20 @@ class _VideoRoPE3D(nn.Module):
         B, T, H, W, _ = x_B_T_H_W_D.shape
         device = x_B_T_H_W_D.device
         fps_key = fps.item() if fps is not None else None
-        cache_key = (H, W, T, fps_key)
-        cached = getattr(self, "_rope_cache", None)
-        if cached is not None and cached[0] == cache_key:
-            return cached[1].to(device)
+        # Device is part of the key because the cache is a plain attribute —
+        # module.to() won't move it — and the tensor is cached *on device* so a
+        # hit is free (a CPU-side cache would re-pay a 4 MB H2D copy per forward).
+        # Under torch.compile the cache is bypassed entirely: a tensor produced
+        # inside a reduce-overhead (CUDA Graphs) run lives in the graph's static
+        # buffer pool, so caching it would hand later calls storage that the next
+        # replay overwrites. Recomputing inside the compiled graph is fused trig
+        # over ~L·D/2 elements — cheaper than any cross-call bookkeeping.
+        compiling = torch.compiler.is_compiling()
+        cache_key = (H, W, T, fps_key, device)
+        if not compiling:
+            cached = getattr(self, "_rope_cache", None)
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
         h_theta = 10_000.0 * self.h_ntk
         w_theta = 10_000.0 * self.w_ntk
         t_theta = 10_000.0 * self.t_ntk
@@ -235,8 +245,9 @@ class _VideoRoPE3D(nn.Module):
             dim=-2,
         )
         result = rearrange(em, "t h w d (i j) -> (t h w) d i j", i=2, j=2).float()
-        self._rope_cache = (cache_key, result.cpu())
-        return result.to(device)
+        if not compiling:
+            self._rope_cache = (cache_key, result)
+        return result
 
 
 def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
