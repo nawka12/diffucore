@@ -24,7 +24,10 @@ from typing import Mapping, Sequence
 UNET_PREFIX = "model.diffusion_model."
 _INPUT_CONV = UNET_PREFIX + "input_blocks.0.0.weight"
 _ATTN2_TO_K = re.compile(r"transformer_blocks\.\d+\.attn2\.to_k\.weight$")
-_ANIMA_FINGERPRINT = "net.llm_adapter.blocks.0.cross_attn.q_proj.weight"
+# Anima's DiT keys are bare (``net.*``) in a native export but carry the
+# ``model.diffusion_model.`` prefix inside an all-in-one ComfyUI checkpoint — so
+# we match the adapter fingerprint on its suffix and recover the prefix.
+_ANIMA_FINGERPRINT = "llm_adapter.blocks.0.cross_attn.q_proj.weight"
 # FLUX transformers carry double-stream blocks. In a standalone BFL transformer
 # the key is bare; an all-in-one ComfyUI checkpoint prefixes it with
 # ``model.diffusion_model.`` — so we match on the suffix and recover the prefix.
@@ -54,6 +57,16 @@ def _context_dim(shapes: Mapping[str, Shape]) -> int | None:
     for key, shape in shapes.items():
         if key.startswith(UNET_PREFIX) and _ATTN2_TO_K.search(key):
             return int(shape[1])  # to_k.weight is [inner_dim, context_dim]
+    return None
+
+
+def _anima_prefix(shapes: Mapping[str, Shape]) -> str | None:
+    """The on-disk prefix in front of Anima's DiT keys (``"net."`` for a native
+    export, ``"model.diffusion_model."`` inside an all-in-one ComfyUI checkpoint).
+    Recovered from the LLM-adapter fingerprint."""
+    for key in shapes:
+        if key.endswith(_ANIMA_FINGERPRINT):
+            return key[: -len(_ANIMA_FINGERPRINT)]
     return None
 
 
@@ -119,9 +132,9 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
     ``NotImplementedError`` for a recognized-but-unsupported family.
     """
     # Anima DiT (Cosmos-Predict2 family with the LLM-adapter cross-encoder).
-    # Bare ``net.*`` prefix and a 6-block adapter at ``net.llm_adapter.*``;
-    # checking the first adapter block's q_proj is enough to disambiguate.
-    if _ANIMA_FINGERPRINT in shapes:
+    # A 6-block adapter at ``<prefix>llm_adapter.*``; checking the first adapter
+    # block's q_proj is enough to disambiguate.
+    if _anima_prefix(shapes) is not None:
         return ModelSpec(
             architecture="anima",
             prediction="flow",

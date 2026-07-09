@@ -123,6 +123,20 @@ def test_detect_anima_from_fingerprint():
     assert spec.image_size == 1024
 
 
+def test_detect_anima_under_comfyui_prefix():
+    """An all-in-one ComfyUI export wraps the same DiT keys under
+    ``model.diffusion_model.``; the fingerprint is matched on its suffix so the
+    prefixed layout detects as Anima too (regression: anima-aesthetic-v1.0)."""
+    shapes = {
+        "model.diffusion_model.llm_adapter.blocks.0.cross_attn.q_proj.weight": (1024, 1024),
+        "model.diffusion_model.blocks.0.adaln_modulation_self_attn.1.weight": (256, 2048),
+        "model.diffusion_model.x_embedder.proj.1.weight": (2048, 68),
+    }
+    spec = detect_architecture(shapes)
+    assert spec.architecture == "anima"
+    assert spec.context_dim == 1024
+
+
 def test_detect_anima_takes_precedence_over_missing_unet():
     """Without the Anima marker, an unrelated key set raises ValueError. The
     marker alone identifies the family — there is no ``model.diffusion_model.``

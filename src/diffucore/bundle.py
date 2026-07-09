@@ -159,7 +159,9 @@ def load_checkpoint(
     )
 
 
-_ANIMA_DIT_PREFIX = "net."
+# Anima DiT keys are bare (``net.*``) in a native export but ``model.diffusion_model.*``
+# inside an all-in-one ComfyUI checkpoint; recover whichever prefix by this leaf.
+_ANIMA_DIT_LEAF = "llm_adapter.blocks.0.cross_attn.q_proj.weight"
 
 
 def load_anima_checkpoint(
@@ -229,11 +231,10 @@ def load_anima_checkpoint(
         text_encoder.load_state_dict(te_sd, strict=True)
     text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
 
-    # DiT (incl. the LLM-Adapter under ``llm_adapter``): keys live under ``net.*``.
+    # DiT (incl. the LLM-Adapter under ``llm_adapter``): keys live under a ``net.*``
+    # or ``model.diffusion_model.*`` prefix, recovered and stripped by the leaf.
     _stage("loading DiT weights (largest file)")
-    sd_dit = load_state_dict(dit_path, device="cpu")
-    sd_dit = {k[len(_ANIMA_DIT_PREFIX):]: v for k, v in sd_dit.items()
-              if k.startswith(_ANIMA_DIT_PREFIX)}
+    sd_dit = _extract_component(load_state_dict(dit_path, device="cpu"), _ANIMA_DIT_LEAF)
     _stage("building DiT backbone (2B params)")
     backbone = AnimaDiT()
     backbone.load_state_dict(sd_dit, strict=True)
