@@ -22,6 +22,7 @@ from diffucore.runtime import (
     perf_context,
     tiled_vae_decode,
     to_channels_last,
+    vae_decode_safe,
 )
 
 _MODELS = Path(__file__).resolve().parents[1] / "models"
@@ -111,6 +112,70 @@ def test_can_decode_untiled_qwen_uses_lower_per_pixel_cost():
     shape = (1, 16, 128, 128)
     assert can_decode_untiled(sdxl_stub, shape, cuda, free_bytes=free) is False
     assert can_decode_untiled(qwen_stub, shape, cuda, free_bytes=free) is True
+
+
+def test_can_decode_untiled_fp16_halves_estimate():
+    """An fp16 VAE's decode activations all halve, so the (fp32-calibrated)
+    per-pixel estimate is halved: at a budget where the fp32 decode would tile,
+    the same VAE in fp16 must go untiled."""
+    cuda = torch.device("cuda")
+
+    def stub(dtype):
+        vae = type("AutoencoderKL", (torch.nn.Module,), {})()
+        vae.register_parameter("w", torch.nn.Parameter(torch.zeros(1, dtype=dtype)))
+        return vae
+
+    # 1024² needs 6 GB in fp32, 3 GB in fp16; free = 6.5 GB → budget ≈ 5.5 GB.
+    free = (13 * 1024**3) // 2
+    shape = (1, 16, 128, 128)
+    assert can_decode_untiled(stub(torch.float32), shape, cuda, free_bytes=free) is False
+    assert can_decode_untiled(stub(torch.float16), shape, cuda, free_bytes=free) is True
+
+
+# --- fp16 VAE non-finite fallback (vae_decode_safe) -- CPU-runnable ----------
+
+class _FlakyFP16VAE(torch.nn.Module):
+    """Decodes to NaN in fp16 and to a clean image in fp32 — the fp16-overflow
+    failure mode ``vae_decode_safe`` must recover from. ``fail_fp16=False``
+    makes fp16 succeed (the no-fallback happy path)."""
+
+    def __init__(self, fail_fp16: bool = True):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1, dtype=torch.float16))
+        self.fail_fp16 = fail_fp16
+        self.decodes = 0
+
+    def decode(self, z):
+        self.decodes += 1
+        fill = float("nan") if (z.dtype == torch.float16 and self.fail_fp16) else 0.5
+        return torch.full((z.shape[0], 3, z.shape[-2] * 8, z.shape[-1] * 8), fill, dtype=z.dtype)
+
+
+def test_vae_decode_safe_fp16_nan_falls_back_to_fp32():
+    """A non-finite fp16 decode must be retried in fp32 and the fallback must
+    persist: the module is converted and ``policy.vae_dtype`` flipped, so every
+    later encode/decode of this bundle skips the doomed fp16 attempt."""
+    vae = _FlakyFP16VAE()
+    policy = DevicePolicy(device=torch.device("cpu"), vae_dtype=torch.float16)
+    image, mode = vae_decode_safe(vae, torch.randn(1, 4, 8, 8, dtype=torch.float16), policy)
+    assert torch.isfinite(image).all()
+    assert mode == "untiled"
+    assert vae.decodes == 2                      # failed fp16 + fp32 retry
+    assert policy.vae_dtype == torch.float32
+    assert next(vae.parameters()).dtype == torch.float32
+
+
+def test_vae_decode_safe_fp16_clean_path_keeps_fp16():
+    """A finite fp16 decode must NOT trigger the fallback — one decode, policy
+    and module untouched."""
+    vae = _FlakyFP16VAE(fail_fp16=False)
+    policy = DevicePolicy(device=torch.device("cpu"), vae_dtype=torch.float16)
+    image, mode = vae_decode_safe(vae, torch.randn(1, 4, 8, 8, dtype=torch.float16), policy)
+    assert torch.isfinite(image).all()
+    assert image.dtype == torch.float16
+    assert vae.decodes == 1
+    assert policy.vae_dtype == torch.float16
+    assert next(vae.parameters()).dtype == torch.float16
 
 
 # --- on_device / DevicePolicy (R3) -- CPU-runnable ---------------------------

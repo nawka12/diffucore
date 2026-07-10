@@ -251,13 +251,53 @@ class _VideoRoPE3D(nn.Module):
         return result
 
 
-def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def _apply_rope_eager(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Apply the 2×2 rotation encoded in ``freqs`` (shape ``(L, D/2, 2, 2)``)
     to each pair of channels of ``t`` (shape ``(B, ..., L, D)``)."""
     t_ = t.reshape(*t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).float()
     out = freqs[..., 0] * t_[..., 0] + freqs[..., 1] * t_[..., 1]
     out = out.movedim(-1, -2).reshape(*t.shape).type_as(t)
     return out
+
+
+_apply_rope_cuda = None  # torch.compile'd lazily on first CUDA call; False = compile unusable here
+
+
+def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """RoPE apply: eager everywhere except CUDA, where the chain is
+    ``torch.compile``'d once and reused.
+
+    The eager reshape/movedim/broadcast-rotate runs as ~a dozen unfused
+    elementwise kernels over fp32 temporaries — 1.37 ms at 4096 tokens on an
+    RTX 2060, and ×56 per forward (q and k, 28 blocks) that is ~7 % of a DiT
+    step. The compiled kernel runs the same math in 0.29 ms.
+    ``emulate_precision_casts`` keeps Inductor's intermediate rounding
+    identical to eager (no fma contraction, no dropped casts) — verified
+    bit-equal across shapes/batches — so this changes speed, not images.
+    ``dynamic=True`` compiles once for all resolutions (no per-shape stall).
+
+    Under an outer ``torch.compile`` (policy.compile / cuda_graphs) the
+    ``is_compiling`` gate hands Dynamo the eager body to inline and fuse into
+    the surrounding graph — same pattern as the RoPE table cache above. Any
+    compile failure (no Triton / no host toolchain) permanently falls back to
+    eager for the process.
+    """
+    global _apply_rope_cuda
+    if torch.compiler.is_compiling() or not t.is_cuda:
+        return _apply_rope_eager(t, freqs)
+    if _apply_rope_cuda is None:
+        try:
+            compiled = torch.compile(_apply_rope_eager, dynamic=True,
+                                     options={"emulate_precision_casts": True})
+            out = compiled(t, freqs)  # compile here so a broken backend is caught once
+            _apply_rope_cuda = compiled
+            return out
+        except Exception as e:  # noqa: BLE001 — any backend failure means "no compile on this box"
+            print(f"[rope] torch.compile unavailable ({type(e).__name__}); keeping eager apply", flush=True)
+            _apply_rope_cuda = False
+    if _apply_rope_cuda is False:
+        return _apply_rope_eager(t, freqs)
+    return _apply_rope_cuda(t, freqs)
 
 
 # --------------------------------------------------------------------------- #

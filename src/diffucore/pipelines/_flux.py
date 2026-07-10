@@ -29,7 +29,7 @@ import torch
 from einops import rearrange
 from PIL import Image
 
-from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
+from ..runtime import perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
 from ._base import PipelineInfo, _step_progress, preprocess_image
 from ..sampling import (
     flow_matching_schedule,
@@ -285,10 +285,9 @@ def flux_text_to_image(
                     x = x * std + mean
                 x = _flux2_unpatchify_latents(x)
             latent = x.to(policy.vae_dtype)
-            tile = policy.vae_tile or not can_decode_untiled(model.vae, latent.shape, device)
-            image = tiled_vae_decode(model.vae, latent) if tile else model.vae.decode(latent)
+            image, decode_mode = vae_decode_safe(model.vae, latent, policy)
         image = _to_pil(image)
-        info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
+        info = PipelineInfo(vae_decode_mode=decode_mode)
         return (image, info) if return_info else image
 
 
@@ -396,6 +395,11 @@ def flux_img2img(
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             vae_lat = model.vae.encode(pixels)
+            if vae_lat.dtype == torch.float16 and not torch.isfinite(vae_lat).all():
+                # fp16 encode overflow poisons the whole run — retry fp32 (see
+                # vae_fallback_to_fp32; the decode below then also runs fp32).
+                vae_fallback_to_fp32(model.vae, policy)
+                vae_lat = model.vae.encode(pixels.float())
         if arch == "flux2":
             z0 = _flux2_patchify_latents(vae_lat.float())
             if getattr(model.vae, "flux2_latent_mean", None) is not None:
@@ -462,8 +466,7 @@ def flux_img2img(
                     x = x * std + mean
                 x = _flux2_unpatchify_latents(x)
             latent = x.to(policy.vae_dtype)
-            tile = policy.vae_tile or not can_decode_untiled(model.vae, latent.shape, device)
-            image = tiled_vae_decode(model.vae, latent) if tile else model.vae.decode(latent)
+            image, decode_mode = vae_decode_safe(model.vae, latent, policy)
         image = _to_pil(image)
 
         # inpaint: paste the original pixels back into the keep region (byte-exact)
@@ -473,5 +476,5 @@ def flux_img2img(
             out = np.where(keep[..., None], original, np.asarray(image))
             image = Image.fromarray(out.astype(np.uint8))
 
-        info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
+        info = PipelineInfo(vae_decode_mode=decode_mode)
         return (image, info) if return_info else image

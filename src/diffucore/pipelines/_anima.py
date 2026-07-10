@@ -10,11 +10,13 @@ threading flow-matching state through the SD/SDXL ``_Pipeline`` scaffolding:
           -> flow-matching σ schedule + CONST scaling + Euler integration
           -> QwenImageVAE.process_out then VAE.decode
 
-Compared to ``_Pipeline._sample``, we do CFG with a single batched forward
-where possible (one pass with batch=2 — cond and uncond stacked) so the 2B
-DiT only sees one forward per sampler step rather than two, and we manage
-the 4D↔5D shape ourselves at the DiT boundary rather than wrapping the
-backbone in an adapter.
+Compared to ``_Pipeline._sample``, CFG runs as two sequential batch-1
+forwards per step (cond, then uncond) instead of one stacked batch-2 pass —
+deliberately: a batch-2 forward measures no faster on a compute-bound GPU
+(RTX 2060: 2149 ms vs 2×1066 ms), while sequential halves peak activation
+memory and lets the guidance-interval and per-branch TeaCache skips drop
+the uncond forward entirely. We manage the 4D↔5D shape ourselves at the
+DiT boundary rather than wrapping the backbone in an adapter.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import torch
 from PIL import Image
 
 from ..models.anima_dit import TeaCache
-from ..runtime import can_decode_untiled, perf_context, staged, tiled_vae_decode
+from ..runtime import perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
 from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
     append_zero,
@@ -310,10 +312,9 @@ def anima_text_to_image(
         # DiT resident, but at 1024² it fits and the smart check picks untiled).
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z = model.vae.process_out(x.to(policy.vae_dtype))
-            tile = policy.vae_tile or not can_decode_untiled(model.vae, z.shape, device)
-            image = tiled_vae_decode(model.vae, z) if tile else model.vae.decode(z)
+            image, decode_mode = vae_decode_safe(model.vae, z, policy)
         image = _to_pil(image)
-        info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
+        info = PipelineInfo(vae_decode_mode=decode_mode)
         return (image, info) if return_info else image
 
 
@@ -419,7 +420,13 @@ def anima_img2img(
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
-            z0 = model.vae.process_in(model.vae.encode(pixels)).to(dtype)
+            z_vae = model.vae.encode(pixels)
+            if z_vae.dtype == torch.float16 and not torch.isfinite(z_vae).all():
+                # fp16 encode overflow poisons the whole run — retry fp32 (see
+                # vae_fallback_to_fp32; the decode below then also runs fp32).
+                vae_fallback_to_fp32(model.vae, policy)
+                z_vae = model.vae.encode(pixels.float())
+            z0 = model.vae.process_in(z_vae).to(dtype)
         # Keep the tail: last `steps + 1` σ → run `steps` from σ(t≈strength), the
         # ComfyUI denoise slice. OSS is a fixed calibrated trajectory, so it falls
         # back to the A1111 start index instead.
@@ -496,8 +503,7 @@ def anima_img2img(
         # ---- 5. decode
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z = model.vae.process_out(x.to(policy.vae_dtype))
-            tile = policy.vae_tile or not can_decode_untiled(model.vae, z.shape, device)
-            image = tiled_vae_decode(model.vae, z) if tile else model.vae.decode(z)
+            image, decode_mode = vae_decode_safe(model.vae, z, policy)
         image = _to_pil(image)
 
         # inpaint: paste the original pixels back into the keep region (byte-exact)
@@ -507,7 +513,7 @@ def anima_img2img(
             out = np.where(keep[..., None], original, np.asarray(image))
             image = Image.fromarray(out.astype(np.uint8))
 
-        info = PipelineInfo(vae_decode_mode="tiled" if tile else "untiled")
+        info = PipelineInfo(vae_decode_mode=decode_mode)
         return (image, info) if return_info else image
 
 

@@ -21,7 +21,7 @@ from tqdm.auto import tqdm
 
 from ..conditioning import Conditioner, SDXLConditioner
 from ..models.unet import DeepCache, timestep_embedding
-from ..runtime import DevicePolicy, can_decode_untiled, staged, tiled_vae_decode
+from ..runtime import DevicePolicy, staged, vae_decode_safe, vae_fallback_to_fp32
 from ..sampling import (
     CFGDenoiser,
     EpsScaling,
@@ -283,15 +283,12 @@ class _Pipeline:
             if policy.channels_last:
                 latent = latent.contiguous(memory_format=torch.channels_last)
             with staged([self.model.vae], policy.device, policy.offload_idle):
-                # Decide tile-vs-untiled *after* staging so free VRAM reflects
-                # the actual decode-time state (VAE on device, UNet/encoders
-                # gone or resident per the policy).
-                tile = policy.vae_tile or not can_decode_untiled(
-                    self.model.vae, latent.shape, policy.device
-                )
-                image = tiled_vae_decode(self.model.vae, latent) if tile else self.model.vae.decode(latent)
+                # Tile-vs-untiled is decided *after* staging (inside the helper)
+                # so free VRAM reflects the actual decode-time state (VAE on
+                # device, UNet/encoders gone or resident per the policy).
+                image, mode = vae_decode_safe(self.model.vae, latent, policy)
         image = ((image.clamp(-1, 1) + 1) * 127.5).round().clamp(0, 255).to(torch.uint8)
-        return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy()), ("tiled" if tile else "untiled")
+        return Image.fromarray(image[0].permute(1, 2, 0).cpu().numpy()), mode
 
     # --- encode (img2img / inpaint) ------------------------------------------
     def _encode_image(self, init_image, width, height, policy, generator):
@@ -303,4 +300,9 @@ class _Pipeline:
         with torch.no_grad():
             with staged([self.model.vae], policy.device, policy.offload_idle):
                 z = self.model.vae.encode(image, generator=generator)
+                if z.dtype == torch.float16 and not torch.isfinite(z).all():
+                    # fp16 VAEs can overflow on encode too (same failure class
+                    # as decode); a poisoned latent would ruin the whole run.
+                    vae_fallback_to_fp32(self.model.vae, policy)
+                    z = self.model.vae.encode(image.float(), generator=generator)
         return z.to(policy.compute_dtype)

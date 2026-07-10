@@ -554,6 +554,12 @@ def can_decode_untiled(
     _, _, h_lat, w_lat = latent_shape
     px = (w_lat * 8) * (h_lat * 8)
     bytes_per_px = _VAE_BYTES_PER_PX.get(type(vae).__name__, _VAE_BYTES_PER_PX_DEFAULT)
+    # The per-px constants were calibrated on fp32 decodes; an fp16 VAE's
+    # activations all halve, so halve the estimate (that headroom is much of
+    # the fp16 win — decodes that used to tile now fit untiled).
+    param = next(vae.parameters(), None)
+    if param is not None and param.dtype == torch.float16:
+        bytes_per_px //= 2
     need = px * bytes_per_px
     budget = free_bytes * _DECODE_FREE_VRAM_MARGIN
     fits = need < budget
@@ -569,4 +575,36 @@ def can_decode_untiled(
     return fits
 
 
-__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last"]
+def vae_fallback_to_fp32(vae: torch.nn.Module, policy: "DevicePolicy") -> None:
+    """Permanently drop an fp16 VAE back to fp32 after a non-finite output.
+
+    Some VAEs overflow fp16 activations (the A1111 ``--no-half-vae`` lore), and
+    which checkpoints do isn't knowable up front. Converting the module in place
+    and persisting ``vae_dtype`` on the policy makes the failure cost one wasted
+    pass on one image — every later encode/decode of this bundle runs fp32.
+    """
+    print("[vae] fp16 output was not finite — falling back to fp32 for this model", flush=True)
+    vae.float()
+    policy.vae_dtype = torch.float32
+
+
+def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
+    """Decode ``latent`` (already in the VAE's dtype), tiled when the policy
+    forces it or free VRAM can't host an untiled decode, with an fp16→fp32
+    non-finite retry (see :func:`vae_fallback_to_fp32`).
+
+    Returns ``(image, decode_mode)`` with ``decode_mode`` ``"tiled"``/``"untiled"``.
+    Call with the VAE already staged on ``policy.device``.
+    """
+    def _decode(z):
+        tile = policy.vae_tile or not can_decode_untiled(vae, z.shape, policy.device)
+        return (tiled_vae_decode(vae, z) if tile else vae.decode(z)), tile
+
+    image, tile = _decode(latent)
+    if latent.dtype == torch.float16 and not torch.isfinite(image).all():
+        vae_fallback_to_fp32(vae, policy)
+        image, tile = _decode(latent.float())
+    return image, ("tiled" if tile else "untiled")
+
+
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]

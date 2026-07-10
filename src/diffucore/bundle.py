@@ -174,8 +174,10 @@ def load_anima_checkpoint(
     policy: DevicePolicy | None = None,
 ) -> ModelBundle:
     """Load Anima's three-file split (DiT + Qwen-Image VAE + Qwen3 TE) into a
-    :class:`ModelBundle`. The VAE stays fp32 (per-channel latent stats blow up
-    in fp16); the DiT and Qwen3 encoder run in ``dtype``.
+    :class:`ModelBundle`. The VAE runs in ``policy.vae_dtype`` (fp32 default;
+    fp16 measured ~2.8× faster on decode with max pixel error < 3/255, and the
+    pipelines retry any non-finite fp16 output in fp32); the DiT and Qwen3
+    encoder run in ``dtype``.
 
     ``schedule`` is left ``None`` — flow-matching models drive sampling from a
     σ table built at pipeline time by :func:`diffucore.sampling.flow_matching_schedule`,

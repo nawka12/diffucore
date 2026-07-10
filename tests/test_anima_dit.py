@@ -101,6 +101,23 @@ def test_rope_cache_lives_on_compute_device():
     assert b is a
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_apply_rope_compiled_is_bit_equal_to_eager():
+    """The CUDA rope apply is torch.compile'd (×4.8 measured on an RTX 2060)
+    with ``emulate_precision_casts`` so the fused kernel rounds exactly like
+    eager — the default path must stay bit-identical. Pins that property across
+    shapes and batch sizes; if a torch upgrade breaks it, this fails rather
+    than images silently drifting. (When compile is unusable the dispatch falls
+    back to eager, and the assertion holds trivially.)"""
+    from diffucore.models.anima_dit import _VideoRoPE3D, _apply_rope, _apply_rope_eager
+    device = torch.device("cuda")
+    rope = _VideoRoPE3D(CosmosDiTConfig()).to(device)
+    for (h, w), b in (((64, 64), 1), ((96, 64), 1), ((32, 48), 2)):
+        freqs = rope(torch.empty(1, 1, h, w, 2048, device=device)).unsqueeze(1).unsqueeze(0)
+        q = torch.randn(b, h * w, 16, 128, device=device, dtype=torch.float16)
+        assert torch.equal(_apply_rope(q, freqs), _apply_rope_eager(q, freqs)), (h, w, b)
+
+
 # --- 3. conditioning sensitivity (catches "ignored input" bugs) ------------
 
 def test_dit_sensitive_to_timesteps(loaded_dit):
