@@ -270,7 +270,7 @@ def test_secant_registered_in_sampler_table():
 
 
 @pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
-                                  "gradient_estimation", "lms", "exp_heun_2_x0",
+                                  "gradient_estimation", "stork2", "lms", "exp_heun_2_x0",
                                   "uni_pc", "uni_pc_bh2"])
 @pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
 def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
@@ -815,6 +815,169 @@ def test_uni_pc_anneal_order_ramp_inactive_when_deterministic():
 
 def test_uni_pc_anneal_registered_in_sampler_table():
     assert K.get_sampler("uni_pc_anneal") is K.sample_uni_pc_anneal
+
+
+# ── STORK-2 ───────────────────────────────────────────────────────────
+# Clean-room STORK-2 (arXiv:2505.24210): an s-stage Runge–Kutta–Gegenbauer
+# cascade driven by Taylor-extrapolated "virtual" stage velocities (one real
+# model evaluation per step). Two structural pins: the cascade must reproduce
+# the RKG2 stability polynomial when driven by *true* stage evaluations
+# (coefficient correctness), and with taylor_order=1 the super-step must
+# collapse to the damped variable-step AB2 closed form (abscissae consistency).
+
+
+def _gegenbauer_R(s, z):
+    """``R_s(z) = a_s + b_s·C_s^{3/2}(1 + w1·z)`` via the standard three-term
+    Gegenbauer recurrence — an independent evaluation of the stability
+    polynomial the RKG2 cascade is derived from."""
+    w1 = 6.0 / ((s + 4.0) * (s - 1.0))
+    b_s = 4.0 * (s - 1.0) * (s + 4.0) / (3.0 * s * (s + 1.0) * (s + 2.0) * (s + 3.0))
+    a_s = 1.0 - (s + 1.0) * (s + 2.0) / 2.0 * b_s
+    w = 1.0 + w1 * z
+    Cm2, Cm1 = 1.0, 3.0 * w
+    C = Cm1 if s >= 1 else Cm2
+    for j in range(2, s + 1):
+        C = (2.0 * w * (j + 0.5) * Cm1 - (j + 1.0) * Cm2) / j
+        Cm2, Cm1 = Cm1, C
+    return a_s + b_s * C
+
+
+@pytest.mark.parametrize("s", [2, 5, 9, 24])
+def test_stork2_stage_cascade_matches_gegenbauer_polynomial(s):
+    # Drive the cascade with TRUE stage evaluations v(Y) = z·Y on the scalar
+    # linear ODE: the result must equal R_s(z). Every mu/nu/mu~/gamma~ value and
+    # the b_0 = 1, b_1 = 1/3 conventions are pinned by this identity, across the
+    # whole stability interval [-2/w1, 0].
+    w1, c, stage = K._rkg2_coeffs(s)
+    for z in (0.0, -0.7, -3.0, -2.0 / w1):
+        Y0 = 1.0
+        Yjm2, Yjm1 = Y0, Y0 + w1 * z * Y0
+        for j, (mu, nu, mut, gat) in enumerate(stage, start=2):
+            Yj = mu * Yjm1 + nu * Yjm2 + (1 - mu - nu) * Y0 + mut * z * Yjm1 + gat * z * Y0
+            Yjm2, Yjm1 = Yjm1, Yj
+        assert abs(Yjm1 - _gegenbauer_R(s, z)) < 1e-12
+
+
+@pytest.mark.parametrize("s", [5, 9, 24])
+def test_stork2_stability_region_scales_quadratically(s):
+    # |R_s(z)| ≤ 1 across z ∈ [-2/w1, 0] with 2/w1 = (s+4)(s-1)/3 ~ O(s²): the
+    # stabilized-RK property the cascade is built for.
+    w1 = 6.0 / ((s + 4.0) * (s - 1.0))
+    for k in range(401):
+        z = -2.0 / w1 * k / 400.0
+        assert abs(_gegenbauer_R(s, z)) <= 1.0 + 1e-9
+
+
+def test_stork2_taylor1_collapses_to_damped_ab2():
+    # With taylor_order=1 the super-step is affine in (v, v̇), so it must equal
+    # x + Δσ·v + C1·Δσ²·v̇ with C1 measured off the scalar cascade — and the
+    # damping C1 < 1/2 (1/2 being undamped variable-step AB2, i.e. ipndm_v
+    # order 2) is the method's signature at this Taylor order.
+    s = 9
+    w1, c, stage = K._rkg2_coeffs(s)
+
+    def cascade(v0, vp, dt):
+        Y0 = 0.0
+        Yjm2, Yjm1 = Y0, Y0 + w1 * dt * v0
+        for j, (mu, nu, mut, gat) in enumerate(stage, start=2):
+            va = v0 + (c[j - 1] * dt) * vp
+            Yj = mu * Yjm1 + nu * Yjm2 + (1 - mu - nu) * Y0 + mut * dt * va + gat * dt * v0
+            Yjm2, Yjm1 = Yjm1, Yj
+        return Yjm1
+
+    dt = -0.37
+    assert abs(cascade(1.0, 0.0, dt) / dt - 1.0) < 1e-12       # consistency: A == 1
+    C1 = cascade(0.0, 1.0, dt) / dt ** 2
+    assert 0.40 < C1 < 0.5                                     # damped vs AB2's 1/2
+    # dt-independence of the collapsed coefficients (they are pure cascade sums)
+    assert abs(cascade(0.0, 1.0, -0.11) / (-0.11) ** 2 - C1) < 1e-12
+
+    # Full sampler vs the closed form on a σ-dependent model (v = 0.35·x).
+    lam = 0.35
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (lam * x)
+    sig = torch.tensor([1.0, 0.8, 0.55, 0.3, 0.12, 0.0])
+    torch.manual_seed(0)
+    xs = torch.randn(1, 4, 4, 4)
+    out = K.sample_stork2(model, xs.clone(), sig, stages=s)
+
+    x = xs.clone()
+    s_in = x.new_ones([1])
+    prev_sigma, prev_v = None, None
+    for i in range(len(sig) - 1):
+        den = model(x, sig[i] * s_in)
+        d = K.to_d(x, sig[i] * s_in, den)
+        dstep = sig[i + 1] - sig[i]
+        if float(sig[i + 1]) == 0.0:
+            x = den
+        elif prev_v is None:
+            x = x + d * dstep
+        else:
+            vp = (d - prev_v) / (float(sig[i]) - prev_sigma)
+            x = x + dstep * d + (C1 * dstep * dstep) * vp
+        prev_sigma, prev_v = float(sig[i]), d
+    assert torch.allclose(out, x, atol=1e-5)
+
+
+def test_stork2_damping_beats_undamped_ab2_on_smooth_ode():
+    # dx/dσ = λ·x has the exact solution x·e^{λΔσ}. The damped derivative
+    # correction must beat undamped variable-step AB2 (ipndm_v order 2) on the
+    # same schedule, and plain Euler once steps are moderate.
+    lam = 0.5
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (lam * x)
+    for steps, beat_euler in ((16, False), (32, True)):
+        sigmas = S.karras_schedule(steps, 0.03, 14.6)
+        torch.manual_seed(3)
+        x_init = torch.randn(2, 4, 4, 4)
+        exact = x_init * torch.exp(torch.tensor(-lam * float(sigmas[0])))
+        err_stork = (K.sample_stork2(model, x_init.clone(), sigmas) - exact).abs().max()
+        err_ab2 = (K.sample_ipndm_v(model, x_init.clone(), sigmas, max_order=2) - exact).abs().max()
+        assert torch.isfinite(err_stork)
+        assert err_stork < err_ab2
+        if beat_euler:
+            err_euler = (K.sample_euler(model, x_init.clone(), sigmas) - exact).abs().max()
+            assert err_stork < err_euler
+
+
+def test_stork2_taylor2_lands_clean_both_schedules():
+    target = torch.full((1, 4, 4, 4), 0.2)
+    for sigmas in (_ve_sigmas(), _flow_sigmas()):
+        x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+        out = K.sample_stork2(const_denoiser(target), x_init, sigmas, taylor_order=2)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(out, target, atol=1e-3)
+
+
+def test_stork2_deterministic():
+    sigmas = _flow_sigmas()
+    x_init = torch.randn(1, 4, 4, 4)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    a = K.sample_stork2(model, x_init.clone(), sigmas)
+    b = K.sample_stork2(model, x_init.clone(), sigmas)
+    assert torch.equal(a, b)
+    assert torch.isfinite(a).all()
+
+
+def test_stork2_sigma_collision_falls_back_and_stays_finite():
+    # A repeated σ (possible at a schedule's σ_min floor) must not divide by ~0;
+    # the derivative estimate degrades and the step falls back gracefully.
+    sigmas = torch.tensor([1.0, 0.5, 0.5, 0.25, 0.1, 0.0])
+    x_init = torch.randn(1, 4, 4, 4)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    out = K.sample_stork2(model, x_init, sigmas)
+    assert torch.isfinite(out).all()
+
+
+def test_stork2_bad_args_raise():
+    sigmas = _flow_sigmas()
+    x = torch.randn(1, 4, 4, 4)
+    with pytest.raises(ValueError):
+        K.sample_stork2(const_denoiser(torch.zeros_like(x)), x, sigmas, stages=1)
+    with pytest.raises(ValueError):
+        K.sample_stork2(const_denoiser(torch.zeros_like(x)), x, sigmas, taylor_order=3)
+
+
+def test_stork2_registered_in_sampler_table():
+    assert K.get_sampler("stork2") is K.sample_stork2
 
 
 def test_all_registered_samplers_resolve():

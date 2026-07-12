@@ -18,7 +18,7 @@ References:
 
 from __future__ import annotations
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, Optional
 
 import numpy as np
@@ -47,6 +47,7 @@ __all__ = [
     "sample_res_multistep",
     "sample_res_multistep_ancestral",
     "sample_gradient_estimation",
+    "sample_stork2",
     "sample_lms",
     "sample_lcm",
     "sample_ddpm",
@@ -1469,6 +1470,149 @@ def sample_gradient_estimation(model: Denoiser, x: torch.Tensor, sigmas: torch.T
     return x
 
 
+@lru_cache(maxsize=None)
+def _rkg2_coeffs(s: int):
+    """Closed-form stage coefficients of the ``s``-stage second-order
+    Runge–Kutta–Gegenbauer (RKG2) method (Skaras & O'Sullivan, J. Comput. Phys.
+    2021), as used by STORK-2 (see :func:`sample_stork2`).
+
+    The stability polynomial is ``R_s(z) = a_s + b_s·C_s^{3/2}(1 + w1·z)`` with
+    the shifted Gegenbauer polynomial ``C^{3/2}``; matching ``e^z`` to second
+    order fixes ``w1 = 6/((s+4)(s-1))``, ``b_j = 4(j-1)(j+4)/(3j(j+1)(j+2)(j+3))``
+    and ``a_j = 1 - (j+1)(j+2)/2·b_j``, and the Gegenbauer three-term recurrence
+    turns ``R_s`` into an ``s``-stage Runge–Kutta cascade. ``b_0 = 1`` and
+    ``b_1 = 1/3`` (so stage 1 is ``R_1(z) = 1 + w1·z`` exactly) and the stage
+    abscissae ``c_j = (j²+j-2)/(s²+s-2)`` (with ``c_1 = c_2/3``) follow the
+    method's published conventions. Returns ``(w1, c, stage)`` where ``c[j]`` is
+    stage ``j``'s time offset as a fraction of the step and ``stage[j-2] =
+    (mu_j, nu_j, mu_tilde_j, gamma_tilde_j)`` for ``j = 2..s``."""
+    w1 = 6.0 / ((s + 4.0) * (s - 1.0))
+
+    def b(j: int) -> float:
+        if j == 0:
+            return 1.0
+        if j == 1:
+            return 1.0 / 3.0
+        return 4.0 * (j - 1.0) * (j + 4.0) / (3.0 * j * (j + 1.0) * (j + 2.0) * (j + 3.0))
+
+    den = s * s + s - 2.0
+    c = [0.0] * (s + 1)
+    c[1] = 4.0 / (3.0 * den)
+    stage = []
+    for j in range(2, s + 1):
+        c[j] = (j * j + j - 2.0) / den
+        a_prev = 1.0 - j * (j + 1.0) / 2.0 * b(j - 1)
+        mu = (2.0 * j + 1.0) / j * b(j) / b(j - 1)
+        nu = -(j + 1.0) / j * b(j) / b(j - 2)
+        mut = mu * w1
+        gat = -mut * a_prev
+        stage.append((mu, nu, mut, gat))
+    return w1, c, stage
+
+
+def sample_stork2(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+    stages: int = 9,
+    taylor_order: int = 1,
+) -> torch.Tensor:
+    """STORK-2: Stabilized Taylor Orthogonal Runge–Kutta, second order (Tan et
+    al., "STORK: Faster Diffusion And Flow Matching Sampling By Resolving Both
+    Stiffness And Structure-Dependence", ICLR 2026, arXiv:2505.24210).
+    Clean-room implementation from the paper, following the reference
+    conventions (RKG2 coefficients with ``b_0 = 1, b_1 = 1/3`` and the
+    ``c_j = (j²+j-2)/(s²+s-2)`` abscissae).
+
+    Each step runs an ``stages``-stage Runge–Kutta–Gegenbauer cascade
+    (:func:`_rkg2_coeffs`) on the σ-space ODE ``dx/dσ = (x − x0)/σ``, but the
+    intermediate stage velocities are "virtual NFEs": Taylor expansions of the
+    velocity in σ around the current point, with the derivatives estimated by
+    divided differences of the *previous steps'* real evaluations — so the cost
+    stays one model evaluation per step, like ``dpmpp_2m``/``ipndm``.
+    Deterministic and model-agnostic (the raw σ-space ODE serves VE — SD/SDXL —
+    and rectified flow — Anima/FLUX — alike, exactly as ``ipndm`` /
+    ``res_multistep`` do).
+
+    What the cascade buys, honestly: with ``taylor_order=1`` the whole
+    super-step collapses algebraically to ``x + Δσ·v + C1(s)·Δσ²·v̇`` — a
+    variable-step 2-step Adams–Bashforth (``ipndm_v`` order 2) whose
+    derivative correction is *damped* from 1/2 to ``C1(s) < 1/2``
+    (≈0.4628 at s=9, →1/2 as s→∞). The divided-difference ``v̇`` is the
+    noisiest term of any multistep solver, and the paper's FID tables show
+    the damping is worth real quality at practical step counts on flow models
+    (STORK-2 beats Flow-UniPC/Flow-DPM++ at 7–10 NFE on SANA; STORK-4, whose
+    ROCK4 coefficient tables are not redistributable, is better still).
+    ``stages`` is therefore a robustness/accuracy dial, not a cost dial:
+    *smaller* damps the derivative correction more (steadier on imperfect /
+    merged models and stiff low-σ regions), *larger* approaches undamped AB2.
+    ``stages=9`` is the paper's optimum for latent flow-matching models.
+
+    ``taylor_order=2`` adds a second divided difference (``v̈``) and a
+    ``Δσ³`` term through the cascade — sharper when the trajectory is smooth
+    and steps are many, noisier at low step counts (the paper's flow-matching
+    experiments prefer order 1). Derivative estimates here use exact
+    nonuniform-grid divided differences (the reference's first-derivative
+    3-point formula assumes uniform steps; ours reduces to it on uniform
+    grids), and warmup degrades gracefully: Euler on the first step, then
+    order-limited estimates until enough history exists. The final step lands
+    on the x0 estimate, as this registry's other data-prediction samplers do."""
+    if stages < 2:
+        raise ValueError("stages must be >= 2")
+    if taylor_order not in (1, 2):
+        raise ValueError("taylor_order must be 1 or 2")
+    s_in = x.new_ones([x.shape[0]])
+    w1, c, stage_coeffs = _rkg2_coeffs(stages)
+    hist_sigma: list[float] = []       # σ of the previous real evaluations
+    hist_v: list[torch.Tensor] = []    # matching real velocities, newest last
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        dt = sigma_next - sigma
+        s0 = float(sigma)
+        # Velocity time-derivative estimates from the real-eval history (the
+        # Taylor expansion treats v as a function of σ along the trajectory).
+        # σ-collisions (possible at a schedule's σ_min floor) degrade the order.
+        vp = vpp = None
+        if hist_sigma and abs(s0 - hist_sigma[-1]) > 1e-8:
+            f01 = (d - hist_v[-1]) / (s0 - hist_sigma[-1])
+            vp = f01
+            if taylor_order >= 2 and len(hist_sigma) >= 2:
+                s1, s2 = hist_sigma[-1], hist_sigma[-2]
+                if abs(s1 - s2) > 1e-8 and abs(s0 - s2) > 1e-8:
+                    f12 = (hist_v[-1] - hist_v[-2]) / (s1 - s2)
+                    f012 = (f01 - f12) / (s0 - s2)
+                    vp = f01 + (s0 - s1) * f012
+                    vpp = 2.0 * f012
+        if bool(sigma_next == 0):
+            x = denoised
+        elif vp is None:
+            x = x + d * dt             # Euler warmup (no usable history yet)
+        else:
+            Y0 = x
+            Yjm2, Yjm1 = Y0, Y0 + (w1 * dt) * d          # stage 1
+            for j, (mu, nu, mut, gat) in enumerate(stage_coeffs, start=2):
+                t_off = c[j - 1] * dt
+                v_approx = d + t_off * vp                 # virtual NFE at stage j-1
+                if vpp is not None:
+                    v_approx = v_approx + (0.5 * t_off * t_off) * vpp
+                Yj = (mu * Yjm1 + nu * Yjm2 + (1.0 - mu - nu) * Y0
+                      + (mut * dt) * v_approx + (gat * dt) * d)
+                Yjm2, Yjm1 = Yjm1, Yj
+            x = Yjm1
+        hist_sigma.append(s0)
+        hist_v.append(d)
+        if len(hist_sigma) > 2:
+            hist_sigma.pop(0)
+            hist_v.pop(0)
+    return x
+
+
 def _linear_multistep_coeff(order: int, t: np.ndarray, i: int, j: int) -> float:
     """Adams–Bashforth coefficient for :func:`sample_lms`: the integral over
     ``[t_i, t_{i+1}]`` of the ``j``-th Lagrange basis polynomial through the last
@@ -1586,6 +1730,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "res_multistep": sample_res_multistep,
     "res_multistep_ancestral": sample_res_multistep_ancestral,
     "gradient_estimation": sample_gradient_estimation,
+    "stork2": sample_stork2,
     "lms": sample_lms,
     "lcm": sample_lcm,
     "ddpm": sample_ddpm,

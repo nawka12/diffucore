@@ -41,7 +41,7 @@ _FLUX_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
     "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
-    "gradient_estimation", "lms", "lcm", "secant", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
+    "gradient_estimation", "stork2", "lms", "lcm", "secant", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
