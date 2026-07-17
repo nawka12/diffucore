@@ -48,6 +48,7 @@ __all__ = [
     "sample_res_multistep_ancestral",
     "sample_gradient_estimation",
     "sample_stork2",
+    "sample_infinity",
     "sample_lms",
     "sample_lcm",
     "sample_ddpm",
@@ -1613,6 +1614,69 @@ def sample_stork2(
     return x
 
 
+def sample_infinity(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+) -> torch.Tensor:
+    """Infinity Diffusion sampler (galpt/infinity-diffusion, MIT; implemented
+    independently from the project's algorithm description and verified
+    equivalent to upstream v1.0.0).
+
+    Euler on the σ-space ODE with an EMA-smoothed derivative correction: the
+    first step is plain Euler, after which each step advances by
+    ``d + beta·ema`` where ``ema ← (1−alpha)·ema + alpha·(d − d_prev)`` tracks
+    an exponential moving average of the derivative *change*. At ``alpha=1``
+    the memory collapses to the last difference and the update is the familiar
+    AB2-style extrapolation ``d + beta·(d − d_prev)`` (uniform-grid
+    Adams–Bashforth 2 at ``beta=1/2``); ``alpha<1`` spreads that derivative
+    estimate over an exponentially-weighted history instead — same damping
+    idea as ``stork2``'s cascade, implemented as memory rather than a damped
+    gain. ``beta=0`` is exact Euler. Deterministic; one model evaluation per
+    step; model-agnostic (raw σ-space serves VE — SD/SDXL — and rectified
+    flow — Anima/FLUX — alike, as ``ipndm``/``stork2`` do).
+
+    Upstream applies the same update through the final (σ→0) step — the
+    correction is not dropped there — and never resets the EMA; both behaviors
+    are kept. Defaults ``alpha=0.5, beta=0.5`` are upstream's.
+
+    What the correction buys, honestly: the fixed ``beta`` never rescales the
+    difference term by the step-size ratio, so it is AB2-consistent only when
+    neighboring steps are comparable. On near-uniform-in-t grids (``normal``,
+    ``sgm_uniform``, ``flow`` — upstream pairs it with linear timesteps
+    through the model's native σ(t), i.e. exactly our ``normal``) it
+    measurably beats Euler on smooth ODEs; on strongly nonuniform grids
+    (``karras`` ρ=7) the mis-scaled correction can land *behind* Euler.
+    Upstream also shipped a quadratically-warped "infinity" schedule for a few
+    hours and reverted it for image-quality reasons; it is not carried
+    here."""
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError("alpha must be in (0, 1]")
+    if not 0.0 <= beta < 1.0:
+        raise ValueError("beta must be in [0, 1)")
+    s_in = x.new_ones([x.shape[0]])
+    ema = d_prev = None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        dt = sigma_next - sigma
+        if d_prev is None:
+            ema = torch.zeros_like(d)
+            x = x + d * dt                      # Euler bootstrap
+        else:
+            ema = (1.0 - alpha) * ema + alpha * (d - d_prev)
+            x = x + (d + beta * ema) * dt
+        d_prev = d
+    return x
+
+
 def _linear_multistep_coeff(order: int, t: np.ndarray, i: int, j: int) -> float:
     """Adams–Bashforth coefficient for :func:`sample_lms`: the integral over
     ``[t_i, t_{i+1}]`` of the ``j``-th Lagrange basis polynomial through the last
@@ -1731,6 +1795,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "res_multistep_ancestral": sample_res_multistep_ancestral,
     "gradient_estimation": sample_gradient_estimation,
     "stork2": sample_stork2,
+    "infinity": sample_infinity,
     "lms": sample_lms,
     "lcm": sample_lcm,
     "ddpm": sample_ddpm,

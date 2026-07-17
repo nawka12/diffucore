@@ -270,8 +270,8 @@ def test_secant_registered_in_sampler_table():
 
 
 @pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
-                                  "gradient_estimation", "stork2", "lms", "exp_heun_2_x0",
-                                  "uni_pc", "uni_pc_bh2"])
+                                  "gradient_estimation", "stork2", "infinity", "lms",
+                                  "exp_heun_2_x0", "uni_pc", "uni_pc_bh2"])
 @pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
 def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
     target = torch.full((1, 4, 4, 4), 0.2)
@@ -978,6 +978,95 @@ def test_stork2_bad_args_raise():
 
 def test_stork2_registered_in_sampler_table():
     assert K.get_sampler("stork2") is K.sample_stork2
+
+
+# ── INFINITY ──────────────────────────────────────────────────────────
+# Infinity Diffusion (galpt/infinity-diffusion, MIT; verified equivalent to
+# upstream v1.0.0): Euler plus an EMA-smoothed derivative-difference
+# correction, applied through the final step, EMA never reset.
+
+
+def test_infinity_beta_zero_equals_euler():
+    torch.manual_seed(0)
+    x_init = torch.randn(1, 4, 4, 4)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    for sigmas in (_ve_sigmas(), _flow_sigmas()):
+        a = K.sample_infinity(model, x_init.clone(), sigmas, beta=0.0)
+        b = K.sample_euler(model, x_init.clone(), sigmas)
+        assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("alpha", [0.5, 1.0])
+def test_infinity_ema_recursion_pinned(alpha):
+    # Drive the sampler with a scripted derivative sequence (denoised = x − σ·c_i
+    # makes d_i == c_i regardless of x) and replay the published recursion with
+    # plain floats: Euler bootstrap, ema ← (1−α)·ema + α·(d − d_prev),
+    # x += (d + β·ema)·Δσ, with the correction kept through the final (σ→0)
+    # step. At α=1 this is the damped-AB2 form d + β·(d − d_prev).
+    cs = [1.7, -0.4, 0.9, 0.2, -1.1]
+    sigmas = torch.tensor([1.0, 0.7, 0.45, 0.25, 0.1, 0.0])
+    torch.manual_seed(2)
+    x_init = torch.randn(1, 4, 4, 4)
+
+    it = iter(cs)
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * next(it)
+    out = K.sample_infinity(model, x_init.clone(), sigmas, alpha=alpha, beta=0.5)
+
+    x = x_init.clone()
+    ema, d_prev = 0.0, None
+    for i, d in enumerate(cs):
+        dt = float(sigmas[i + 1] - sigmas[i])
+        if d_prev is None:
+            x = x + d * dt
+        else:
+            ema = (1.0 - alpha) * ema + alpha * (d - d_prev)
+            x = x + (d + 0.5 * ema) * dt
+        d_prev = d
+    assert torch.allclose(out, x, atol=1e-6)
+
+
+def test_infinity_correction_beats_euler_on_smooth_ode():
+    # dx/dσ = λ·x has the exact solution x·e^{λΔσ}. The fixed-β correction is
+    # AB2-consistent only when neighboring steps are comparable, so the claim
+    # holds on near-uniform grids — a uniform σ ramp and the linear-timestep
+    # ``normal`` flow schedule upstream pairs it with — NOT on karras(ρ=7),
+    # whose step-size ratios mis-scale the difference term (measured worse
+    # than Euler there).
+    lam = 0.5
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (lam * x)
+    torch.manual_seed(3)
+    x_init = torch.randn(2, 4, 4, 4)
+    for sigmas in (S.append_zero(torch.linspace(14.6, 0.03, 32)),
+                   S.normal_schedule(S.FlowSamplingView(3.0), 32)):
+        exact = x_init * torch.exp(torch.tensor(-lam * float(sigmas[0])))
+        err_inf = (K.sample_infinity(model, x_init.clone(), sigmas) - exact).abs().max()
+        err_euler = (K.sample_euler(model, x_init.clone(), sigmas) - exact).abs().max()
+        assert torch.isfinite(err_inf)
+        assert err_inf < err_euler
+
+
+def test_infinity_deterministic():
+    sigmas = _flow_sigmas()
+    torch.manual_seed(1)
+    x_init = torch.randn(1, 4, 4, 4)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    a = K.sample_infinity(model, x_init.clone(), sigmas)
+    b = K.sample_infinity(model, x_init.clone(), sigmas)
+    assert torch.equal(a, b)
+    assert torch.isfinite(a).all()
+
+
+def test_infinity_bad_args_raise():
+    sigmas = _flow_sigmas()
+    x = torch.randn(1, 4, 4, 4)
+    with pytest.raises(ValueError):
+        K.sample_infinity(const_denoiser(torch.zeros_like(x)), x, sigmas, alpha=0.0)
+    with pytest.raises(ValueError):
+        K.sample_infinity(const_denoiser(torch.zeros_like(x)), x, sigmas, beta=1.0)
+
+
+def test_infinity_registered_in_sampler_table():
+    assert K.get_sampler("infinity") is K.sample_infinity
 
 
 def test_all_registered_samplers_resolve():
