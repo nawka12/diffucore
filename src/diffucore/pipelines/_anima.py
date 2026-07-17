@@ -60,8 +60,8 @@ _FLOW_AWARE_SAMPLERS = {
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
-    "normal", "kl_optimal", "linear_quadratic", "smoothstep", "beta",
-    "beta_mix",
+    "normal", "infinity", "kl_optimal", "linear_quadratic", "smoothstep",
+    "beta", "beta_mix",
 )
 
 if TYPE_CHECKING:

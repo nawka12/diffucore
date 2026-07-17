@@ -981,63 +981,100 @@ def test_stork2_registered_in_sampler_table():
 
 
 # ── INFINITY ──────────────────────────────────────────────────────────
-# Infinity Diffusion (galpt/infinity-diffusion, MIT; verified equivalent to
-# upstream v1.0.0): Euler plus an EMA-smoothed derivative-difference
-# correction, applied through the final step, EMA never reset.
+# Infinity Diffusion (galpt/infinity-diffusion, MIT; verified bit-identical
+# to upstream @4f72d8f 2026-07-17): Euler bootstrap, then a velocity EMA
+# (α₁=β₁=0.5) plus — from the third step — an acceleration EMA (α₂=β₂=0.3)
+# of the derivative differences, gated by three invariants (magnitude clamp
+# at 50% of |d|, halving on direction reversal, pure Euler when both fire).
+# Fixed constants (upstream tried adaptive coefficients and reverted);
+# correction kept through the final step, EMAs never reset.
 
 
-def test_infinity_beta_zero_equals_euler():
+def test_infinity_constant_derivative_equals_euler():
+    # A constant derivative (denoised = x − σ·c) zeroes every difference, so
+    # velocity and acceleration stay 0 and the walk is bit-exactly Euler.
+    # Power-of-two sigmas, integer x and a dyadic c keep every subtraction
+    # exact, so ``x − (x − σ·c)`` recovers σ·c with no rounding residue.
     torch.manual_seed(0)
-    x_init = torch.randn(1, 4, 4, 4)
-    model = lambda x, sg: 0.3 * torch.tanh(x)
-    for sigmas in (_ve_sigmas(), _flow_sigmas()):
-        a = K.sample_infinity(model, x_init.clone(), sigmas, beta=0.0)
-        b = K.sample_euler(model, x_init.clone(), sigmas)
-        assert torch.equal(a, b)
+    x_init = torch.randint(-8, 8, (1, 4, 4, 4)).float()
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * 0.75
+    sigmas = torch.tensor([8.0, 4.0, 2.0, 1.0, 0.5, 0.0])
+    a = K.sample_infinity(model, x_init.clone(), sigmas)
+    b = K.sample_euler(model, x_init.clone(), sigmas)
+    assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("alpha", [0.5, 1.0])
-def test_infinity_ema_recursion_pinned(alpha):
+def test_infinity_recursion_and_invariants_pinned():
     # Drive the sampler with a scripted derivative sequence (denoised = x − σ·c_i
     # makes d_i == c_i regardless of x) and replay the published recursion with
-    # plain floats: Euler bootstrap, ema ← (1−α)·ema + α·(d − d_prev),
-    # x += (d + β·ema)·Δσ, with the correction kept through the final (σ→0)
-    # step. At α=1 this is the damped-AB2 form d + β·(d − d_prev).
-    cs = [1.7, -0.4, 0.9, 0.2, -1.1]
-    sigmas = torch.tensor([1.0, 0.7, 0.45, 0.25, 0.1, 0.0])
+    # plain floats. With a spatially-constant d the tensor reductions collapse:
+    # d.abs().mean() == |c_i| and the cosine test reduces to sign(c_i·c_{i-1}),
+    # so the invariant gating is float-replayable too. The sequence is chosen so
+    # every gate fires at least once: full correction, magnitude clamp alone,
+    # direction-reversal halving alone, and both together (pure Euler step).
+    cs = [1.7, 1.5, 0.05, -0.9, 1.2, -0.02]
+    sigmas = torch.tensor([1.0, 0.7, 0.45, 0.25, 0.12, 0.05, 0.0])
     torch.manual_seed(2)
     x_init = torch.randn(1, 4, 4, 4)
 
     it = iter(cs)
     model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * next(it)
-    out = K.sample_infinity(model, x_init.clone(), sigmas, alpha=alpha, beta=0.5)
+    out = K.sample_infinity(model, x_init.clone(), sigmas)
 
+    a1 = b1 = 0.5
+    a2 = b2 = 0.3
     x = x_init.clone()
-    ema, d_prev = 0.0, None
+    vel = acc = 0.0
+    d_prev = d_prev2 = None
+    hits = set()
     for i, d in enumerate(cs):
         dt = float(sigmas[i + 1] - sigmas[i])
         if d_prev is None:
             x = x + d * dt
+            d_prev = d
+            continue
+        delta = d - d_prev
+        vel = (1.0 - a1) * vel + a1 * delta
+        if d_prev2 is None:
+            raw = b1 * vel
         else:
-            ema = (1.0 - alpha) * ema + alpha * (d - d_prev)
-            x = x + (d + 0.5 * ema) * dt
+            acc = (1.0 - a2) * acc + a2 * (delta - (d_prev - d_prev2))
+            raw = b1 * vel + b2 * acc
+        d_mag = abs(d) + 1e-8
+        clamped = abs(raw) > 0.5 * d_mag
+        if clamped:
+            raw = raw * (0.5 * d_mag / abs(raw))
+        reversed_dir = d * d_prev < 0
+        if clamped and reversed_dir:
+            corr = 0.0
+            hits.add("both->euler")
+        elif reversed_dir:
+            corr = raw * 0.5
+            hits.add("reverse-half")
+        else:
+            corr = raw
+            hits.add("clamp-only" if clamped else "full")
+        x = x + (d + corr) * dt
+        d_prev2 = d_prev
         d_prev = d
-    assert torch.allclose(out, x, atol=1e-6)
+    assert hits == {"full", "clamp-only", "reverse-half", "both->euler"}
+    assert torch.allclose(out, x, atol=1e-5)
 
 
 def test_infinity_correction_beats_euler_on_smooth_ode():
-    # dx/dσ = λ·x has the exact solution x·e^{λΔσ}. The fixed-β correction is
-    # AB2-consistent only when neighboring steps are comparable, so the claim
-    # holds on near-uniform grids — a uniform σ ramp and the linear-timestep
-    # ``normal`` flow schedule upstream pairs it with — NOT on karras(ρ=7),
-    # whose step-size ratios mis-scale the difference term (measured worse
-    # than Euler there).
+    # dx/dσ = λ·x has the exact solution x·e^{λΔσ}. The fixed gains are
+    # AB2-consistent only when neighboring steps are comparable, so the win
+    # holds on near-uniform grids — a uniform σ ramp, the linear-timestep
+    # ``normal`` flow schedule, and its sine-perturbed ``infinity`` variant.
+    # On karras(ρ=7) the mis-scaled correction used to land behind Euler;
+    # the invariant clamp now bounds that to roughly par (not asserted).
     lam = 0.5
     model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (lam * x)
     torch.manual_seed(3)
     x_init = torch.randn(2, 4, 4, 4)
     for sigmas in (S.append_zero(torch.linspace(14.6, 0.03, 32)),
-                   S.normal_schedule(S.FlowSamplingView(3.0), 32)):
+                   S.normal_schedule(S.FlowSamplingView(3.0), 32),
+                   S.infinity_schedule(S.FlowSamplingView(3.0), 32)):
         exact = x_init * torch.exp(torch.tensor(-lam * float(sigmas[0])))
         err_inf = (K.sample_infinity(model, x_init.clone(), sigmas) - exact).abs().max()
         err_euler = (K.sample_euler(model, x_init.clone(), sigmas) - exact).abs().max()
@@ -1054,15 +1091,6 @@ def test_infinity_deterministic():
     b = K.sample_infinity(model, x_init.clone(), sigmas)
     assert torch.equal(a, b)
     assert torch.isfinite(a).all()
-
-
-def test_infinity_bad_args_raise():
-    sigmas = _flow_sigmas()
-    x = torch.randn(1, 4, 4, 4)
-    with pytest.raises(ValueError):
-        K.sample_infinity(const_denoiser(torch.zeros_like(x)), x, sigmas, alpha=0.0)
-    with pytest.raises(ValueError):
-        K.sample_infinity(const_denoiser(torch.zeros_like(x)), x, sigmas, beta=1.0)
 
 
 def test_infinity_registered_in_sampler_table():

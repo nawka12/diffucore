@@ -31,6 +31,7 @@ from ..sampling import (
     exponential_schedule,
     get_sampler,
     guidance_interval_bounds,
+    infinity_schedule,
     karras_schedule,
     kl_optimal_schedule,
     linear_quadratic_schedule,
@@ -56,6 +57,7 @@ _SCHEDULE_FROM_MODEL = {
     "simple": simple_schedule,
     "sgm_uniform": sgm_uniform_schedule,
     "normal": normal_schedule,
+    "infinity": infinity_schedule,
     "ddim_uniform": ddim_uniform_schedule,
     "linear_quadratic": linear_quadratic_schedule,
 }

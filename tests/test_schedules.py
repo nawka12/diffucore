@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from diffucore.sampling import schedules as S
@@ -103,6 +105,38 @@ def test_normal_schedule_descends_to_zero():
     assert torch.all(sig[:-1] >= sig[1:])
     assert torch.isfinite(sig).all()
     assert abs(sig[0].item() - 1.0) < 1e-3             # flow σ_max == 1
+
+
+def test_infinity_schedule_endpoints_descent_and_sine_shift():
+    # Infinity Diffusion's sine-perturbed timestep ramp (verified equivalent
+    # to upstream @4f72d8f): same σ_max→σ_min span as `normal`, but the first
+    # timestep gap shrinks to (1−s)× linear and the last grows to (1+s)×,
+    # with s = min(0.6, steps/50) — saturated at 30 steps.
+    view = _flow_view()
+    steps = 30
+    sig = S.infinity_schedule(view, steps)
+    nor = S.normal_schedule(view, steps)
+    assert sig.shape[0] == steps + 1
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] > sig[1:])
+    assert torch.equal(sig[0], nor[0])                  # f(0)=0: exact σ_max
+    assert torch.allclose(sig[-2], nor[-2], atol=1e-6)  # f(1)=1: σ_min
+    t = view.sigma_to_t(sig[:-1])
+    lin_gap = (t[0] - t[-1]) / (steps - 1)
+    assert abs((t[0] - t[1]) / lin_gap - 0.4) < 0.05    # ≈ 1−s gentler start
+    assert abs((t[-2] - t[-1]) / lin_gap - 1.6) < 0.05  # ≈ 1+s more cleanup
+
+
+def test_infinity_schedule_strength_adapts_to_steps():
+    # Below the cap the perturbation scales as s = steps/50: the max deviation
+    # of the warped ramp from linear is s·sin(πu)/π ≈ s/π at midpoint.
+    view = _flow_view()
+    for steps, s in ((5, 0.1), (25, 0.5)):
+        t = view.sigma_to_t(S.infinity_schedule(view, steps)[:-1])
+        f = (t[0] - t) / (t[0] - t[-1])
+        u = torch.linspace(0.0, 1.0, steps)
+        dev = (f - u).abs().max().item()
+        assert abs(dev - s / math.pi) < 0.1 * s / math.pi, steps
 
 
 def test_ddim_uniform_descends_to_zero():
@@ -242,8 +276,9 @@ def test_beta_mix_default_strictly_descending_at_high_step_counts():
 def test_flow_table_schedule_dispatches_all_names():
     # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
-    for name in ("sgm_uniform", "simple", "normal", "linear_quadratic",
-                 "smoothstep", "beta", "beta_mix", "kl_optimal"):
+    for name in ("sgm_uniform", "simple", "normal", "infinity",
+                 "linear_quadratic", "smoothstep", "beta", "beta_mix",
+                 "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name

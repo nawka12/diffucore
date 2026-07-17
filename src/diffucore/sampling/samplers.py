@@ -1620,46 +1620,44 @@ def sample_infinity(
     sigmas: torch.Tensor,
     *,
     callback: Callback = None,
-    alpha: float = 0.5,
-    beta: float = 0.5,
 ) -> torch.Tensor:
-    """Infinity Diffusion sampler (galpt/infinity-diffusion, MIT; implemented
-    independently from the project's algorithm description and verified
-    equivalent to upstream v1.0.0).
+    """Infinity Diffusion sampler (galpt/infinity-diffusion, MIT; verified
+    equivalent to upstream @4f72d8f, 2026-07-17).
 
-    Euler on the σ-space ODE with an EMA-smoothed derivative correction: the
-    first step is plain Euler, after which each step advances by
-    ``d + beta·ema`` where ``ema ← (1−alpha)·ema + alpha·(d − d_prev)`` tracks
-    an exponential moving average of the derivative *change*. At ``alpha=1``
-    the memory collapses to the last difference and the update is the familiar
-    AB2-style extrapolation ``d + beta·(d − d_prev)`` (uniform-grid
-    Adams–Bashforth 2 at ``beta=1/2``); ``alpha<1`` spreads that derivative
-    estimate over an exponentially-weighted history instead — same damping
-    idea as ``stork2``'s cascade, implemented as memory rather than a damped
-    gain. ``beta=0`` is exact Euler. Deterministic; one model evaluation per
-    step; model-agnostic (raw σ-space serves VE — SD/SDXL — and rectified
+    Euler on the σ-space ODE with an invariant-gated IIR correction: the first
+    step is plain Euler, after which each step advances by ``d + correction``
+    where the correction combines a *velocity* EMA of the first derivative
+    difference (``vel ← (1−α₁)·vel + α₁·(d − d_prev)``, gain ``β₁``) and — from
+    the third step — an *acceleration* EMA of the second difference
+    (``acc ← (1−α₂)·acc + α₂·(d − 2·d_prev + d_prev2)``, gain ``β₂``). Before
+    stepping, three invariants gate the correction: (1) its mean magnitude is
+    clamped to 50% of the derivative's, (2) it is halved if the derivative
+    reversed direction (cosine vs. the previous step < 0), and (3) it is
+    zeroed — a pure Euler step — when both trigger. The velocity half at
+    ``α₁=β₁=0.5`` is the damped-AB2 memory the earlier upstream version was;
+    the acceleration term adds curvature tracking on top. Constants are
+    upstream's fixed ``α₁=0.5, β₁=0.5, α₂=0.3, β₂=0.3`` — upstream briefly
+    shipped signal-adaptive coefficients and reverted to fixed the same day,
+    so no knobs are exposed here either. Deterministic; one model evaluation
+    per step; model-agnostic (raw σ-space serves VE — SD/SDXL — and rectified
     flow — Anima/FLUX — alike, as ``ipndm``/``stork2`` do).
 
-    Upstream applies the same update through the final (σ→0) step — the
-    correction is not dropped there — and never resets the EMA; both behaviors
-    are kept. Defaults ``alpha=0.5, beta=0.5`` are upstream's.
+    Upstream applies the correction through the final (σ→0) step and never
+    resets the EMAs; both behaviors are kept. The magnitude clamp and the
+    cosine test reduce over the *whole* tensor (upstream semantics), which
+    couples batch entries — harmless here since the pipelines sample one
+    latent at a time.
 
-    What the correction buys, honestly: the fixed ``beta`` never rescales the
-    difference term by the step-size ratio, so it is AB2-consistent only when
-    neighboring steps are comparable. On near-uniform-in-t grids (``normal``,
-    ``sgm_uniform``, ``flow`` — upstream pairs it with linear timesteps
-    through the model's native σ(t), i.e. exactly our ``normal``) it
-    measurably beats Euler on smooth ODEs; on strongly nonuniform grids
-    (``karras`` ρ=7) the mis-scaled correction can land *behind* Euler.
-    Upstream also shipped a quadratically-warped "infinity" schedule for a few
-    hours and reverted it for image-quality reasons; it is not carried
-    here."""
-    if not 0.0 < alpha <= 1.0:
-        raise ValueError("alpha must be in (0, 1]")
-    if not 0.0 <= beta < 1.0:
-        raise ValueError("beta must be in [0, 1)")
+    Grid caveat, honestly: the fixed gains never rescale the difference terms
+    by the step-size ratio, so the correction is AB2-consistent only when
+    neighboring steps are comparable. Pair with ``normal``-like grids or the
+    matching ``infinity`` schedule (sine-perturbed timesteps); on strongly
+    nonuniform grids (``karras`` ρ=7) it can land behind Euler — the clamp
+    bounds the damage but does not fix the scaling."""
+    alpha1, beta1 = 0.5, 0.5
+    alpha2, beta2 = 0.3, 0.3
     s_in = x.new_ones([x.shape[0]])
-    ema = d_prev = None
+    vel = acc = d_prev = d_prev2 = None
     for i in range(len(sigmas) - 1):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * s_in)
@@ -1668,11 +1666,31 @@ def sample_infinity(
             callback(i, sigma, x, denoised)
         dt = sigma_next - sigma
         if d_prev is None:
-            ema = torch.zeros_like(d)
+            vel = torch.zeros_like(d)
+            acc = torch.zeros_like(d)
             x = x + d * dt                      # Euler bootstrap
+            d_prev = d
+            continue
+        delta = d - d_prev
+        vel = (1.0 - alpha1) * vel + alpha1 * delta
+        if d_prev2 is None:
+            correction = beta1 * vel            # acceleration needs 3 d's
         else:
-            ema = (1.0 - alpha) * ema + alpha * (d - d_prev)
-            x = x + (d + beta * ema) * dt
+            acc = (1.0 - alpha2) * acc + alpha2 * (delta - (d_prev - d_prev2))
+            correction = beta1 * vel + beta2 * acc
+        d_mag = d.abs().mean() + 1e-8
+        c_mag = correction.abs().mean()
+        clamped = bool(c_mag > 0.5 * d_mag)
+        if clamped:
+            correction = correction * (0.5 * d_mag / c_mag)
+        cos_sim = (d * d_prev).sum() / (d.norm() * d_prev.norm() + 1e-8)
+        reversed_dir = bool(cos_sim < 0.0)
+        if clamped and reversed_dir:
+            correction = torch.zeros_like(correction)
+        elif reversed_dir:
+            correction = correction * 0.5
+        x = x + (d + correction) * dt
+        d_prev2 = d_prev
         d_prev = d
     return x
 

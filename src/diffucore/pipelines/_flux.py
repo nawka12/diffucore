@@ -52,7 +52,7 @@ _FLOW_AWARE_SAMPLERS = {
 # pure-noise init. See schedules._FLOW_TABLE_SCHEDULERS.
 _FLUX_SCHEDULERS = (
     "flux", "flow", "sgm_uniform", "simple",
-    "normal", "kl_optimal", "linear_quadratic",
+    "normal", "infinity", "kl_optimal", "linear_quadratic",
 )
 
 # FLUX.2 uses ModelSamplingFlux with shift=2.02 (the value is the log-shift `mu`).

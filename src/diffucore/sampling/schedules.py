@@ -27,6 +27,7 @@ __all__ = [
     "simple_schedule",
     "sgm_uniform_schedule",
     "normal_schedule",
+    "infinity_schedule",
     "ddim_uniform_schedule",
     "linear_quadratic_schedule",
     "smoothstep_schedule",
@@ -256,6 +257,31 @@ def normal_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
     return append_zero(sigmas)
 
 
+def infinity_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                      dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Infinity Diffusion's sine-perturbed schedule (galpt/infinity-diffusion,
+    MIT; verified equivalent to upstream @4f72d8f, 2026-07-17): ``normal``'s
+    linear timestep ramp warped by ``f(u) = u − s·sin(πu)/π``, which shrinks
+    the first step's timestep gap to ``(1−s)×`` linear (gentler start) and
+    grows the last step's to ``(1+s)×`` (more room for the final cleanup),
+    with ``s = min(0.6, steps/50)`` adapting to the step count — near-linear
+    at low steps, fully perturbed from 30 up. ``f`` is strictly increasing
+    (``f′ ≥ 1−s > 0``) and fixes both endpoints, so the schedule still spans
+    exactly ``sigma_max``→``sigma_min`` through the model's native σ(t) —
+    flow-safe (starts at σ_max) and every sigma is from the training
+    distribution, unlike sigma-space schedules such as ``karras``."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    start = float(schedule.sigma_to_t(schedule.sigma_max))
+    end = float(schedule.sigma_to_t(schedule.sigma_min))
+    u = torch.linspace(0.0, 1.0, steps, device=device, dtype=torch.float32)
+    strength = min(0.6, steps / 50.0)
+    f = u - strength * (torch.sin(math.pi * u) / math.pi)
+    ts = start + (end - start) * f
+    sigmas = schedule.t_to_sigma(ts).to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
 def ddim_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                           dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """ComfyUI ``ddim_uniform``: pick sigmas from the model's (ascending) sigma
@@ -465,6 +491,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "sgm_uniform": sgm_uniform_schedule,
     "simple": simple_schedule,
     "normal": normal_schedule,
+    "infinity": infinity_schedule,
     "linear_quadratic": linear_quadratic_schedule,
     "smoothstep": smoothstep_schedule,
     "beta": beta_schedule,
@@ -482,8 +509,9 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Build a flow sigma schedule for the table/timestep-based schedulers by
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
-    model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``linear_quadratic``,
-    ``smoothstep``, ``beta``, ``beta_mix`` and ``kl_optimal``.
+    model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``infinity``,
+    ``linear_quadratic``, ``smoothstep``, ``beta``, ``beta_mix`` and
+    ``kl_optimal``.
 
     ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint
     density; ``bm_*`` tune the ``beta_mix`` two-Beta mixture;
