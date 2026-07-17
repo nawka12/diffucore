@@ -8,6 +8,8 @@ the cheap small-config CosmosDiT — no Anima weights needed.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from diffucore.models.anima_dit import CosmosDiT, CosmosDiTConfig, TeaCache
@@ -166,6 +168,85 @@ def test_higher_order_reduces_error_on_a_curved_residual():
         return float((tc.forecast() - f(4)).abs())
     e0, e1, e2 = error_at_order(0), error_at_order(1), error_at_order(2)
     assert e2 < e1 < e0
+
+
+def _forecast_after(activations, k_at, **teacache_kwargs):
+    """Feed ``activations`` = [(step, residual), …] through ``update`` and return
+    the forecast at step ``k_at``."""
+    tc = TeaCache(rel_l1_thresh=1.0, **teacache_kwargs)
+    for step, r in activations:
+        tc.calls = step
+        tc.update(r)
+    tc.calls = k_at
+    return tc.forecast()
+
+
+def test_hermite_at_sigma_inv_sqrt2_order1_is_exactly_taylor():
+    """HiCache's degradation guarantee: ``σ·H_1(σk) = 2σ²k``, so at σ = 1/√2 an
+    order-1 hermite forecast is bit-identical to the order-1 taylor one."""
+    acts = [(1, torch.tensor([0.0, 1.0])), (3, torch.tensor([2.0, 5.0]))]
+    for k_at in (4, 5, 8):
+        taylor = _forecast_after(acts, k_at, max_order=1)
+        hermite = _forecast_after(acts, k_at, max_order=1, basis="hermite", sigma=2 ** -0.5)
+        assert torch.equal(taylor, hermite)
+
+
+def test_hermite_order2_matches_closed_form():
+    """Order-2 scaled-Hermite forecast against hand-computed values:
+    ``r + Δ¹·σ·H₁(σk) + Δ²/2!·σ²·H₂(σk)`` with H₁(x)=2x, H₂(x)=4x²−2."""
+    # Unit-gap activations with residuals 1, 4, 9 → Δ¹ = 5, Δ² = 2 at step 3.
+    acts = [(1, torch.tensor([1.0])), (2, torch.tensor([4.0])), (3, torch.tensor([9.0]))]
+    sigma, k = 0.5, 2  # forecast at step 5
+    x = sigma * k
+    expect = 9.0 + 5.0 * (sigma * 2 * x) + (2.0 / 2.0) * (sigma ** 2 * (4 * x * x - 2))
+    got = _forecast_after(acts, 5, max_order=2, basis="hermite", sigma=sigma)
+    assert torch.allclose(got, torch.tensor([expect]))
+
+
+def test_hermite_first_skip_and_order0_reuse_residual_exactly():
+    """H̃₀ ≡ 1, so hermite changes nothing before a slope exists: a lone
+    activation (and order 0 generally) still reuses the residual bit-exactly."""
+    r = torch.tensor([1.0, -2.0])
+    assert torch.equal(_forecast_after([(1, r)], 4, max_order=2, basis="hermite"), r)
+    assert torch.equal(_forecast_after([(1, r), (2, r + 1)], 3, max_order=0, basis="hermite"),
+                       r + 1)
+
+
+def test_hermite_damps_taylor_overshoot_at_turning_points():
+    """The HiCache selling point: on a residual that turns (rises then falls),
+    Taylor's monotone extrapolation overshoots; the σ-contracted Hermite forecast
+    stays closer to the truth."""
+    f = lambda s: torch.tensor([math.sin(1.2 * s)])  # turns within a few steps
+    acts = [(s, f(s)) for s in (1, 2, 3)]
+    truth = f(5)
+    taylor = _forecast_after(acts, 5, max_order=2)
+    hermite = _forecast_after(acts, 5, max_order=2, basis="hermite", sigma=0.5)
+    assert (hermite - truth).abs().item() < (taylor - truth).abs().item()
+
+
+def test_unknown_basis_and_forecast_mode_are_rejected():
+    import pytest
+
+    with pytest.raises(ValueError):
+        TeaCache(rel_l1_thresh=1.0, basis="chebyshev")
+    from diffucore.pipelines._anima import _make_teacache
+    with pytest.raises(ValueError):
+        _make_teacache(0.15, None, 4.0, "cubic")
+
+
+def test_make_teacache_forecast_modes():
+    """The pipeline-level ``teacache_forecast`` string maps to the paper setups:
+    hermite = order-2 σ=0.5 scaled-Hermite (HiCache default), taylor = the
+    order-1 linear TaylorSeer forecast."""
+    from diffucore.pipelines._anima import _make_teacache
+
+    cond, uncond = _make_teacache(0.15, None, 4.0, "hermite")
+    assert (cond.basis, cond.max_order, cond.sigma) == ("hermite", 2, 0.5)
+    assert (uncond.basis, uncond.max_order, uncond.sigma) == ("hermite", 2, 0.5)
+    cond, uncond = _make_teacache(0.15, None, 1.0, "taylor")
+    assert (cond.basis, cond.max_order) == ("taylor", 1)
+    assert uncond is None  # CFG off -> single stream, as before
+    assert _make_teacache(0.0, None, 4.0, "hermite") == (None, None)
 
 
 def test_threshold_forces_recompute_and_resets():

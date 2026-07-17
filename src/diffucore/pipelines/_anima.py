@@ -87,14 +87,24 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(img[0].permute(1, 2, 0).cpu().numpy())
 
 
-def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float):
+def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float,
+                   forecast: str = "hermite"):
     """Build the per-CFG-branch TeaCache streams (or ``(None, None)`` when off).
-    The uncond stream is omitted when CFG is disabled (single forward per step)."""
+    The uncond stream is omitted when CFG is disabled (single forward per step).
+
+    ``forecast`` picks how skipped steps extrapolate the cached residual:
+    ``"hermite"`` (HiCache, arXiv:2508.16984 — order-2 scaled-Hermite with the
+    paper's σ=0.5) or ``"taylor"`` (TaylorSeer — order-1 linear). The skip
+    *decision* (threshold/calibration) is identical under both."""
     if thresh <= 0:
         return None, None
-    args = (thresh,) if coeffs is None else (thresh, coeffs)
-    cond = TeaCache(*args)
-    uncond = TeaCache(*args) if cfg_scale != 1.0 else None
+    kwargs: dict = {} if coeffs is None else {"coefficients": coeffs}
+    if forecast == "hermite":
+        kwargs.update(basis="hermite", max_order=2, sigma=0.5)
+    elif forecast != "taylor":
+        raise ValueError(f"teacache_forecast must be 'taylor' or 'hermite'; got {forecast!r}")
+    cond = TeaCache(thresh, **kwargs)
+    uncond = TeaCache(thresh, **kwargs) if cfg_scale != 1.0 else None
     return cond, uncond
 
 
@@ -124,6 +134,7 @@ def anima_text_to_image(
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
+    teacache_forecast: str = "hermite",
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -151,6 +162,8 @@ def anima_text_to_image(
     cached transformer-block residual instead of recomputing it. Larger = more
     skipping = faster but lower fidelity; 0 disables. Uncalibrated on Anima
     (identity rescale), so tune the threshold empirically.
+    ``teacache_forecast`` picks the skip-step extrapolation basis — see
+    :func:`_make_teacache`.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -226,7 +239,8 @@ def anima_text_to_image(
         # TeaCache: one cache stream per CFG branch (cond/uncond are separate
         # forwards whose modulated inputs coincide, so they can't share one).
         # ``teacache_coefficients`` rescales the raw drift (identity if None).
-        tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale)
+        tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
+                                            teacache_forecast)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
@@ -347,6 +361,7 @@ def anima_img2img(
     oss_sigmas: "torch.Tensor | list[float] | None" = None,
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
+    teacache_forecast: str = "hermite",
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -449,7 +464,8 @@ def anima_img2img(
         # ---- 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
         # TeaCache: one cache stream per CFG branch (see anima_text_to_image).
-        tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale)
+        tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
+                                            teacache_forecast)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():

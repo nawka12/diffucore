@@ -523,6 +523,18 @@ class TeaCache:
     Forecasting only engages once ≥2 activations exist; before that (and at
     order 0) a skip reuses the last residual exactly, as before.
 
+    **Basis (HiCache, arXiv:2508.16984).** ``basis`` picks the extrapolation
+    basis the finite-difference factors are weighted with: ``"taylor"`` uses
+    the monomials ``k^i`` above; ``"hermite"`` uses scaled physicists' Hermite
+    polynomials ``σ^i · H_i(σk)`` — the Karhunen-Loève-optimal basis when the
+    derivative estimates behave like a Gaussian process, which residual
+    trajectories empirically do. The two ``σ`` factors damp high-order terms
+    (``σ^i``) and keep the evaluation in the stable oscillatory regime
+    (``σk``), fixing Taylor's overshoot at trajectory turning points and
+    making order 2 usable. At ``sigma = 2**-0.5`` an order-1 hermite forecast
+    is *exactly* the order-1 taylor one (``σ·H_1(σk) = 2σ²k = k``); the
+    HiCache paper recommends order 2 with ``sigma = 0.5``.
+
     One instance tracks one stream. Classifier-free guidance needs two (the
     conditioned and unconditioned passes are separate Anima forwards whose
     modulated inputs coincide, so a shared accumulator would read zero drift
@@ -535,11 +547,16 @@ class TeaCache:
     """
 
     def __init__(self, rel_l1_thresh: float, coefficients: Sequence[float] = (1.0, 0.0),
-                 *, record: bool = False, max_order: int = 1):
+                 *, record: bool = False, max_order: int = 1,
+                 basis: str = "taylor", sigma: float = 0.5):
+        if basis not in ("taylor", "hermite"):
+            raise ValueError(f"basis must be 'taylor' or 'hermite'; got {basis!r}")
         self.rel_l1_thresh = float(rel_l1_thresh)
         self.coefficients = tuple(float(c) for c in coefficients)
         self.record = record
         self.max_order = int(max_order)
+        self.basis = basis
+        self.sigma = float(sigma)
         self.prev_modulated: Optional[torch.Tensor] = None
         self.accumulated = 0.0
         self.calls = 0   # forwards seen
@@ -605,15 +622,29 @@ class TeaCache:
         self.taylor = new
         self.last_activated = self.calls
 
+    def _basis_weight(self, i: int, k: int) -> float:
+        """Weight of the i-th finite-difference factor at horizon ``k`` (i ≥ 1):
+        the monomial ``k^i`` (taylor) or the scaled Hermite ``σ^i · H_i(σk)``
+        (hermite), with ``H_i`` built by the physicists' recurrence
+        ``H_{n+1}(x) = 2x·H_n(x) - 2n·H_{n-1}(x)``."""
+        if self.basis == "taylor":
+            return float(k ** i)
+        x = self.sigma * k
+        h_prev, h = 1.0, 2.0 * x                    # H_0, H_1
+        for n in range(1, i):
+            h_prev, h = h, 2.0 * x * h - 2.0 * n * h_prev
+        return self.sigma ** i * h
+
     def forecast(self) -> torch.Tensor:
-        """Taylor-extrapolate the block residual to the current (skipped) step
-        from the factors :meth:`update` last recorded. With only the 0-th factor
-        (order 0, or fewer than two activations) this returns the last residual
-        unchanged — the original cache-then-reuse behavior."""
+        """Extrapolate the block residual to the current (skipped) step from the
+        factors :meth:`update` last recorded, weighting them with the configured
+        ``basis``. With only the 0-th factor (order 0, or fewer than two
+        activations) this returns the last residual unchanged — the original
+        cache-then-reuse behavior — under either basis."""
         k = self.calls - self.last_activated
         out = None
         for i, factor in self.taylor.items():
-            term = factor if i == 0 else factor * (k ** i / math.factorial(i))
+            term = factor if i == 0 else factor * (self._basis_weight(i, k) / math.factorial(i))
             out = term if out is None else out + term
         return out
 

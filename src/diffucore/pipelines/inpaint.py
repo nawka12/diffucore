@@ -61,6 +61,7 @@ class Inpaint(_Pipeline):
         bm_alpha2: float = 3.0, bm_beta2: float = 0.7,
         teacache_thresh: float = 0.0,
         teacache_coefficients: "list[float] | None" = None,
+        teacache_forecast: str = "hermite",
         deepcache_interval: int = 1,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
@@ -88,6 +89,7 @@ class Inpaint(_Pipeline):
                 bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,
                 bm_alpha2=bm_alpha2, bm_beta2=bm_beta2,
                 teacache_thresh=teacache_thresh, teacache_coefficients=teacache_coefficients,
+                teacache_forecast=teacache_forecast,
                 progress_callback=progress_callback, preview_callback=preview_callback,
                 return_info=return_info,
             )
