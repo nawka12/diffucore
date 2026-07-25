@@ -10,6 +10,21 @@ Layered tests:
 3. Numerical agreement vs ComfyUI's ``WanVAE`` (the upstream reference). The
    GPL-licensed ComfyUI tree is imported here in ``tests/`` only; nothing
    under ``src/diffucore/`` touches it. Skipped if ComfyUI is absent.
+
+   **These two skip under the app venv** — importing ComfyUI pulls in native
+   deps (``comfy_aimdo``, ``comfy_kitchen``) that only exist in ComfyUI's own
+   interpreter. To actually run them, use that interpreter (comfy-cli installs
+   ComfyUI into a pyenv version; ``pyenv which python`` from the ComfyUI
+   workspace resolves it)::
+
+       PYTHONPATH=$PWD/src <comfy-python> -m pytest tests/test_qwen_image_vae.py
+
+   Setting ``PYTHONPATH`` matters: a bare interpreter may resolve ``diffucore``
+   to some other checkout on the system rather than this one.
+
+   Last run 2026-07-25 against ``qwen_image_vae.safetensors``: encode
+   max\\|Δ\\| 2.4e-06, decode 3.2e-06 — float32 round-off, i.e. the 4-D
+   image-only path reproduces the reference 5-D VAE exactly at T=1.
 """
 
 from __future__ import annotations
@@ -129,11 +144,17 @@ def comfy_vae():
         from comfy.ldm.wan.vae import WanVAE
         from safetensors.torch import load_file
     except ImportError as e:
-        # ComfyUI pulls in optional native deps (comfy_aimdo, comfy_kitchen) at
-        # import time; if any are missing we cannot use it as an in-process
-        # oracle. Skip rather than fail — the round-trip + key-match tests
-        # still verify correctness without the oracle.
-        pytest.skip(f"ComfyUI import failed (likely missing optional dep): {e}")
+        # ComfyUI pulls in native deps (comfy_aimdo, comfy_kitchen) at import
+        # time that live only in its own interpreter, so this always skips
+        # under the app venv. Skip rather than fail — the round-trip and
+        # key-match tests still verify correctness without the oracle — but
+        # say how to actually run it, or nobody ever will.
+        pytest.skip(
+            f"ComfyUI import failed ({e}). This test needs ComfyUI's own "
+            f"interpreter; from the diffucore root run:\n"
+            f"  PYTHONPATH=$PWD/src $(cd {_COMFY_ROOT} && pyenv which python) "
+            f"-m pytest tests/test_qwen_image_vae.py"
+        )
 
     sd = load_file(str(_VAE_CKPT))
     dim = sd["decoder.head.0.gamma"].shape[0]
@@ -165,9 +186,12 @@ def test_decode_matches_comfy_within_tolerance(loaded_vae, comfy_vae):
     z = torch.randn(1, 16, 16, 16)
     with torch.no_grad():
         ours = loaded_vae.decode(z)
-        theirs_chunks = comfy_vae.decode(z.unsqueeze(2))
-        # ComfyUI's decode returns a list of T-chunks; for T=1 there is one.
-        theirs = torch.cat(theirs_chunks, dim=2).squeeze(2)
+        theirs_out = comfy_vae.decode(z.unsqueeze(2))
+        # Older ComfyUI returned a list of T-chunks (one at T=1); current
+        # versions return the tensor directly. Accept either.
+        if not torch.is_tensor(theirs_out):
+            theirs_out = torch.cat(list(theirs_out), dim=2)
+        theirs = theirs_out.squeeze(2)
     assert ours.shape == theirs.shape
     diff = (ours - theirs).abs().max().item()
     assert diff < 1e-3, f"max|Δ| decode = {diff:.3e}"

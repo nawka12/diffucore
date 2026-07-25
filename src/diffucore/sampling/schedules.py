@@ -28,6 +28,7 @@ __all__ = [
     "sgm_uniform_schedule",
     "normal_schedule",
     "infinity_schedule",
+    "infinity_htds_schedule",
     "ddim_uniform_schedule",
     "linear_quadratic_schedule",
     "smoothstep_schedule",
@@ -282,6 +283,48 @@ def infinity_schedule(schedule, steps: int, *, device: torch.device | str = "cpu
     return append_zero(sigmas)
 
 
+def infinity_htds_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
+                           dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Infinity Diffusion's "Hyperbolic Tail-Density" schedule (HTDS —
+    galpt/infinity-diffusion ``omega``/``nano``, MIT, upstream @4319bc7):
+    ``normal``'s linear timestep ramp bent by a hyperbolic tangent,
+    ``decay(u) = tanh(δ·(1−u)) / tanh(δ)``, with ``δ = clamp((steps − 4)/26,
+    0, 1.8)`` adapting to the step count. At ``steps ≤ 4``, ``δ`` is 0 and the
+    schedule degenerates to exactly linear — upstream's guard for distilled
+    models — saturating from ~50 steps up.
+
+    ``decay`` is strictly decreasing with ``decay(0) = 1`` and ``decay(1) =
+    0``, so the run spans exactly ``sigma_max``→``sigma_min`` through the
+    model's native σ(t) — flow-safe, and every sigma is one the model was
+    trained on, like ``normal`` and ``infinity`` and unlike sigma-space
+    schedules such as ``karras``.
+
+    **The name is backwards.** ``tanh(δ(1−u))/tanh(δ)`` is *convex* on
+    ``[0, 1]`` — its slope at ``u=0`` is ``−δ·sech²(δ)/tanh(δ)``, shallower
+    than linear, steepening to ``−δ/tanh(δ)`` at ``u=1``. So sigma is held
+    high through the early trajectory and plunges at the end: HTDS is
+    high-σ-dense, the *opposite* of the low-noise tail density upstream's
+    README advertises (its "up to 45% of steps at σ ≤ 0.8" is, for the code as
+    written, closer to 3%). Measured against ``normal`` at 50 flow steps, HTDS
+    puts 7 sigmas below 0.5σ_max where ``normal`` puts 13. Ported faithfully
+    anyway — it is what upstream ships and what its comparisons were made
+    with — but pick it to spend budget on structure, not on texture.
+
+    This is the schedule upstream pairs with ``infinity_omega``, and on that
+    reading the pairing is coherent: the sampler's detail gain is also
+    strongest at high σ."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    start = float(schedule.sigma_to_t(schedule.sigma_max))
+    end = float(schedule.sigma_to_t(schedule.sigma_min))
+    u = torch.linspace(0.0, 1.0, steps, device=device, dtype=torch.float32)
+    delta = max(0.0, min(1.80, (float(steps) - 4.0) / 26.0))
+    decay = 1.0 - u if delta <= 1e-5 else torch.tanh(delta * (1.0 - u)) / math.tanh(delta)
+    ts = end + (start - end) * decay
+    sigmas = schedule.t_to_sigma(ts).to(device=device, dtype=dtype)
+    return append_zero(sigmas)
+
+
 def ddim_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                           dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """ComfyUI ``ddim_uniform``: pick sigmas from the model's (ascending) sigma
@@ -492,6 +535,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "simple": simple_schedule,
     "normal": normal_schedule,
     "infinity": infinity_schedule,
+    "infinity_htds": infinity_htds_schedule,
     "linear_quadratic": linear_quadratic_schedule,
     "smoothstep": smoothstep_schedule,
     "beta": beta_schedule,
@@ -510,8 +554,8 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
     """Build a flow sigma schedule for the table/timestep-based schedulers by
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
     model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``infinity``,
-    ``linear_quadratic``, ``smoothstep``, ``beta``, ``beta_mix`` and
-    ``kl_optimal``.
+    ``infinity_htds``, ``linear_quadratic``, ``smoothstep``, ``beta``,
+    ``beta_mix`` and ``kl_optimal``.
 
     ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint
     density; ``bm_*`` tune the ``beta_mix`` two-Beta mixture;

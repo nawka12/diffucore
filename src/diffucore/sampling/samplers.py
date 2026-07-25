@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .parameterization import append_dims
 
@@ -49,6 +50,9 @@ __all__ = [
     "sample_gradient_estimation",
     "sample_stork2",
     "sample_infinity",
+    "sample_infinity_realism",
+    "sample_infinity_nano",
+    "sample_infinity_omega",
     "sample_lms",
     "sample_lcm",
     "sample_ddpm",
@@ -1621,43 +1625,67 @@ def sample_infinity(
     *,
     callback: Callback = None,
 ) -> torch.Tensor:
-    """Infinity Diffusion sampler (galpt/infinity-diffusion, MIT; verified
-    equivalent to upstream @4f72d8f, 2026-07-17).
+    """Infinity Diffusion sampler (galpt/infinity-diffusion, MIT; upstream
+    ``main`` @4f72d8f, 2026-07-17), with one deliberate correction — see
+    *Step-size scaling* below.
 
     Euler on the σ-space ODE with an invariant-gated IIR correction: the first
     step is plain Euler, after which each step advances by ``d + correction``
     where the correction combines a *velocity* EMA of the first derivative
-    difference (``vel ← (1−α₁)·vel + α₁·(d − d_prev)``, gain ``β₁``) and — from
-    the third step — an *acceleration* EMA of the second difference
-    (``acc ← (1−α₂)·acc + α₂·(d − 2·d_prev + d_prev2)``, gain ``β₂``). Before
-    stepping, three invariants gate the correction: (1) its mean magnitude is
-    clamped to 50% of the derivative's, (2) it is halved if the derivative
-    reversed direction (cosine vs. the previous step < 0), and (3) it is
-    zeroed — a pure Euler step — when both trigger. The velocity half at
-    ``α₁=β₁=0.5`` is the damped-AB2 memory the earlier upstream version was;
-    the acceleration term adds curvature tracking on top. Constants are
-    upstream's fixed ``α₁=0.5, β₁=0.5, α₂=0.3, β₂=0.3`` — upstream briefly
-    shipped signal-adaptive coefficients and reverted to fixed the same day,
-    so no knobs are exposed here either. Deterministic; one model evaluation
-    per step; model-agnostic (raw σ-space serves VE — SD/SDXL — and rectified
-    flow — Anima/FLUX — alike, as ``ipndm``/``stork2`` do).
+    difference (gain ``β₁``) and — from the third step — an *acceleration* EMA
+    of the second difference (gain ``β₂``). Before stepping, three invariants
+    gate the correction: (1) its mean magnitude is clamped to 50% of the
+    derivative's, (2) it is halved if the derivative reversed direction
+    (cosine vs. the previous step < 0), and (3) it is zeroed — a pure Euler
+    step — when both trigger. Constants are upstream's fixed ``α₁=0.5, β₁=0.5,
+    α₂=0.3, β₂=0.3`` — upstream briefly shipped signal-adaptive coefficients
+    and reverted to fixed the same day, so no knobs are exposed here either.
+    Deterministic; one model evaluation per step; model-agnostic (raw σ-space
+    serves VE — SD/SDXL — and rectified flow — Anima/FLUX — alike, as
+    ``ipndm``/``stork2`` do).
+
+    **Step-size scaling (deviation from upstream).** Upstream filters the raw
+    differences ``d − d_prev`` and applies the result with fixed gains, so the
+    correction is AB2-consistent only when neighboring steps are equal; on a
+    nonuniform grid it silently mis-scales. Here each difference is divided by
+    the step it was taken over *before* entering the EMA, so the filter carries
+    derivative estimates rather than raw differences::
+
+        dd  ← (d − d_prev) / dt_prev                    ≈ d′(σ)
+        vel ← (1−α₁)·vel + α₁·dd
+        acc ← (1−α₂)·acc + α₂·(dd − dd_prev)/dt_prev    ≈ d″(σ)
+        correction = β₁·dt·vel + β₂·dt²·acc
+
+    On a uniform σ grid the ``dt`` factors cancel exactly and this reduces to
+    upstream's recursion bit-for-bit (the EMA is linear, so a constant divisor
+    passes straight through); on a nonuniform grid it is the AB2/AB3-consistent
+    form of the same filter. Upstream's ``micro`` branch reaches for the same
+    idea with a post-hoc ``h/(2·h_prev)`` factor on the filter *output*; that
+    form measured strictly worse than this one on every grid tested, because it
+    leaves the filter's memory dimensionally inconsistent.
+
+    Measured against a converged reference on a nonlinear ODE (max abs error
+    relative to Euler, 16–32 steps): ``flow``/``normal`` 0.28→0.09,
+    ``infinity`` 0.35→0.12, and ``karras`` ρ=7 — which upstream's scaling
+    could not integrate at all — 2.5→1.6 at 16 steps and 1.18→0.44 at 32,
+    i.e. from *behind* Euler to comfortably ahead of it. The trade is real
+    though: ``sgm_uniform``/``simple`` regress (0.27→0.66), as do
+    ``kl_optimal``, ``linear_quadratic`` and marginally
+    ``beta``/``beta_mix``/``smoothstep``. Both forms stay well ahead of Euler
+    there, so the practical advice is unchanged — pair with ``flow``/``normal``
+    or the matching ``infinity`` schedule — except that ``karras`` is no longer
+    a trap.
 
     Upstream applies the correction through the final (σ→0) step and never
     resets the EMAs; both behaviors are kept. The magnitude clamp and the
     cosine test reduce over the *whole* tensor (upstream semantics), which
     couples batch entries — harmless here since the pipelines sample one
-    latent at a time.
-
-    Grid caveat, honestly: the fixed gains never rescale the difference terms
-    by the step-size ratio, so the correction is AB2-consistent only when
-    neighboring steps are comparable. Pair with ``normal``-like grids or the
-    matching ``infinity`` schedule (sine-perturbed timesteps); on strongly
-    nonuniform grids (``karras`` ρ=7) it can land behind Euler — the clamp
-    bounds the damage but does not fix the scaling."""
+    latent at a time."""
     alpha1, beta1 = 0.5, 0.5
     alpha2, beta2 = 0.3, 0.3
     s_in = x.new_ones([x.shape[0]])
-    vel = acc = d_prev = d_prev2 = None
+    vel = acc = d_prev = dd_prev = None
+    dt_prev = None
     for i in range(len(sigmas) - 1):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * s_in)
@@ -1669,15 +1697,15 @@ def sample_infinity(
             vel = torch.zeros_like(d)
             acc = torch.zeros_like(d)
             x = x + d * dt                      # Euler bootstrap
-            d_prev = d
+            d_prev, dt_prev = d, dt
             continue
-        delta = d - d_prev
-        vel = (1.0 - alpha1) * vel + alpha1 * delta
-        if d_prev2 is None:
-            correction = beta1 * vel            # acceleration needs 3 d's
+        dd = (d - d_prev) / dt_prev             # ≈ d′(σ); dt-normalized
+        vel = (1.0 - alpha1) * vel + alpha1 * dd
+        if dd_prev is None:
+            correction = beta1 * dt * vel       # acceleration needs 3 d's
         else:
-            acc = (1.0 - alpha2) * acc + alpha2 * (delta - (d_prev - d_prev2))
-            correction = beta1 * vel + beta2 * acc
+            acc = (1.0 - alpha2) * acc + alpha2 * ((dd - dd_prev) / dt_prev)
+            correction = beta1 * dt * vel + beta2 * dt * dt * acc
         d_mag = d.abs().mean() + 1e-8
         c_mag = correction.abs().mean()
         clamped = bool(c_mag > 0.5 * d_mag)
@@ -1690,9 +1718,374 @@ def sample_infinity(
         elif reversed_dir:
             correction = correction * 0.5
         x = x + (d + correction) * dt
-        d_prev2 = d_prev
-        d_prev = d
+        dd_prev, d_prev, dt_prev = dd, d, dt
     return x
+
+
+def sample_infinity_realism(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+) -> torch.Tensor:
+    """Infinity Diffusion, ``realism`` branch (galpt/infinity-diffusion, MIT;
+    upstream @4148474, 2026-07-20) — the detail/grain-leaning sibling of
+    :func:`sample_infinity`, kept alongside it rather than replacing it.
+
+    The integrator step is *the same first-order step* as ``infinity``: upstream
+    writes it as ``x ← r·x − (r−1)·x0`` with ``r = σ_next/σ``, which is
+    algebraically Euler in σ space (upstream's docstring calls this the
+    "DPM-Solver++ (2M) exponential integrator"; it is the first-order/DDIM x0
+    form, not 2M). Three things genuinely differ:
+
+    1. **The EMAs live in x0 space, not derivative space.** ``infinity`` smooths
+       differences of ``d = (x − x0)/σ``; here the velocity/acceleration EMAs
+       smooth differences of the *denoised prediction itself*
+       (``vel ← (1−α₁)·vel + α₁·(x0 − x0_prev)``, and from the third step
+       ``acc ← (1−α₂)·acc + α₂·(Δx0 − Δx0_prev)``), and the correction is added
+       to ``x0`` before the step. Because ``d`` carries a ``1/σ`` factor that x0
+       does not, this is a different filter, not a rewrite of the same one — it
+       weights late (small-σ) steps far more heavily.
+    2. **The invariants are measured on x0 too:** the magnitude clamp is 50% of
+       ``|x0|.mean()`` and the cosine test compares ``x0`` against the previous
+       ``x0`` (which, unlike ``d``, rarely reverses — so the gates fire less).
+       Same three-way gating otherwise: clamp, halve on reversal, zero on both.
+    3. **Adaptive noise injection** — the "realism" of the branch name. With
+       ``confidence = 1 − min(1, |c|/|x0|)`` (pre-clamp ``|c|``), a step that
+       cleared the invariants comfortably re-noises by
+       ``γ·σ·ε, γ = 0.20·(confidence − 0.3)/0.7`` for ``confidence > 0.3``.
+       Upstream's rationale is that a stable trajectory can afford stochastic
+       exploration of fine texture; the practical effect is film-like grain and
+       more high-frequency detail, at the cost of the deterministic ODE's
+       cleanliness. Injection is *not* skipped on the final (σ→0) step, so the
+       returned latent keeps ``γ·σ_last`` of grain — small (σ_last ≈ 0.03) but
+       deliberate, and upstream's behavior, so it is kept.
+
+    Constants are upstream's fixed ``α₁=β₁=0.5, α₂=β₂=0.3``; no knobs, as with
+    ``infinity``. One model evaluation per step.
+
+    **SD/SDXL only — not model-agnostic, despite operating in raw σ space.**
+    The injection is ``γ·σ`` with ``γ`` saturating at 0.20, an *absolute* noise
+    scale that takes no account of how far the step actually travels. On
+    SD/SDXL that works out: ``σ_max`` is 14.6 and the early steps are large, so
+    on karras/16 the injection never exceeds what a step removes. On rectified
+    flow ``σ_max`` is 1.0 *and* the shift compresses the top of the schedule,
+    so the same 0.2·σ dwarfs the step — measured on Anima at flow shift=3.0
+    over 32 steps, the first step injects 18.8× what it removes (46× under the
+    ``infinity`` scheduler, whose sine warp shrinks that first gap further),
+    and 28 of 32 steps over-inject. Total injected noise reaches ~0.83 std
+    against a latent std of ~1, which holds the input off-distribution for most
+    of the trajectory. It also gets *worse* with more steps, since smaller
+    steps do not shrink the injection. Kept for SD/SDXL, where it is upstream's
+    algorithm on upstream's target; the Anima and FLUX pipelines no longer
+    offer it.
+
+    **Stochastic** — unlike ``infinity``. Upstream draws with ``torch.randn_like``
+    and its README states the branch does not reproduce across runs at a fixed
+    seed; we draw through ``_noise_like(x, generator)`` instead, like every other
+    stochastic sampler here, so a given seed *does* reproduce. That is the one
+    deliberate deviation from upstream.
+
+    **Not ported: upstream's "self-correcting scheduler."** On any invariant
+    trigger, upstream inserts the midpoint σ and re-runs the step. Skipped for
+    three reasons: the re-run recomputes the denoiser at an unchanged ``(x, σ)``,
+    so the extra NFE buys literally nothing; the reversal gate depends only on
+    that unchanged pair, so once it fires the loop re-inserts until the σ gap
+    hits the 1e-6 floor (~20 wasted evaluations, and each inserted σ can trigger
+    it again — the NFE count becomes data-dependent and unbounded); and it breaks
+    the fixed step count the progress/preview callbacks are built on. Upstream's
+    own gap-floor fallthrough is the clamp/halve/zero gating we apply directly.
+
+    Grid caveat from ``infinity`` applies unchanged: the fixed gains never
+    rescale by the step-size ratio, so pair with ``normal``-like grids or the
+    matching ``infinity`` schedule rather than ``karras`` ρ=7."""
+    alpha1, beta1 = 0.5, 0.5
+    alpha2, beta2 = 0.3, 0.3
+    s_in = x.new_ones([x.shape[0]])
+    vel = acc = x0_prev = x0_prev2 = None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        ratio = sigma_next / sigma                  # r·x − (r−1)·x0 ≡ Euler in σ
+        if x0_prev is None:
+            vel = torch.zeros_like(denoised)
+            acc = torch.zeros_like(denoised)
+            x = ratio * x - (ratio - 1.0) * denoised
+            x0_prev = denoised
+            continue
+        delta = denoised - x0_prev
+        vel = (1.0 - alpha1) * vel + alpha1 * delta
+        if x0_prev2 is None:
+            correction = beta1 * vel                # acceleration needs 3 x0's
+        else:
+            acc = (1.0 - alpha2) * acc + alpha2 * (delta - (x0_prev - x0_prev2))
+            correction = beta1 * vel + beta2 * acc
+        d_mag = denoised.abs().mean() + 1e-8
+        c_mag = correction.abs().mean()             # pre-clamp; feeds confidence
+        clamped = bool(c_mag > 0.5 * d_mag)
+        if clamped:
+            correction = correction * (0.5 * d_mag / c_mag)
+        cos_sim = (denoised * x0_prev).sum() / (denoised.norm() * x0_prev.norm() + 1e-8)
+        reversed_dir = bool(cos_sim < 0.0)
+        if clamped and reversed_dir:
+            correction = torch.zeros_like(correction)
+        elif reversed_dir:
+            correction = correction * 0.5
+        x = ratio * x - (ratio - 1.0) * (denoised + correction)
+        confidence = 1.0 - min(1.0, (c_mag / d_mag).item())
+        if confidence > 0.3 and not (clamped and reversed_dir):
+            gamma = 0.20 * ((confidence - 0.3) / 0.7)
+            x = x + _noise_like(x, generator) * gamma * sigma
+        x0_prev2 = x0_prev
+        x0_prev = denoised
+    return x
+
+
+def _gaussian_blur2d(x: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+    """Depthwise Gaussian blur for :func:`sample_infinity_omega`'s pyramid.
+    Upstream builds the full 2-D kernel as an outer product and runs one
+    grouped ``conv2d``; kept that way (the kernels are 3×3/5×5, so separating
+    the passes would not pay for the extra launch)."""
+    radius = kernel_size // 2
+    k = torch.arange(-radius, radius + 1, dtype=x.dtype, device=x.device)
+    k = torch.exp(-0.5 * (k / sigma) ** 2)
+    k = k / k.sum()
+    kernel = (k[:, None] * k[None, :]).expand(x.shape[1], 1, kernel_size, kernel_size)
+    return F.conv2d(x, kernel, padding=radius, groups=x.shape[1])
+
+
+def _quantile_variance_preserve(denoised: torch.Tensor, ema_q95: Optional[torch.Tensor],
+                                total_steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """NQVP — pull each channel's 95th-percentile spatial deviation toward its
+    running EMA, within a ``[0.88, 1.12]`` band. Computed in float32:
+    ``torch.quantile`` rejects fp16/bf16 outright, and our pipelines sample in
+    fp16."""
+    eps = 6.1035e-5
+    d = denoised.float()
+    mean = d.mean(dim=(2, 3), keepdim=True)
+    centered = d - mean
+    q95 = torch.quantile(centered.abs().flatten(2), 0.95, dim=2,
+                         keepdim=True).unsqueeze(-1).clamp(min=eps)
+    if ema_q95 is None:
+        return denoised, q95
+    momentum = 1.0 - 1.0 / max(1.0, float(total_steps))
+    new_ema = momentum * ema_q95 + (1.0 - momentum) * q95
+    ratio = (new_ema / (q95 + eps)).clamp(min=0.88, max=1.12)
+    return (centered * ratio + mean).to(denoised.dtype), new_ema
+
+
+def _adaptive_channel_stabilize(denoised: torch.Tensor, ema_mean: Optional[torch.Tensor],
+                                ema_std: Optional[torch.Tensor], total_steps: int,
+                                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ACS — track per-channel spatial mean and std, pull the std back into a
+    ``[0.90, 1.10]`` band around its EMA and the mean halfway back to its EMA.
+    Also float32: it is a numerical stabilizer, and an fp16 ``std`` reduction
+    over a full feature map is exactly where that goes wrong."""
+    eps = 6.1035e-5
+    d = denoised.float()
+    cur_mean = d.mean(dim=(2, 3), keepdim=True)
+    centered = d - cur_mean
+    cur_std = centered.std(dim=(2, 3), keepdim=True).clamp(min=eps)
+    if ema_mean is None or ema_std is None:
+        return denoised, cur_mean, cur_std
+    momentum = 1.0 - 1.0 / max(1.0, float(total_steps))
+    new_mean = momentum * ema_mean + (1.0 - momentum) * cur_mean
+    new_std = momentum * ema_std + (1.0 - momentum) * cur_std
+    corr_std = (new_std / (cur_std + eps)).clamp(min=0.90, max=1.10)
+    result = centered * corr_std + cur_mean + (new_mean - cur_mean) * 0.50
+    return result.to(denoised.dtype), new_mean, new_std
+
+
+# Upstream gates AHFRI/DoG on the absolute sigma 1.5, which is ~1/10 of SD's
+# sigma_max (14.6) — the branch only ever ran on SD/SDXL. Expressed as that
+# fraction instead, it is bit-identical on SD and carries the same *phase*
+# behavior onto rectified flow (Anima), whose sigma_max is 1.0 and where the
+# literal constant would pin eta near its floor for the whole trajectory.
+_OMEGA_ETA_KNEE = 1.5 / 14.6
+
+
+def _sample_infinity_pyramid(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    name: str,
+    acs: bool,
+    dog: bool,
+    callback: Callback = None,
+) -> torch.Tensor:
+    """Shared loop for the Laplacian-pyramid branches. ``nano`` is upstream's
+    ``omega`` with ACS and DoG removed and nothing else changed (verified by
+    diffing the two branch files), so they run one implementation with two
+    flags rather than two copies of the numerics."""
+    if x.ndim != 4:
+        raise ValueError(
+            f"{name} needs a 4-D [B, C, H, W] latent (its band decomposition is "
+            f"2-D convolution); got rank {x.ndim}. FLUX packs the latent into a "
+            f"[B, L, C·p²] token sequence, so this sampler is not available for "
+            f"it — use infinity there."
+        )
+    eps = 6.1035e-5
+    total_steps = len(sigmas) - 1
+    s_in = x.new_ones([x.shape[0]])
+    sigma_knee = _OMEGA_ETA_KNEE * float(sigmas[0])
+    ema_q95 = ema_mean = ema_std = None
+    for i in range(total_steps):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        dt = sigma_next - sigma
+        if total_steps <= 6:                    # distilled/Turbo: plain Euler
+            x = x + to_d(x, sigma * s_in, denoised) * dt
+            continue
+        denoised, ema_q95 = _quantile_variance_preserve(denoised, ema_q95, total_steps)
+        if acs:
+            denoised, ema_mean, ema_std = _adaptive_channel_stabilize(
+                denoised, ema_mean, ema_std, total_steps)
+        v = to_d(x, sigma * s_in, denoised).float()
+
+        macro = _gaussian_blur2d(v, 5, 2.0)
+        mid = _gaussian_blur2d(v, 3, 1.0)
+        meso = mid - macro
+        nano = v - mid
+
+        # Local std map of the nano band (E[n²] − E[n]², both blurred).
+        var = _gaussian_blur2d(nano * nano, 3, 1.0) - _gaussian_blur2d(nano, 3, 1.0) ** 2
+        s_nano = var.clamp(min=eps).sqrt()
+        eta = 0.25 * min(1.0, max(0.1, float(sigma) / sigma_knee))
+        gain = 1.0 + eta * torch.tanh(s_nano / (s_nano.mean(dim=(2, 3), keepdim=True) + eps))
+
+        if dog:
+            band = _gaussian_blur2d(nano, 3, 0.5) - _gaussian_blur2d(nano, 5, 1.0)
+            nano = nano + (0.15 * eta) * band
+
+        x = x + (macro + meso + gain * nano).to(x.dtype) * dt
+    return x
+
+
+def sample_infinity_nano(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+) -> torch.Tensor:
+    """Infinity Diffusion, ``nano`` branch (galpt/infinity-diffusion, MIT;
+    upstream @355b792, 2026-07-24) — :func:`sample_infinity_omega` without ACS
+    and without the DoG term, which is exactly what upstream's ``nano`` is.
+
+    Same Euler step, same LPVD/AHFRI velocity filter, same NQVP spread clamp,
+    same ≤6-step bypass and same 4-D requirement; see ``infinity_omega`` for
+    all of it. What is gone:
+
+    * **ACS**, which pulled each channel's spatial mean 50% of the way to a
+      running EMA every step. That is the prime suspect for the heavy colour
+      cast omega showed on Anima (per-channel means spanning 123 points against
+      ``stork2``'s 54): locking the mean to an EMA seeded early in the
+      trajectory blocks the late global colour shift a finished render needs.
+    * **DoG**, whose ``0.15·η ≤ 0.038`` on a band-pass of an already-small band
+      made it close to a no-op anyway.
+
+    So this is the branch to reach for if omega looks flat and fogged — it
+    keeps the nano-band gain, which is the part that was supposed to add
+    detail, and drops the stabilizer that appears to be removing it. NQVP's
+    ``[0.88, 1.12]`` spread clamp is still here, so it is not a full
+    un-stabilized run.
+
+    Deterministic; one model evaluation per step; six small depthwise
+    convolutions per step (two fewer than omega)."""
+    return _sample_infinity_pyramid(model, x, sigmas, name="infinity_nano",
+                                    acs=False, dog=False, callback=callback)
+
+
+def sample_infinity_omega(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+) -> torch.Tensor:
+    """Infinity Diffusion, ``omega`` branch (galpt/infinity-diffusion, MIT;
+    upstream @4319bc7, 2026-07-25 — the repo's current default branch).
+
+    Be clear about what this is: **the integrator is plain Euler**. Both
+    ``infinity``'s invariant-gated correction and the ``micro`` branch's
+    second-order term were dropped upstream along the way, so as an ODE solver
+    omega is strictly weaker than :func:`sample_infinity`. What it adds is a
+    per-step *spatial* filter on the velocity field and two stabilizers on the
+    denoised prediction, aimed at detail retention rather than accuracy:
+
+    * **LPVD** splits ``d`` into three bands with a Gaussian pyramid —
+      ``macro`` (σ=2, 5×5), ``meso`` (σ=1, 3×3, minus macro) and ``nano``
+      (the residual).
+    * **AHFRI** amplifies the nano band by ``1 + η·tanh(s/s̄)`` where ``s`` is
+      a local standard-deviation map of that band, so the boost lands where
+      high-frequency structure already exists. ``η = 0.25·clamp(σ/σ_knee,
+      0.1, 1)`` — at most a 25% gain.
+    * **DoG** adds ``0.15·η`` of an isotropic band-pass of the nano band.
+      Faithful to upstream and near-free, but be aware ``0.15·η ≤ 0.038``
+      applied to a band-pass of an already-small band: it is close to a no-op.
+      The real behavioral change over the ``nano`` branch is ACS.
+    * **NQVP** and **ACS** hold the denoised prediction's per-channel spread
+      (and, for ACS, mean) near their running EMAs — upstream's answer to CFG
+      colour cast at high guidance.
+
+    Note ``η`` is 10× larger at high σ than at low σ, so the amplification
+    lands during structure formation rather than during fine-texture cleanup.
+    That matches ``infinity_htds``, which despite its name is also high-σ-dense
+    — the pairing is coherent, just not where the README says it aims.
+
+    The ≤25% nano-band gain pushes toward detail while NQVP and ACS, which
+    clamp the denoised prediction's spread every step, push away from it, and
+    **the stabilizers win** — on a synthetic denoiser omega came out smoother
+    than ``euler``, and on Anima (AnimaPulse, 1024×1536, 32 steps, CFG 4.0,
+    ``infinity`` schedule, one seed) it measured 2.1× less high-frequency
+    energy than ``stork2`` (97 vs 209), lower contrast, and a heavy colour cast
+    — per-channel means spanning 123 points against ``stork2``'s 54. It reads
+    as flat and fogged. ACS is the prime suspect; :func:`sample_infinity_nano`
+    is the same sampler without it. Upstream's own F-PTLS benchmark measures
+    FFT power density, which this mechanism inflates by construction, so it was
+    never independent evidence for the branch's detail claims.
+
+    Deterministic; one model evaluation per step; six (nano) to eight (omega)
+    small depthwise convolutions per step on top, which is noise next to a DiT
+    forward. Below 7 steps the whole filter is bypassed and this is exactly
+    ``euler`` — upstream's guard for distilled/Turbo models.
+
+    **4-D latents only.** The band decomposition is 2-D convolution over the
+    latent's spatial axes, so this needs ``[B, C, H, W]``. SD/SDXL and Anima
+    qualify; FLUX does not — it patchifies to a ``[B, L, C·p²]`` token
+    sequence before sampling, where a spatial blur is meaningless. The engine
+    keeps omega out of the FLUX dropdown; the guard below is for direct
+    library callers.
+
+    **Port deviations, both forced:** (1) upstream's ``is_split_resume``
+    heuristic — disable the stabilizers when ``sigmas[0] < 8.0``, meant to
+    detect a ComfyUI ``KSamplerAdvanced`` mid-schedule resume — is dropped. On
+    rectified flow ``σ_max`` is 1.0, so it would fire on *every* Anima
+    generation and silently turn both stabilizers off forever; we have no
+    resume node for it to detect either. (2) The stabilizers and the pyramid
+    run in float32 (see their docstrings).
+
+    Upstream's 5-D ``(B, C, T, H, W)`` folding path is omitted, but its README
+    is right that Anima needs one — under ComfyUI it does. There Anima carries
+    ``latent_format = Wan21`` (``latent_dimensions = 3``,
+    ``temporal_downscale_ratio = 4``) and its DiT is Cosmos-Predict2's
+    ``MiniTrainDIT``, whose forward names its input ``x_B_C_T_H_W`` outright,
+    so ComfyUI samplers see 5-D latents for Anima. Our pipelines do not: they
+    sample a 4-D ``(B, 16, H, W)`` latent and add the temporal axis only at the
+    DiT call boundary (``x.unsqueeze(2)`` … ``.squeeze(2)``), pinning ``T=1``.
+    The vendored DiT itself is general over ``T``, so if multi-frame Anima is
+    ever wired up here, this sampler and :func:`sample_infinity_nano` need the
+    fold restored — fold ``(B, C, T, H, W)`` to ``(B·T, C, H, W)`` before the
+    convolutions and back after — and the rank guard below relaxed."""
+    return _sample_infinity_pyramid(model, x, sigmas, name="infinity_omega",
+                                    acs=True, dog=True, callback=callback)
 
 
 def _linear_multistep_coeff(order: int, t: np.ndarray, i: int, j: int) -> float:
@@ -1814,6 +2207,9 @@ SAMPLERS: dict[str, Denoiser] = {
     "gradient_estimation": sample_gradient_estimation,
     "stork2": sample_stork2,
     "infinity": sample_infinity,
+    "infinity_realism": sample_infinity_realism,
+    "infinity_nano": sample_infinity_nano,
+    "infinity_omega": sample_infinity_omega,
     "lms": sample_lms,
     "lcm": sample_lcm,
     "ddpm": sample_ddpm,

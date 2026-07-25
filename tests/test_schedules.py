@@ -139,6 +139,39 @@ def test_infinity_schedule_strength_adapts_to_steps():
         assert abs(dev - s / math.pi) < 0.1 * s / math.pi, steps
 
 
+def test_infinity_htds_endpoints_and_high_sigma_density():
+    # HTDS bends `normal`'s linear timestep ramp by tanh(δ(1−u))/tanh(δ) over
+    # the same σ_max→σ_min span. That bend is CONVEX, so despite the branch's
+    # "tail density" name the schedule holds sigma high and plunges at the end
+    # — it is high-σ-dense, strictly less tail-dense than `normal`. Pinned in
+    # this direction on purpose: upstream's README claims the opposite, and a
+    # future "fix" that flips the curve would be a silent behavior change.
+    view = _flow_view()
+    steps = 30
+    sig = S.infinity_htds_schedule(view, steps)
+    nor = S.normal_schedule(view, steps)
+    assert sig.shape[0] == steps + 1
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] > sig[1:])
+    assert torch.equal(sig[0], nor[0])                  # decay(0)=1: exact σ_max
+    assert torch.allclose(sig[-2], nor[-2], atol=1e-6)  # decay(1)=0: σ_min
+    assert torch.all(sig[:-1] >= nor[:-1] - 1e-6)       # convex: never below normal
+    mid = float(nor[0]) / 2.0
+    assert int((sig[:-1] < mid).sum()) < int((nor[:-1] < mid).sum())
+
+
+def test_infinity_htds_degenerates_to_linear_at_low_steps():
+    # δ = clamp((steps−4)/26, 0, 1.8) is 0 at steps ≤ 4, upstream's guard for
+    # distilled models: the bend vanishes and the ramp is exactly `normal`.
+    view = _flow_view()
+    for steps in (2, 3, 4):
+        assert torch.allclose(S.infinity_htds_schedule(view, steps),
+                              S.normal_schedule(view, steps), atol=1e-6)
+    # ...and it is genuinely bent once past the guard.
+    assert not torch.allclose(S.infinity_htds_schedule(view, 20),
+                              S.normal_schedule(view, 20), atol=1e-3)
+
+
 def test_ddim_uniform_descends_to_zero():
     sig = S.ddim_uniform_schedule(_flow_view(), 20)
     assert sig[-1].item() == 0.0
@@ -276,7 +309,7 @@ def test_beta_mix_default_strictly_descending_at_high_step_counts():
 def test_flow_table_schedule_dispatches_all_names():
     # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
-    for name in ("sgm_uniform", "simple", "normal", "infinity",
+    for name in ("sgm_uniform", "simple", "normal", "infinity", "infinity_htds",
                  "linear_quadratic", "smoothstep", "beta", "beta_mix",
                  "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)

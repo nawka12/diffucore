@@ -1004,42 +1004,40 @@ def test_infinity_constant_derivative_equals_euler():
     assert torch.equal(a, b)
 
 
-def test_infinity_recursion_and_invariants_pinned():
-    # Drive the sampler with a scripted derivative sequence (denoised = x − σ·c_i
-    # makes d_i == c_i regardless of x) and replay the published recursion with
-    # plain floats. With a spatially-constant d the tensor reductions collapse:
-    # d.abs().mean() == |c_i| and the cosine test reduces to sign(c_i·c_{i-1}),
-    # so the invariant gating is float-replayable too. The sequence is chosen so
-    # every gate fires at least once: full correction, magnitude clamp alone,
-    # direction-reversal halving alone, and both together (pure Euler step).
-    cs = [1.7, 1.5, 0.05, -0.9, 1.2, -0.02]
-    sigmas = torch.tensor([1.0, 0.7, 0.45, 0.25, 0.12, 0.05, 0.0])
-    torch.manual_seed(2)
-    x_init = torch.randn(1, 4, 4, 4)
-
-    it = iter(cs)
-    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * next(it)
-    out = K.sample_infinity(model, x_init.clone(), sigmas)
-
+def _infinity_float_replay(cs, sigmas, x_init, *, dt_scaled):
+    """Replay the infinity recursion with plain floats. With a spatially
+    constant ``d`` the tensor reductions collapse (``d.abs().mean() == |c_i|``,
+    and the cosine test reduces to ``sign(c_i·c_{i-1})``), so the invariant
+    gating is float-replayable too. ``dt_scaled`` selects our step-size-aware
+    filter vs. upstream's raw fixed-gain one."""
     a1 = b1 = 0.5
     a2 = b2 = 0.3
     x = x_init.clone()
     vel = acc = 0.0
-    d_prev = d_prev2 = None
+    d_prev = dd_prev = dt_prev = None
     hits = set()
     for i, d in enumerate(cs):
         dt = float(sigmas[i + 1] - sigmas[i])
         if d_prev is None:
             x = x + d * dt
-            d_prev = d
+            d_prev, dt_prev = d, dt
             continue
-        delta = d - d_prev
-        vel = (1.0 - a1) * vel + a1 * delta
-        if d_prev2 is None:
-            raw = b1 * vel
+        if dt_scaled:
+            dd = (d - d_prev) / dt_prev
+            vel = (1.0 - a1) * vel + a1 * dd
+            if dd_prev is None:
+                raw = b1 * dt * vel
+            else:
+                acc = (1.0 - a2) * acc + a2 * ((dd - dd_prev) / dt_prev)
+                raw = b1 * dt * vel + b2 * dt * dt * acc
         else:
-            acc = (1.0 - a2) * acc + a2 * (delta - (d_prev - d_prev2))
-            raw = b1 * vel + b2 * acc
+            dd = d - d_prev
+            vel = (1.0 - a1) * vel + a1 * dd
+            if dd_prev is None:
+                raw = b1 * vel
+            else:
+                acc = (1.0 - a2) * acc + a2 * (dd - dd_prev)
+                raw = b1 * vel + b2 * acc
         d_mag = abs(d) + 1e-8
         clamped = abs(raw) > 0.5 * d_mag
         if clamped:
@@ -1055,10 +1053,63 @@ def test_infinity_recursion_and_invariants_pinned():
             corr = raw
             hits.add("clamp-only" if clamped else "full")
         x = x + (d + corr) * dt
-        d_prev2 = d_prev
-        d_prev = d
-    assert hits == {"full", "clamp-only", "reverse-half", "both->euler"}
+        dd_prev, d_prev, dt_prev = dd, d, dt
+    return x, hits
+
+
+# Scripted derivative sequence: denoised = x − σ·c_i makes d_i == c_i whatever
+# x is. Chosen so every gate fires at least once — full correction, magnitude
+# clamp alone, direction-reversal halving alone, and both together (Euler).
+_PINNED_CS = [1.7, 1.5, 0.05, -0.9, 1.2, -0.02]
+_ALL_GATES = {"full", "clamp-only", "reverse-half", "both->euler"}
+
+
+def test_infinity_recursion_and_invariants_pinned():
+    sigmas = torch.tensor([1.0, 0.7, 0.45, 0.25, 0.12, 0.05, 0.0])
+    torch.manual_seed(2)
+    x_init = torch.randn(1, 4, 4, 4)
+    it = iter(_PINNED_CS)
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * next(it)
+    out = K.sample_infinity(model, x_init.clone(), sigmas)
+    x, hits = _infinity_float_replay(_PINNED_CS, sigmas, x_init, dt_scaled=True)
+    assert hits == _ALL_GATES
     assert torch.allclose(out, x, atol=1e-5)
+
+
+def test_infinity_uniform_grid_reduces_to_upstream_fixed_gains():
+    # Our deviation from upstream is dividing each difference by the step it
+    # was taken over before the EMA and multiplying by dt after. On a uniform
+    # σ grid those factors cancel exactly (the EMA is linear, so a constant
+    # divisor passes straight through), so the sampler must reproduce
+    # upstream's raw fixed-gain recursion — the guarantee that the fix is a
+    # nonuniform-grid correction and not a retuning.
+    sigmas = torch.tensor([1.2, 1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
+    torch.manual_seed(2)
+    x_init = torch.randn(1, 4, 4, 4)
+    it = iter(_PINNED_CS)
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * next(it)
+    out = K.sample_infinity(model, x_init.clone(), sigmas)
+    upstream, hits = _infinity_float_replay(_PINNED_CS, sigmas, x_init, dt_scaled=False)
+    assert hits == _ALL_GATES
+    assert torch.allclose(out, upstream, atol=1e-6)
+
+
+def test_infinity_step_scaling_helps_on_nonuniform_grids():
+    # dx/dσ = λ·x, exact solution x·e^{λΔσ}. On karras(ρ=7) — the grid the
+    # unscaled upstream form could not integrate (it landed behind Euler) —
+    # the step-size-aware filter must now beat Euler outright.
+    lam = 0.5
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (lam * x)
+    torch.manual_seed(3)
+    x_init = torch.randn(2, 4, 4, 4)
+    for sigmas in (S.karras_schedule(32, 0.03, 14.6),
+                   S.normal_schedule(S.FlowSamplingView(3.0), 32),
+                   S.infinity_schedule(S.FlowSamplingView(3.0), 32)):
+        exact = x_init * torch.exp(torch.tensor(-lam * float(sigmas[0])))
+        err_inf = (K.sample_infinity(model, x_init.clone(), sigmas) - exact).abs().max()
+        err_euler = (K.sample_euler(model, x_init.clone(), sigmas) - exact).abs().max()
+        assert torch.isfinite(err_inf)
+        assert err_inf < err_euler
 
 
 def test_infinity_correction_beats_euler_on_smooth_ode():
@@ -1097,6 +1148,357 @@ def test_infinity_registered_in_sampler_table():
     assert K.get_sampler("infinity") is K.sample_infinity
 
 
+# ── INFINITY OMEGA ────────────────────────────────────────────────────
+# galpt/infinity-diffusion `omega` @4319bc7. Euler plus a 3-band Laplacian
+# pyramid on the velocity field (nano band amplified by AHFRI + DoG) and two
+# EMA stabilizers (NQVP, ACS) on the denoised prediction. Deliberately not a
+# consistent integrator: the nano-band gain biases the trajectory on purpose.
+
+
+def test_infinity_omega_low_step_count_is_exactly_euler():
+    # Upstream bypasses the whole filter at ≤6 steps for distilled/Turbo
+    # models. That path must be bit-identical to euler, not merely close.
+    torch.manual_seed(0)
+    x_init = torch.randn(1, 4, 8, 8)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    sigmas = S.flow_matching_schedule(6, shift=3.0)
+    assert torch.equal(K.sample_infinity_omega(model, x_init.clone(), sigmas),
+                       K.sample_euler(model, x_init.clone(), sigmas))
+
+
+def test_infinity_omega_rejects_non_4d_latents():
+    # FLUX patchifies to [B, L, C·p²] before sampling; a 2-D spatial blur is
+    # meaningless there, so the sampler must say so instead of failing inside
+    # conv2d. The engine keeps it out of the FLUX dropdown; this is the guard
+    # for direct library callers.
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    with pytest.raises(ValueError, match="4-D"):
+        K.sample_infinity_omega(model, torch.randn(1, 256, 64), sigmas)
+
+
+def test_infinity_omega_deterministic_and_finite():
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    torch.manual_seed(1)
+    x_init = torch.randn(1, 4, 16, 16)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    a = K.sample_infinity_omega(model, x_init.clone(), sigmas)
+    b = K.sample_infinity_omega(model, x_init.clone(), sigmas)
+    assert torch.equal(a, b)
+    assert torch.isfinite(a).all()
+
+
+def test_infinity_omega_runs_in_fp16():
+    # torch.quantile rejects fp16/bf16 outright, so NQVP casts to float32.
+    # Our pipelines sample in fp16 — this is the regression guard for that.
+    sigmas = S.flow_matching_schedule(16, shift=3.0).half()
+    torch.manual_seed(1)
+    x_init = torch.randn(1, 4, 16, 16, dtype=torch.float16)
+    model = lambda x, sg: (0.3 * torch.tanh(x.float())).half()
+    out = K.sample_infinity_omega(model, x_init, sigmas)
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out).all()
+
+
+def test_infinity_omega_gaussian_blur_preserves_dc_in_the_interior():
+    # The pyramid is only a band split if the kernels are normalized: away from
+    # the borders a constant field must survive the blur untouched. Upstream
+    # pads with zeros, so a 2px rim is darkened and lands in the nano band as a
+    # spurious edge — faithful to upstream, bounded by the ≤25% gain, and the
+    # reason this checks the interior rather than the whole field.
+    x = torch.full((2, 3, 12, 12), 0.7)
+    for k, s in ((3, 1.0), (5, 2.0), (3, 0.5), (5, 1.0)):
+        out = K._gaussian_blur2d(x, k, s)
+        assert torch.allclose(out[:, :, 3:-3, 3:-3], x[:, :, 3:-3, 3:-3], atol=1e-6)
+
+
+def test_infinity_omega_nqvp_pulls_spread_into_published_band():
+    # NQVP scales each channel's centered field by clamp(ema/q95, 0.88, 1.12).
+    # Feed it a prediction whose spread is far outside the EMA envelope and the
+    # correction must saturate at exactly those upstream constants.
+    torch.manual_seed(7)
+    base = torch.randn(1, 4, 16, 16)
+    _, ema = K._quantile_variance_preserve(base, None, 20)
+    wide, _ = K._quantile_variance_preserve(base * 8.0, ema, 20)
+    narrow, _ = K._quantile_variance_preserve(base * 0.1, ema, 20)
+    # ratio vs the uncorrected input, measured on the centered field
+    def spread(y):
+        return (y - y.mean(dim=(2, 3), keepdim=True)).abs().flatten(2).quantile(0.95, dim=2)
+    assert torch.allclose(spread(wide) / spread(base * 8.0), torch.tensor(0.88), atol=1e-3)
+    assert torch.allclose(spread(narrow) / spread(base * 0.1), torch.tensor(1.12), atol=1e-3)
+
+
+def test_infinity_omega_acs_pulls_mean_halfway_and_clamps_std():
+    # ACS moves the per-channel mean 50% of the way to its EMA and clamps the
+    # std ratio to [0.90, 1.10]. Both constants are upstream's.
+    torch.manual_seed(8)
+    base = torch.randn(1, 4, 16, 16)
+    _, ema_mean, ema_std = K._adaptive_channel_stabilize(base, None, None, 20)
+    shifted = base + 5.0                       # mean far outside the envelope
+    out, _, _ = K._adaptive_channel_stabilize(shifted, ema_mean, ema_std, 20)
+    # momentum = 1 - 1/20, so the EMA barely moves; the pull is half the gap.
+    m_cur = shifted.mean(dim=(2, 3), keepdim=True)
+    m_ema = 0.95 * ema_mean + 0.05 * m_cur
+    expected = m_cur + (m_ema - m_cur) * 0.5
+    assert torch.allclose(out.mean(dim=(2, 3), keepdim=True), expected, atol=1e-4)
+    wide, _, _ = K._adaptive_channel_stabilize(base * 8.0, ema_mean, ema_std, 20)
+    ratio = wide.std(dim=(2, 3)) / (base * 8.0).std(dim=(2, 3))
+    assert torch.allclose(ratio, torch.tensor(0.90), atol=1e-3)
+
+
+def test_infinity_omega_filter_is_live_above_the_bypass():
+    # Above 6 steps the filter must actually change the trajectory (guards
+    # against the pyramid silently reconstructing v and making omega == euler).
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
+    torch.manual_seed(4)
+    x_init = torch.randn(1, 4, 32, 32)
+    model = lambda x, sg: 0.3 * torch.tanh(x) + 0.1 * x
+    omega = K.sample_infinity_omega(model, x_init.clone(), sigmas)
+    euler = K.sample_euler(model, x_init.clone(), sigmas)
+    assert torch.isfinite(omega).all()
+    assert not torch.allclose(omega, euler, atol=1e-4)
+
+
+def test_infinity_omega_registered_in_sampler_table():
+    assert K.get_sampler("infinity_omega") is K.sample_infinity_omega
+
+
+# ── INFINITY NANO ─────────────────────────────────────────────────────
+# galpt/infinity-diffusion `nano` @355b792 — upstream's omega with ACS and the
+# DoG term removed and nothing else changed. Shares omega's loop behind two
+# flags, so these tests mostly pin that the flags do what they claim.
+
+
+def test_infinity_nano_is_omega_without_acs_and_dog():
+    # The whole reason nano exists here: it must equal omega with those two
+    # blocks skipped, and must NOT equal omega itself.
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    torch.manual_seed(3)
+    x_init = torch.randn(1, 4, 16, 16)
+    model = lambda x, sg: 0.3 * torch.tanh(x) + 0.1 * x
+    nano = K.sample_infinity_nano(model, x_init.clone(), sigmas)
+    ref = K._sample_infinity_pyramid(model, x_init.clone(), sigmas,
+                                     name="ref", acs=False, dog=False)
+    assert torch.equal(nano, ref)
+    assert not torch.allclose(nano, K.sample_infinity_omega(model, x_init.clone(), sigmas),
+                              atol=1e-5)
+
+
+def test_infinity_nano_leaves_channel_means_freer_than_omega():
+    # ACS pulls each channel's spatial mean halfway to a running EMA every
+    # step; without it the trajectory is free to move its channel means. Drive
+    # a denoiser whose channel means drift steadily and nano must track that
+    # drift more closely than omega does.
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
+    torch.manual_seed(11)
+    x_init = torch.randn(1, 4, 16, 16)
+    drift = torch.tensor([-1.0, -0.3, 0.3, 1.0]).view(1, 4, 1, 1)
+
+    def model(x, sg):
+        # x0 target pulls each channel toward a different, sigma-dependent mean
+        return 0.2 * torch.tanh(x) + drift * (1.0 - float(sg[0]))
+
+    nano = K.sample_infinity_nano(model, x_init.clone(), sigmas)
+    omega = K.sample_infinity_omega(model, x_init.clone(), sigmas)
+    spread = lambda y: (y.mean(dim=(2, 3)).max() - y.mean(dim=(2, 3)).min()).item()
+    assert spread(nano) > spread(omega)
+
+
+def test_infinity_nano_low_step_count_is_exactly_euler():
+    torch.manual_seed(0)
+    x_init = torch.randn(1, 4, 8, 8)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    sigmas = S.flow_matching_schedule(6, shift=3.0)
+    assert torch.equal(K.sample_infinity_nano(model, x_init.clone(), sigmas),
+                       K.sample_euler(model, x_init.clone(), sigmas))
+
+
+def test_infinity_nano_rejects_non_4d_latents():
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    with pytest.raises(ValueError, match="4-D"):
+        K.sample_infinity_nano(model, torch.randn(1, 256, 64), sigmas)
+
+
+def test_infinity_nano_runs_in_fp16_and_is_deterministic():
+    sigmas = S.flow_matching_schedule(16, shift=3.0).half()
+    torch.manual_seed(1)
+    x_init = torch.randn(1, 4, 16, 16, dtype=torch.float16)
+    model = lambda x, sg: (0.3 * torch.tanh(x.float())).half()
+    a = K.sample_infinity_nano(model, x_init.clone(), sigmas)
+    b = K.sample_infinity_nano(model, x_init.clone(), sigmas)
+    assert torch.equal(a, b)
+    assert a.dtype == torch.float16
+    assert torch.isfinite(a).all()
+
+
+def test_infinity_nano_registered_in_sampler_table():
+    assert K.get_sampler("infinity_nano") is K.sample_infinity_nano
+
+
+# ── INFINITY (realism branch) ─────────────────────────────────────────
+# Upstream's ``realism`` branch (@4148474, 2026-07-20) keeps the same
+# first-order step but moves both EMAs and both invariants into x0 space and
+# re-noises confident steps by γ·σ·ε (γ = 0.2·(conf−0.3)/0.7). Ported as a
+# separate sampler; upstream's midpoint-σ insertion is deliberately not ported
+# (see the docstring), and the noise is drawn through the seeded generator
+# rather than upstream's unseeded ``torch.randn_like``.
+
+
+def _infinity_realism_reference(model, x, sigmas, generator):
+    """Verbatim transcription of upstream realism's ``InfinitySampler.sample``
+    (minus the midpoint-σ insertion, plus the seeded draw), used to pin the port."""
+    alpha1, alpha2, beta1, beta2 = 0.5, 0.3, 0.5, 0.3
+    d_prev = d_prev2 = vel = acc = None
+    s_in = x.new_ones([x.shape[0]])
+    for i in range(len(sigmas) - 1):
+        s_cur, s_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, s_cur * s_in)
+        if i == 0:
+            ratio = s_next / s_cur
+            x = ratio * x - (ratio - 1) * denoised
+            d_prev = denoised
+            vel = torch.zeros_like(denoised)
+            acc = torch.zeros_like(denoised)
+            continue
+        delta = denoised - d_prev
+        if i == 1:
+            vel = (1.0 - alpha1) * vel + alpha1 * delta
+            raw_correction = beta1 * vel
+        else:
+            delta_prev = d_prev - d_prev2
+            vel = (1.0 - alpha1) * vel + alpha1 * delta
+            acc = (1.0 - alpha2) * acc + alpha2 * (delta - delta_prev)
+            raw_correction = beta1 * vel + beta2 * acc
+        d_mag = denoised.abs().mean() + 1e-8
+        c_mag = raw_correction.abs().mean()
+        clamped = c_mag > 0.5 * d_mag
+        if clamped:
+            raw_correction = raw_correction * (0.5 * d_mag / c_mag)
+        cos_sim = (denoised * d_prev).sum() / (denoised.norm() * d_prev.norm() + 1e-8)
+        reversed_dir = cos_sim < 0.0
+        if clamped and reversed_dir:
+            correction = torch.zeros_like(raw_correction)
+        elif reversed_dir:
+            correction = raw_correction * 0.5
+        else:
+            correction = raw_correction
+        ratio = s_next / s_cur
+        x = ratio * x - (ratio - 1) * (denoised + correction)
+        confidence = 1.0 - min(1.0, (c_mag / d_mag).item())
+        if confidence > 0.3 and not (clamped and reversed_dir):
+            gamma = 0.20 * ((confidence - 0.3) / 0.7)
+            x = x + torch.randn(x.shape, generator=generator) * gamma * s_cur
+        d_prev2 = d_prev
+        d_prev = denoised
+    return x
+
+
+@pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
+def test_infinity_realism_matches_upstream_recursion(sigmas_fn):
+    sigmas = sigmas_fn()
+    torch.manual_seed(5)
+    x_init = torch.randn(1, 4, 8, 8) * sigmas[0]
+    model = lambda x, sg: 0.4 * torch.tanh(x) - 0.1 * sg.view(-1, 1, 1, 1)
+    out = K.sample_infinity_realism(model, x_init.clone(), sigmas,
+                                    generator=torch.Generator().manual_seed(7))
+    ref = _infinity_realism_reference(model, x_init.clone(), sigmas,
+                                      torch.Generator().manual_seed(7))
+    assert torch.equal(out, ref)
+
+
+def test_infinity_realism_is_stochastic_but_seed_reproducible():
+    # The deviation from upstream: a fixed seed reproduces, a different one does
+    # not, and neither matches the deterministic ``infinity`` sampler.
+    sigmas = _flow_sigmas()
+    torch.manual_seed(1)
+    x_init = torch.randn(1, 4, 4, 4)
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    run = lambda seed: K.sample_infinity_realism(
+        model, x_init.clone(), sigmas, generator=torch.Generator().manual_seed(seed))
+    a, b, c = run(3), run(3), run(4)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+    assert torch.isfinite(a).all()
+    assert not torch.allclose(a, K.sample_infinity(model, x_init.clone(), sigmas))
+
+
+def test_infinity_realism_both_invariants_give_plain_euler():
+    # When the magnitude clamp and the x0 direction reversal both fire, the
+    # correction is zeroed *and* the noise is gated off, so the step is exactly
+    # the plain first-order step. The scripted x0 sequence (spatially constant,
+    # so the tensor reductions collapse to scalars) fires both gates on every
+    # non-bootstrap step — asserted below, so the comparison is not vacuous.
+    cs = [8.0, -4.0, 2.0]
+    sigmas = torch.tensor([1.0, 0.6, 0.3, 0.0])
+    torch.manual_seed(4)
+    x_init = torch.randn(1, 4, 4, 4)
+
+    vel = acc = 0.0
+    d_prev = d_prev2 = None
+    for i, c in enumerate(cs):
+        if d_prev is None:
+            d_prev = c
+            continue
+        delta = c - d_prev
+        vel = 0.5 * vel + 0.5 * delta
+        if d_prev2 is None:
+            raw = 0.5 * vel
+        else:
+            acc = 0.7 * acc + 0.3 * (delta - (d_prev - d_prev2))
+            raw = 0.5 * vel + 0.3 * acc
+        assert abs(raw) > 0.5 * abs(c)          # clamp fires
+        assert c * d_prev < 0                   # direction reversal fires
+        d_prev2, d_prev = d_prev, c
+
+    it = iter(cs)
+    model_x0 = lambda x, sg: torch.full_like(x, next(it))
+    out = K.sample_infinity_realism(model_x0, x_init.clone(), sigmas,
+                                    generator=torch.Generator().manual_seed(0))
+    it2 = iter(cs)
+    model_x0_again = lambda x, sg: torch.full_like(x, next(it2))
+    ref = K.sample_euler(model_x0_again, x_init.clone(), sigmas)
+    assert torch.allclose(out, ref, atol=1e-6)
+
+
+@pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
+def test_infinity_realism_lands_on_target_within_injected_grain(sigmas_fn):
+    # A constant-x0 denoiser zeroes every difference, so the correction is 0 and
+    # confidence is maximal: every step re-noises at the full γ = 0.2. The walk
+    # still lands on target, but carries the last step's γ·σ_last grain — the
+    # deliberate cost of the realism branch, so the tolerance is that bound
+    # (with 5σ of headroom on the Gaussian draw) rather than the 1e-3 the
+    # deterministic samplers get.
+    target = torch.full((1, 4, 4, 4), 0.2)
+    sigmas = sigmas_fn()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    out = K.sample_infinity_realism(const_denoiser(target), x_init.clone(), sigmas,
+                                    generator=torch.Generator().manual_seed(11))
+    grain = 0.2 * float(sigmas[-2])
+    assert torch.isfinite(out).all()
+    assert (out - target).abs().max() < 5.0 * grain
+    assert abs(float((out - target).mean())) < grain
+
+
+def test_infinity_realism_registered_in_sampler_table():
+    assert K.get_sampler("infinity_realism") is K.sample_infinity_realism
+
+
 def test_all_registered_samplers_resolve():
     for name, fn in K.SAMPLERS.items():
         assert K.get_sampler(name) is fn
+
+
+def test_infinity_realism_injection_is_disproportionate_on_shifted_flow():
+    # Why infinity_realism is SD/SDXL only: its injection is an absolute γ·σ
+    # (γ ≤ 0.20) that ignores the step size. On SD's σ_max=14.6 grid that is
+    # smaller than what a step removes; on a shifted rectified-flow grid, where
+    # σ_max is 1.0 and the shift compresses the top, it is many times larger.
+    # Pinned so a future "make it model-agnostic" claim has to confront this.
+    def worst_ratio(sig):
+        return max((0.20 * float(sig[i])) / (float(sig[i]) - float(sig[i + 1]))
+                   for i in range(len(sig) - 1))
+
+    assert worst_ratio(S.karras_schedule(16, 0.0292, 14.6)) < 1.0
+    assert worst_ratio(S.flow_matching_schedule(32, shift=3.0)) > 10.0
+    assert worst_ratio(S.infinity_schedule(S.FlowSamplingView(3.0), 32)) > 10.0

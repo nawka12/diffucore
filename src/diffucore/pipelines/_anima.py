@@ -46,7 +46,8 @@ _ANIMA_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "euler_ancestral_anneal", "er_sde",
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
-    "res_multistep_ancestral", "gradient_estimation", "stork2", "infinity", "lms", "lcm",
+    "res_multistep_ancestral", "gradient_estimation", "stork2", "infinity",
+    "infinity_nano", "infinity_omega", "lms", "lcm",
     "secant", "secant_anneal",
     "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
 }
@@ -60,8 +61,8 @@ _FLOW_AWARE_SAMPLERS = {
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
-    "normal", "infinity", "kl_optimal", "linear_quadratic", "smoothstep",
-    "beta", "beta_mix",
+    "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
+    "smoothstep", "beta", "beta_mix",
 )
 
 if TYPE_CHECKING:

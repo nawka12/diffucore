@@ -41,8 +41,8 @@ _FLUX_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "er_sde", "dpm_2", "dpm_2_ancestral",
     "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
-    "gradient_estimation", "stork2", "infinity", "lms", "lcm", "secant", "exp_heun_2_x0",
-    "uni_pc", "uni_pc_bh2",
+    "gradient_estimation", "stork2", "infinity", "lms", "lcm", "secant",
+    "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
@@ -52,7 +52,7 @@ _FLOW_AWARE_SAMPLERS = {
 # pure-noise init. See schedules._FLOW_TABLE_SCHEDULERS.
 _FLUX_SCHEDULERS = (
     "flux", "flow", "sgm_uniform", "simple",
-    "normal", "infinity", "kl_optimal", "linear_quadratic",
+    "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
 )
 
 # FLUX.2 uses ModelSamplingFlux with shift=2.02 (the value is the log-shift `mu`).
