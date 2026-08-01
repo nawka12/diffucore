@@ -2089,12 +2089,20 @@ def _adaptive_channel_stabilize(denoised: torch.Tensor, ema_mean: Optional[torch
     return result.to(denoised.dtype), new_mean, new_std
 
 
-# Upstream gates AHFRI/DoG on the absolute sigma 1.5, which is ~1/10 of SD's
-# sigma_max (14.6) — the branch only ever ran on SD/SDXL. Expressed as that
-# fraction instead, it is bit-identical on SD and carries the same *phase*
-# behavior onto rectified flow (Anima), whose sigma_max is 1.0 and where the
-# literal constant would pin eta near its floor for the whole trajectory.
-_OMEGA_ETA_KNEE = 1.5 / 14.6
+# Upstream calls this "split resume detection" and uses it to skip its two EMA
+# stabilizers on a ComfyUI KSamplerAdvanced mid-schedule restart, where an EMA
+# seeded from step 0 would be meaningless. But the test is on the *absolute*
+# sigma, and only variance-exploding models have a sigma_max above it: SD/SDXL
+# start at 14.6, so the stabilizers run; rectified flow starts at 1.0, so they
+# never do. ComfyUI's Anima is ModelSamplingDiscreteFlow(multiplier=1.0,
+# shift=3.0) — sigma_max = 3·1/(1+2·1) = 1.0 — so under ComfyUI *every* Anima
+# generation runs with NQVP and ACS switched off. Whatever upstream meant, that
+# is the behavior its flow-model results were produced with, so the gate is
+# ported literally. Note it also closes on almost every SD *img2img* run: only
+# the top ~13% of a karras schedule sits above sigma 8, so the stabilizers need
+# roughly strength >= 0.87 (karras) or >= 0.92 (exponential) to run at all.
+# Also what ComfyUI does — the gate is a de-facto "full-denoise VE only" switch.
+_STABILIZER_SIGMA_MIN = 8.0
 
 
 def _sample_infinity_pyramid(
@@ -2110,7 +2118,11 @@ def _sample_infinity_pyramid(
     """Shared loop for the Laplacian-pyramid branches. ``nano`` is upstream's
     ``omega`` with ACS and DoG removed and nothing else changed (verified by
     diffing the two branch files), so they run one implementation with two
-    flags rather than two copies of the numerics."""
+    flags rather than two copies of the numerics.
+
+    Note ``stabilize``: on rectified flow it is always False, which leaves
+    ``omega`` and ``nano`` separated by the DoG term alone (see
+    ``_STABILIZER_SIGMA_MIN``)."""
     if x.ndim != 4:
         raise ValueError(
             f"{name} needs a 4-D [B, C, H, W] latent (its band decomposition is "
@@ -2121,7 +2133,7 @@ def _sample_infinity_pyramid(
     eps = 6.1035e-5
     total_steps = len(sigmas) - 1
     s_in = x.new_ones([x.shape[0]])
-    sigma_knee = _OMEGA_ETA_KNEE * float(sigmas[0])
+    stabilize = float(sigmas[0]) >= _STABILIZER_SIGMA_MIN
     ema_q95 = ema_mean = ema_std = None
     for i in range(total_steps):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
@@ -2132,10 +2144,11 @@ def _sample_infinity_pyramid(
         if total_steps <= 6:                    # distilled/Turbo: plain Euler
             x = x + to_d(x, sigma * s_in, denoised) * dt
             continue
-        denoised, ema_q95 = _quantile_variance_preserve(denoised, ema_q95, total_steps)
-        if acs:
-            denoised, ema_mean, ema_std = _adaptive_channel_stabilize(
-                denoised, ema_mean, ema_std, total_steps)
+        if stabilize:
+            denoised, ema_q95 = _quantile_variance_preserve(denoised, ema_q95, total_steps)
+            if acs:
+                denoised, ema_mean, ema_std = _adaptive_channel_stabilize(
+                    denoised, ema_mean, ema_std, total_steps)
         v = to_d(x, sigma * s_in, denoised).float()
 
         macro = _gaussian_blur2d(v, 5, 2.0)
@@ -2146,7 +2159,10 @@ def _sample_infinity_pyramid(
         # Local std map of the nano band (E[n²] − E[n]², both blurred).
         var = _gaussian_blur2d(nano * nano, 3, 1.0) - _gaussian_blur2d(nano, 3, 1.0) ** 2
         s_nano = var.clamp(min=eps).sqrt()
-        eta = 0.25 * min(1.0, max(0.1, float(sigma) / sigma_knee))
+        # Upstream's literal knee. On flow (sigma <= 1) it never saturates, so
+        # eta spans 0.025..0.167 instead of 0.025..0.25 — a weaker nano gain
+        # than an SD run gets, and again what upstream's flow results used.
+        eta = 0.25 * min(1.0, max(0.1, float(sigma) / 1.5))
         gain = 1.0 + eta * torch.tanh(s_nano / (s_nano.mean(dim=(2, 3), keepdim=True) + eps))
 
         if dog:
@@ -2172,19 +2188,17 @@ def sample_infinity_nano(
     same ≤6-step bypass and same 4-D requirement; see ``infinity_omega`` for
     all of it. What is gone:
 
-    * **ACS**, which pulled each channel's spatial mean 50% of the way to a
-      running EMA every step. That is the prime suspect for the heavy colour
-      cast omega showed on Anima (per-channel means spanning 123 points against
-      ``stork2``'s 54): locking the mean to an EMA seeded early in the
-      trajectory blocks the late global colour shift a finished render needs.
+    * **ACS**, which pulls each channel's spatial mean 50% of the way to a
+      running EMA every step.
     * **DoG**, whose ``0.15·η ≤ 0.038`` on a band-pass of an already-small band
-      made it close to a no-op anyway.
+      makes it close to a no-op anyway.
 
-    So this is the branch to reach for if omega looks flat and fogged — it
-    keeps the nano-band gain, which is the part that was supposed to add
-    detail, and drops the stabilizer that appears to be removing it. NQVP's
-    ``[0.88, 1.12]`` spread clamp is still here, so it is not a full
-    un-stabilized run.
+    **On rectified flow this sampler is nearly identical to omega**, and the
+    difference is the near-no-op one. Both stabilizers are gated off below
+    ``σ_max = 8`` (see ``_STABILIZER_SIGMA_MIN``), so on Anima omega loses ACS
+    *and* NQVP too and the two branches are separated by the DoG term alone.
+    Pick between them on SD/SDXL, where the gate lets the stabilizers run and
+    ACS is a real behavioral difference; on Anima the choice barely registers.
 
     Deterministic; one model evaluation per step; six small depthwise
     convolutions per step (two fewer than omega)."""
@@ -2200,7 +2214,8 @@ def sample_infinity_omega(
     callback: Callback = None,
 ) -> torch.Tensor:
     """Infinity Diffusion, ``omega`` branch (galpt/infinity-diffusion, MIT;
-    upstream @4319bc7, 2026-07-25 — the repo's current default branch).
+    upstream @4319bc7, 2026-07-24 — the repo's current default branch; its head
+    8756ace is README-only, so this is the branch's latest sampler code).
 
     Be clear about what this is: **the integrator is plain Euler**. Both
     ``infinity``'s invariant-gated correction and the ``micro`` branch's
@@ -2214,32 +2229,33 @@ def sample_infinity_omega(
       (the residual).
     * **AHFRI** amplifies the nano band by ``1 + η·tanh(s/s̄)`` where ``s`` is
       a local standard-deviation map of that band, so the boost lands where
-      high-frequency structure already exists. ``η = 0.25·clamp(σ/σ_knee,
-      0.1, 1)`` — at most a 25% gain.
+      high-frequency structure already exists. ``η = 0.25·clamp(σ/1.5, 0.1,
+      1)`` — at most a 25% gain, and on flow at most 16.7% (σ ≤ 1 never
+      saturates the knee).
     * **DoG** adds ``0.15·η`` of an isotropic band-pass of the nano band.
       Faithful to upstream and near-free, but be aware ``0.15·η ≤ 0.038``
       applied to a band-pass of an already-small band: it is close to a no-op.
-      The real behavioral change over the ``nano`` branch is ACS.
     * **NQVP** and **ACS** hold the denoised prediction's per-channel spread
       (and, for ACS, mean) near their running EMAs — upstream's answer to CFG
-      colour cast at high guidance.
+      colour cast at high guidance. **Both only run when ``sigmas[0] ≥ 8``**,
+      so they are live on SD/SDXL at full denoise and dead on rectified flow;
+      see ``_STABILIZER_SIGMA_MIN``, which is the single most important thing
+      to know about this sampler's behavior per family.
+
+    So there are really two omegas. On **SD/SDXL** it is the full stack, where
+    the ≤25% nano gain pushes toward detail and the two stabilizers push back
+    against it. On **Anima and any other rectified-flow model** it is LPVD +
+    AHFRI + DoG on Euler with nothing stabilized — an unclamped detail filter,
+    which is the configuration upstream's flow-model comparisons were made in.
 
     Note ``η`` is 10× larger at high σ than at low σ, so the amplification
     lands during structure formation rather than during fine-texture cleanup.
     That matches ``infinity_htds``, which despite its name is also high-σ-dense
     — the pairing is coherent, just not where the README says it aims.
 
-    The ≤25% nano-band gain pushes toward detail while NQVP and ACS, which
-    clamp the denoised prediction's spread every step, push away from it, and
-    **the stabilizers win** — on a synthetic denoiser omega came out smoother
-    than ``euler``, and on Anima (AnimaPulse, 1024×1536, 32 steps, CFG 4.0,
-    ``infinity`` schedule, one seed) it measured 2.1× less high-frequency
-    energy than ``stork2`` (97 vs 209), lower contrast, and a heavy colour cast
-    — per-channel means spanning 123 points against ``stork2``'s 54. It reads
-    as flat and fogged. ACS is the prime suspect; :func:`sample_infinity_nano`
-    is the same sampler without it. Upstream's own F-PTLS benchmark measures
-    FFT power density, which this mechanism inflates by construction, so it was
-    never independent evidence for the branch's detail claims.
+    One caution on upstream's evidence: its F-PTLS benchmark measures FFT power
+    density, which AHFRI inflates by construction, so it is not independent
+    support for the branch's detail claims.
 
     Deterministic; one model evaluation per step; six (nano) to eight (omega)
     small depthwise convolutions per step on top, which is noise next to a DiT
@@ -2253,13 +2269,22 @@ def sample_infinity_omega(
     keeps omega out of the FLUX dropdown; the guard below is for direct
     library callers.
 
-    **Port deviations, both forced:** (1) upstream's ``is_split_resume``
-    heuristic — disable the stabilizers when ``sigmas[0] < 8.0``, meant to
-    detect a ComfyUI ``KSamplerAdvanced`` mid-schedule resume — is dropped. On
-    rectified flow ``σ_max`` is 1.0, so it would fire on *every* Anima
-    generation and silently turn both stabilizers off forever; we have no
-    resume node for it to detect either. (2) The stabilizers and the pyramid
-    run in float32 (see their docstrings).
+    **Port deviations:** exactly one, and it is forced — the stabilizers and
+    the pyramid run in float32 (see their docstrings), because
+    ``torch.quantile`` rejects fp16 outright and an fp16 ``std`` reduction over
+    a full feature map is precisely where a numerical stabilizer goes wrong.
+    Everything else is literal, including the ``sigmas[0] < 8`` stabilizer gate
+    and the ``σ/1.5`` knee. Fed a float32 latent, omega and nano reproduce
+    ``galpt/infinity-diffusion``'s ``InfinitySampler`` bit-for-bit on both SD-
+    scale and flow-scale schedules.
+
+    Two earlier deviations were **reverted** after upstream's author reported
+    that the colour cast we measured does not occur under ComfyUI. Dropping the
+    ``sigmas[0] < 8`` gate as a misfiring heuristic was the cause: it left ACS
+    running on Anima, where ComfyUI never runs it, and ACS pinning each
+    channel's mean to an early-seeded EMA is what produced the cast. The
+    relativized ``σ_knee`` went with it. Any Anima measurement of this sampler
+    taken before that revert describes our build, not upstream's.
 
     Upstream's 5-D ``(B, C, T, H, W)`` folding path is omitted, but its README
     is right that Anima needs one — under ComfyUI it does. There Anima carries

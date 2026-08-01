@@ -1429,6 +1429,43 @@ def test_infinity_omega_filter_is_live_above_the_bypass():
     assert not torch.allclose(omega, euler, atol=1e-4)
 
 
+def test_infinity_omega_stabilizers_are_off_on_rectified_flow():
+    # Upstream gates NQVP and ACS on sigmas[0] >= 8.0. ComfyUI's Anima is
+    # ModelSamplingDiscreteFlow(multiplier=1.0, shift=3.0), so sigma_max is
+    # exactly 1.0 and the gate closes for every flow generation — which is why
+    # upstream's author sees no colour cast on Anima. We ported the gate away
+    # once, left ACS pinning channel means to an early EMA, and produced
+    # exactly that cast. This pins the gate so it cannot be dropped again:
+    # on a flow schedule omega must equal its own no-stabilizer path.
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
+    assert float(sigmas[0]) == 1.0
+    torch.manual_seed(5)
+    x_init = torch.randn(1, 4, 16, 16)
+    drift = torch.tensor([-1.0, -0.3, 0.3, 1.0]).view(1, 4, 1, 1)
+    model = lambda x, sg: 0.2 * torch.tanh(x) + drift / (1.0 + float(sg[0]))
+
+    omega = K.sample_infinity_omega(model, x_init.clone(), sigmas)
+    # Same loop with the two stabilizers never invoked: identical, bit for bit.
+    unstab = K._sample_infinity_pyramid(model, x_init.clone(), sigmas,
+                                        name="ref", acs=False, dog=True)
+    assert torch.equal(omega, unstab)
+
+
+def test_infinity_omega_stabilizers_are_on_at_sd_sigma_scale():
+    # The other side of the gate: at SD's sigma_max the stabilizers must run,
+    # or the port would be dead code on the only family upstream tested it on.
+    sigmas = S.karras_schedule(20, 0.0292, 14.6146)
+    torch.manual_seed(5)
+    x_init = torch.randn(1, 4, 16, 16)
+    drift = torch.tensor([-1.0, -0.3, 0.3, 1.0]).view(1, 4, 1, 1)
+    model = lambda x, sg: 0.2 * torch.tanh(x) + drift / (1.0 + float(sg[0]))
+
+    omega = K.sample_infinity_omega(model, x_init.clone(), sigmas)
+    unstab = K._sample_infinity_pyramid(model, x_init.clone(), sigmas,
+                                        name="ref", acs=False, dog=True)
+    assert not torch.allclose(omega, unstab, atol=1e-5)
+
+
 def test_infinity_omega_registered_in_sampler_table():
     assert K.get_sampler("infinity_omega") is K.sample_infinity_omega
 
@@ -1441,8 +1478,9 @@ def test_infinity_omega_registered_in_sampler_table():
 
 def test_infinity_nano_is_omega_without_acs_and_dog():
     # The whole reason nano exists here: it must equal omega with those two
-    # blocks skipped, and must NOT equal omega itself.
-    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    # blocks skipped, and must NOT equal omega itself. Uses an SD-scale
+    # schedule so the stabilizer gate is open and ACS actually differs.
+    sigmas = S.karras_schedule(16, 0.0292, 14.6146)
     torch.manual_seed(3)
     x_init = torch.randn(1, 4, 16, 16)
     model = lambda x, sg: 0.3 * torch.tanh(x) + 0.1 * x
@@ -1458,15 +1496,16 @@ def test_infinity_nano_leaves_channel_means_freer_than_omega():
     # ACS pulls each channel's spatial mean halfway to a running EMA every
     # step; without it the trajectory is free to move its channel means. Drive
     # a denoiser whose channel means drift steadily and nano must track that
-    # drift more closely than omega does.
-    sigmas = S.flow_matching_schedule(20, shift=3.0)
+    # drift more closely than omega does. SD-scale schedule: on flow the gate
+    # disables ACS in both, and this comparison has nothing to measure.
+    sigmas = S.karras_schedule(20, 0.0292, 14.6146)
     torch.manual_seed(11)
     x_init = torch.randn(1, 4, 16, 16)
     drift = torch.tensor([-1.0, -0.3, 0.3, 1.0]).view(1, 4, 1, 1)
 
     def model(x, sg):
         # x0 target pulls each channel toward a different, sigma-dependent mean
-        return 0.2 * torch.tanh(x) + drift * (1.0 - float(sg[0]))
+        return 0.2 * torch.tanh(x) + drift / (1.0 + float(sg[0]))
 
     nano = K.sample_infinity_nano(model, x_init.clone(), sigmas)
     omega = K.sample_infinity_omega(model, x_init.clone(), sigmas)
