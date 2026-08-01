@@ -817,6 +817,176 @@ def test_uni_pc_anneal_registered_in_sampler_table():
     assert K.get_sampler("uni_pc_anneal") is K.sample_uni_pc_anneal
 
 
+# ── COGENT ────────────────────────────────────────────────────────────
+# Coherence-gated exponential multistep: the DPM++(2M) flow core with the
+# *_anneal family's σ-annealed eta, and the 2nd-order correction scaled by
+# psi = max((1+2·rho)/3, 1 − e^-h) — a measured Wiener shrinkage with a
+# step-size floor. See sample_cogent / _coherence_gate.
+
+
+_TINY_H = torch.tensor(1e-6)      # floor ≈ 0, isolating the coherence term
+
+
+def test_coherence_gate_maps_rho_to_wiener_factor():
+    # psi = (1 + 2·rho)/3: identical differences (rho = 1) ⇒ 1, orthogonal
+    # (rho = 0) ⇒ 1/3, and rho ≤ -1/2 (the pure-noise floor of the model) ⇒ 0.
+    a = torch.randn(1, 4, 8, 8)
+    b = torch.randn(1, 4, 8, 8)
+    b = b - (a * b).sum() / (a * a).sum() * a          # orthogonalise b against a
+    assert torch.allclose(K._coherence_gate(a, a, _TINY_H), torch.ones(1, 1, 1, 1), atol=1e-5)
+    assert torch.allclose(K._coherence_gate(a, b, _TINY_H),
+                          torch.full((1, 1, 1, 1), 1 / 3), atol=1e-4)
+    assert torch.allclose(K._coherence_gate(a, -a, _TINY_H), torch.zeros(1, 1, 1, 1), atol=1e-5)
+
+
+def test_coherence_gate_floor_is_the_phi_weight():
+    # With no second difference yet the gate is the floor alone; and the floor
+    # wins over an anticorrelated (psi = 0) reading. h = ln 2 ⇒ 1 - e^-h = 1/2.
+    a = torch.randn(1, 4, 8, 8)
+    h = torch.log(torch.tensor(2.0))
+    assert torch.allclose(K._coherence_gate(a, None, h), torch.tensor(0.5), atol=1e-6)
+    assert torch.allclose(K._coherence_gate(a, -a, h), torch.full((1, 1, 1, 1), 0.5), atol=1e-6)
+    # a fine step lets the coherence term damp all the way down
+    assert float(K._coherence_gate(a, -a, _TINY_H)) < 1e-5
+
+
+def test_coherence_gate_is_per_sample_and_scale_invariant():
+    # Reduced over every dim but the batch, and a cosine, so positive rescaling
+    # of either argument leaves it untouched.
+    a = torch.randn(3, 4, 8, 8)
+    b = torch.randn(3, 4, 8, 8)
+    psi = K._coherence_gate(a, b, _TINY_H)
+    assert psi.shape == (3, 1, 1, 1)
+    assert torch.allclose(psi, K._coherence_gate(5.0 * a, 0.1 * b, _TINY_H), atol=1e-5)
+    # per-sample: perturbing sample 0 must not move sample 1's gate
+    a2 = a.clone()
+    a2[0] = torch.randn(4, 8, 8)
+    assert torch.allclose(psi[1:], K._coherence_gate(a2, b, _TINY_H)[1:], atol=1e-5)
+
+
+def test_cogent_gate_of_one_equals_dpmpp_2m_anneal(monkeypatch):
+    # psi ≡ 1 is the undamped textbook coefficient, i.e. exactly the DPM++(2M)
+    # annealed multistep. The floor is ≤ 1 so max(1, floor) == 1, and this pins
+    # that the only thing cogent adds to that core is the gate.
+    torch.manual_seed(5)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    monkeypatch.setattr(K, "_coherence_gate", lambda d, od, h: torch.ones(
+        d.shape[0], *([1] * (d.ndim - 1))))
+    got = _last_nonzero_latent(K.sample_cogent, model, x_init, sigmas,
+                               eta_max=0.0, model_type="flow", shift=3.0)
+    want = _last_nonzero_latent(K.sample_dpmpp_2m_anneal, model, x_init, sigmas,
+                                eta_max=0.0, model_type="flow", shift=3.0)
+    assert torch.isfinite(got).all()
+    assert torch.equal(got, want)          # bit-for-bit, not merely close
+
+
+def test_cogent_step_size_floor_keeps_the_correction_alive(monkeypatch):
+    # With the Wiener term pinned to 0 (the pure-noise reading) psi collapses to
+    # the step-size floor, which must still be nonzero — otherwise the step would
+    # silently fall to first order. Compare against the first-order exponential
+    # step written out by hand: cogent must NOT match it.
+    torch.manual_seed(11)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(8, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    real_gate = K._coherence_gate
+    monkeypatch.setattr(K, "_coherence_gate",
+                        lambda d, od, h: real_gate(d, -d, h))   # rho = -1 ⇒ floor only
+    got = _last_nonzero_latent(K.sample_cogent, model, x_init, sigmas,
+                               eta_max=0.0, model_type="flow", shift=3.0)
+
+    # first-order (DDIM/exponential-Euler) reference: the same loop with no
+    # 2nd-order term at all.
+    sig = K._offset_first_sigma_for_snr(sigmas, "flow", 3.0)
+    x, s_in, last = x_init.clone(), x_init.new_ones([1]), None
+    for i in range(len(sig) - 1):
+        denoised = model(x, sig[i] * s_in)
+        if bool(sig[i + 1] == 0):
+            break
+        last = x.clone()
+        lam_s, lam_t = K._half_log_snr(sig[i], "flow"), K._half_log_snr(sig[i + 1], "flow")
+        h = lam_t - lam_s
+        x = sig[i + 1] / sig[i] * x + (sig[i + 1] * lam_t.exp()) * (-h).expm1().neg() * denoised
+    assert torch.isfinite(got).all()
+    assert not torch.allclose(got, last, atol=1e-4)
+
+    # the floor is exactly the integrator's phi-weight: in (0, 1) for every h > 0
+    lam = K._half_log_snr(sig[:-1], "flow")
+    hs = lam[1:] - lam[:-1]
+    floor = (-hs).expm1().neg()
+    assert bool((hs > 0).all())
+    assert bool(((floor > 0) & (floor < 1)).all())
+
+
+def test_cogent_constant_x0_ends_clean():
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    out = K.sample_cogent(
+        const_denoiser(target), torch.randn(1, 16, 4, 4), sigmas,
+        model_type="flow", shift=3.0, generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_cogent_ve_finite_and_lands_clean():
+    # Family-agnostic: the VE map (SD/SDXL) anneals on σ/(1+σ) instead of σ.
+    target = torch.full((1, 4, 8, 8), -0.2)
+    out = K.sample_cogent(const_denoiser(target), torch.randn(1, 4, 8, 8) * 14.6,
+                          _ve_sigmas(), generator=torch.Generator().manual_seed(1))
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_cogent_seed_reproducible_and_stochastic():
+    torch.manual_seed(4)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    def run(**kw):
+        return _last_nonzero_latent(K.sample_cogent, model, x_init, sigmas,
+                                    model_type="flow", shift=3.0, **kw)
+
+    a = run(generator=torch.Generator().manual_seed(3))
+    b = run(generator=torch.Generator().manual_seed(3))
+    det = run(eta_max=0.0)
+    det2 = run(eta_max=0.0, generator=torch.Generator().manual_seed(9))
+    assert torch.equal(a, b)
+    assert not torch.allclose(a, det, atol=1e-5)
+    assert torch.equal(det, det2)          # eta_max=0 ⇒ no noise drawn at all
+
+
+def test_cogent_registered_in_sampler_table():
+    assert K.get_sampler("cogent") is K.sample_cogent
+
+
+# ── sampler allowlist consistency ─────────────────────────────────────
+# Each pipeline gates generation on a family allowlist AND separately looks up a
+# flow-aware set to decide which kwargs to pass. Adding a sampler to only one of
+# them is silent until generation time, where it surfaces as "sampler must be one
+# of [...]" — which is exactly how `cogent` shipped broken once.
+
+
+@pytest.mark.parametrize("module", ["_anima", "_flux"])
+def test_pipeline_sampler_allowlists_are_consistent(module):
+    import importlib
+    mod = importlib.import_module(f"diffucore.pipelines.{module}")
+    allow = mod._ANIMA_SAMPLERS if module == "_anima" else mod._FLUX_SAMPLERS
+    # every allowlisted name must actually resolve to a sampler
+    assert not (allow - set(K.SAMPLERS)), f"{module}: not in SAMPLERS registry"
+    # anything the pipeline special-cases as flow-aware must be runnable there
+    assert not (mod._FLOW_AWARE_SAMPLERS - allow), \
+        f"{module}: flow-aware sampler missing from the family allowlist"
+
+
 # ── STORK-2 ───────────────────────────────────────────────────────────
 # Clean-room STORK-2 (arXiv:2505.24210): an s-stage Runge–Kutta–Gegenbauer
 # cascade driven by Taylor-extrapolated "virtual" stage velocities (one real

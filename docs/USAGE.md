@@ -56,7 +56,14 @@ image = TextToImage(model)(
   as the deterministic core instead of plain Euler / the secant. The 2M core stays
   genuinely 2nd-order at low step counts — where the secant self-gates back to Euler —
   so it reaches the same quality in fewer steps; `eta_max=0` is the deterministic
-  2M flow solver. Pair with `beta`/`flow` like its siblings).
+  2M flow solver. Pair with `beta`/`flow` like its siblings), and
+  `cogent` (all families — the same σ-annealed burn-in and DPM++(2M) exponential
+  core as `dpmpp_2m_anneal`, but the 2nd-order correction is scaled by a *measured*
+  weight `psi = max((1 + 2·rho)/3, 1 − e^−h)` instead of a hardcoded σ heuristic:
+  `rho` is the coherence of consecutive x0 differences, giving a Wiener shrinkage
+  that damps itself on an imperfect model and stays undamped on a clean one, and
+  `1 − e^−h` is the integrator's own phi-weight as a step-size floor. `eta_max=0`
+  is deterministic; `psi ≡ 1` is exactly `dpmpp_2m_anneal`. Prefer 24+ steps).
   Ancestral samplers are rectified-flow-aware on Anima/FLUX.
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
   `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
