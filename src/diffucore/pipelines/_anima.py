@@ -47,7 +47,8 @@ _ANIMA_SAMPLERS = {
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
     "res_multistep_ancestral", "gradient_estimation", "stork2", "infinity",
-    "infinity_nano", "infinity_omega", "lms", "lcm",
+    "infinity_realism", "infinity_nano", "infinity_omega", "infinity_aether",
+    "lms", "lcm",
     "secant", "secant_anneal",
     "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
     "cogent",
@@ -312,6 +313,10 @@ def anima_text_to_image(
                 if sampler in ("secant", "secant_anneal"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
+                # aether injects coherence-gated grain; it is stochastic but takes no
+                # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
+                if sampler == "infinity_aether":
+                    kwargs["generator"] = gen
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent"):
                     kwargs["eta_max"] = eta_max
                 # uni_pc_anneal intentionally omitted: even with its order-ramp the
@@ -509,6 +514,10 @@ def anima_img2img(
             if sampler in ("secant", "secant_anneal"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
+            # aether injects coherence-gated grain; it is stochastic but takes no
+            # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
+            if sampler == "infinity_aether":
+                kwargs["generator"] = gen
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent"):
                 kwargs["eta_max"] = eta_max
             # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
