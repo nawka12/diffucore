@@ -51,13 +51,13 @@ _ANIMA_SAMPLERS = {
     "lms", "lcm",
     "secant", "secant_anneal",
     "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
-    "cogent",
+    "cogent", "cogent3", "cogent3_pump",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "dpmpp_2m_anneal",
-    "uni_pc_anneal", "cogent",
+    "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
@@ -317,7 +317,7 @@ def anima_text_to_image(
                 # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
-                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent"):
+                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
                     kwargs["eta_max"] = eta_max
                 # uni_pc_anneal intentionally omitted: even with its order-ramp the
                 # shared 1.0 panel default over-softens it (deterministic stays
@@ -518,7 +518,7 @@ def anima_img2img(
             # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
-            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent"):
+            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
                 kwargs["eta_max"] = eta_max
             # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
             # low baked-in eta_max (0.2) instead of the shared 1.0 panel default.

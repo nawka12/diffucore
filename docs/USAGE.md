@@ -63,7 +63,15 @@ image = TextToImage(model)(
   `rho` is the coherence of consecutive x0 differences, giving a Wiener shrinkage
   that damps itself on an imperfect model and stays undamped on a clean one, and
   `1 − e^−h` is the integrator's own phi-weight as a step-size floor. `eta_max=0`
-  is deterministic; `psi ≡ 1` is exactly `dpmpp_2m_anneal`. Prefer 24+ steps).
+  is deterministic; `psi ≡ 1` is exactly `dpmpp_2m_anneal`. Prefer 24+ steps),
+  and `cogent3` (all families — cogent's measured 2nd-order gate plus a second
+  gate `psi_2 = (2 + 3·rho_2)/5` on the 3rd-order DPM-Solver++(3M) term, where
+  `rho_2` is the coherence of consecutive *second* differences of the x0
+  history; with both gates pinned to 1 and `eta_max=0` it is bit-for-bit the
+  deterministic 3M core, and under a rough/merged model the 3rd-order term
+  damps itself back to cogent's 2nd-order behaviour instead of amplifying the
+  error. `psi_2` has no floor — the term is never load-bearing. Prefer 24+
+  steps).
   Ancestral samplers are rectified-flow-aware on Anima/FLUX.
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
   `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`

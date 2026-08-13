@@ -968,6 +968,236 @@ def test_cogent_registered_in_sampler_table():
     assert K.get_sampler("cogent") is K.sample_cogent
 
 
+# ── COGENT3 ───────────────────────────────────────────────────────────
+# The measured gate carried to third order: the deterministic DPM-Solver++(3M)
+# flow exponential core (dpmpp_3m_sde with eta=0 — bit-for-bit when both gates
+# are the identity) with two data-driven weights on the high-order corrections.
+# The 2nd-order term keeps cogent's psi_1 = max((1+2·rho1)/3, 1 − e^-h); the
+# 3rd-order term — a difference of differences, the noisiest quantity in the
+# family — is scaled by psi_2 = (2 + 3·rho2)/5, the Wiener shrink on the
+# coherence of consecutive second differences (see _cogent3_curvature_gate).
+
+
+def _curv_gate_ones_or_zero(value):
+    return lambda d, od: torch.full((d.shape[0], *([1] * (d.ndim - 1))), value)
+
+
+def test_cogent3_curvature_gate_maps_rho_to_wiener_factor():
+    # psi_2 = (2 + 3·rho2)/5: identical second differences (rho2 = 1) ⇒ 1,
+    # orthogonal (rho2 = 0) ⇒ 0.4, and rho2 = -2/3 (the pure-noise floor of the
+    # model, where the second difference carries only noise) ⇒ 0. No history
+    # yields ones (the caller supplies its own bootstrap for the first
+    # 3rd-order-capable step).
+    a = torch.randn(1, 4, 8, 8)
+    b = torch.randn(1, 4, 8, 8)
+    b = b - (a * b).sum() / (a * a).sum() * a           # orthogonalise b against a
+    assert torch.allclose(K._cogent3_curvature_gate(a, a), torch.ones(1, 1, 1, 1), atol=1e-5)
+    assert torch.allclose(K._cogent3_curvature_gate(a, b),
+                          torch.full((1, 1, 1, 1), 0.4), atol=1e-4)
+    # rho2 = -2/3 ⇒ psi_2 = (2 + 3·(-2/3))/5 = 0 (pure noise reading)
+    na = torch.randn(1, 4, 8, 8)
+    assert torch.allclose(K._cogent3_curvature_gate(na, -na), torch.zeros(1, 1, 1, 1), atol=1e-5)
+    assert torch.allclose(K._cogent3_curvature_gate(a, None), torch.ones(1, 1, 1, 1), atol=1e-5)
+
+
+def test_cogent3_curvature_gate_is_per_sample_and_scale_invariant():
+    # Reduced over every dim but the batch, and a cosine: positive rescaling of
+    # either argument leaves it untouched, and perturbing sample 0 must not move
+    # sample 1's gate.
+    a = torch.randn(3, 4, 8, 8)
+    b = torch.randn(3, 4, 8, 8)
+    psi = K._cogent3_curvature_gate(a, b)
+    assert psi.shape == (3, 1, 1, 1)
+    assert torch.allclose(psi, K._cogent3_curvature_gate(5.0 * a, 0.1 * b), atol=1e-5)
+    a2 = a.clone()
+    a2[0] = torch.randn(4, 8, 8)
+    assert torch.allclose(psi[1:], K._cogent3_curvature_gate(a2, b)[1:], atol=1e-5)
+
+
+def test_cogent3_gate_of_one_equals_dpmpp_3m_sde_deterministic(monkeypatch):
+    # With both gates pinned to the identity and eta_max=0, the update is
+    # exactly the deterministic DPM-Solver++(3M) flow exponential integrator:
+    # this pins that the only thing cogent3 adds on top of that core is the
+    # two gates (the same role test_cogent_gate_of_one plays for cogent).
+    torch.manual_seed(5)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    monkeypatch.setattr(K, "_coherence_gate",
+                        lambda d, od, h: torch.ones(d.shape[0], *([1] * (d.ndim - 1))))
+    monkeypatch.setattr(K, "_cogent3_curvature_gate", _curv_gate_ones_or_zero(1.0))
+    got = _last_nonzero_latent(K.sample_cogent3, model, x_init, sigmas,
+                               eta_max=0.0, model_type="flow", shift=3.0)
+    want = _last_nonzero_latent(K.sample_dpmpp_3m_sde, model, x_init, sigmas,
+                                eta=0.0, model_type="flow", shift=3.0)
+    assert torch.isfinite(got).all()
+    assert torch.equal(got, want)            # bit-for-bit, not merely close
+
+
+def test_cogent3_third_order_term_actually_fires(monkeypatch):
+    # On a σ-dependent model the 3rd-order correction must not be degenerate:
+    # the default (gates live) run differs from a run with the curvature gate
+    # pinned to zero, which is the gated-2nd-order fallback.
+    torch.manual_seed(11)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(24, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    real = K._cogent3_curvature_gate
+    monkeypatch.setattr(K, "_cogent3_curvature_gate", _curv_gate_ones_or_zero(0.0))
+    fallback = _last_nonzero_latent(K.sample_cogent3, model, x_init, sigmas,
+                                    eta_max=0.0, model_type="flow", shift=3.0)
+    monkeypatch.setattr(K, "_cogent3_curvature_gate", real)
+    live = _last_nonzero_latent(K.sample_cogent3, model, x_init, sigmas,
+                                eta_max=0.0, model_type="flow", shift=3.0)
+    assert torch.isfinite(live).all()
+    assert torch.isfinite(fallback).all()
+    assert not torch.allclose(live, fallback, atol=1e-6)   # 3rd-order term is live
+
+
+def test_cogent3_constant_x0_ends_clean():
+    target = torch.full((1, 16, 4, 4), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    out = K.sample_cogent3(
+        const_denoiser(target), torch.randn(1, 16, 4, 4), sigmas,
+        model_type="flow", shift=3.0, generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_cogent3_ve_finite_and_lands_clean():
+    # Family-agnostic: the VE map (SD/SDXL) anneals on σ/(1+σ) instead of σ.
+    target = torch.full((1, 4, 8, 8), -0.2)
+    out = K.sample_cogent3(const_denoiser(target), torch.randn(1, 4, 8, 8) * 14.6,
+                           _ve_sigmas(), generator=torch.Generator().manual_seed(1))
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_cogent3_seed_reproducible_and_stochastic():
+    torch.manual_seed(4)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    def run(**kw):
+        return _last_nonzero_latent(K.sample_cogent3, model, x_init, sigmas,
+                                    model_type="flow", shift=3.0, **kw)
+
+    a = run(generator=torch.Generator().manual_seed(3))
+    b = run(generator=torch.Generator().manual_seed(3))
+    det = run(eta_max=0.0)
+    det2 = run(eta_max=0.0, generator=torch.Generator().manual_seed(9))
+    assert torch.equal(a, b)
+    assert not torch.allclose(a, det, atol=1e-5)
+    assert torch.equal(det, det2)            # eta_max=0 ⇒ no noise drawn at all
+
+
+def test_cogent3_registered_in_sampler_table():
+    assert K.get_sampler("cogent3") is K.sample_cogent3
+
+
+# ── cogent3's coherence pump (the `cogent3_pump` sampler) ─────────────
+# aether's high-σ structure pump, isolated from its band-pass stack and given a
+# hard low-σ shutoff. See sample_cogent3's docstring for the mechanism.
+
+def _pump_run(x_init, sigmas, model, **kw):
+    return _last_nonzero_latent(K.sample_cogent3, model, x_init, sigmas,
+                                model_type="flow", shift=3.0, **kw)
+
+
+def test_pump_off_is_bit_exact_cogent3():
+    # The whole point of shipping the pump as a parameter rather than a forked
+    # sampler: pump_strength=0 must not perturb the numerics *or* consume any
+    # noise from the generator, so the default path is provably untouched.
+    torch.manual_seed(7)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    base = _pump_run(x_init, sigmas, model, generator=torch.Generator().manual_seed(2))
+    off = _pump_run(x_init, sigmas, model, pump_strength=0.0,
+                    generator=torch.Generator().manual_seed(2))
+    assert torch.equal(base, off)            # bit-for-bit, generator stream included
+
+
+def test_pump_fires_and_is_seed_reproducible():
+    torch.manual_seed(8)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    a = _pump_run(x_init, sigmas, model, pump_strength=0.08,
+                  generator=torch.Generator().manual_seed(3))
+    b = _pump_run(x_init, sigmas, model, pump_strength=0.08,
+                  generator=torch.Generator().manual_seed(3))
+    off = _pump_run(x_init, sigmas, model, generator=torch.Generator().manual_seed(3))
+    assert torch.isfinite(a).all()
+    assert torch.equal(a, b)                             # reproducible
+    assert not torch.allclose(a, off, atol=1e-5)         # the pump actually moves x
+
+
+def test_pump_shuts_off_below_pump_end():
+    # pump_end above σ_max ⇒ the ramp is zero on every step, so no noise is
+    # drawn and the run must collapse onto plain cogent3 bit-for-bit. This is
+    # what guarantees the low-σ tail converges instead of accumulating grain.
+    torch.manual_seed(9)
+    target = torch.randn(1, 4, 8, 8)
+    model = _anneal_sigma_dependent_model(target)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+
+    base = _pump_run(x_init, sigmas, model, generator=torch.Generator().manual_seed(4))
+    shut = _pump_run(x_init, sigmas, model, pump_strength=0.08, pump_end=1.5,
+                     generator=torch.Generator().manual_seed(4))
+    assert torch.equal(base, shut)
+
+
+def test_pump_never_touches_the_final_latent():
+    # aether's failure mode on flow: its terminal grain floor injects into the
+    # finished latent, with nothing after it to denoise it away. The pump lives
+    # in the sigma_next != 0 branch, so a constant-x0 model must still land
+    # exactly on the target however hard it is pumped.
+    target = torch.full((1, 4, 8, 8), 0.1)
+    sigmas = S.flow_matching_schedule(16, shift=3.0)
+    out = K.sample_cogent3(
+        const_denoiser(target), torch.randn(1, 4, 8, 8), sigmas,
+        model_type="flow", shift=3.0, pump_strength=0.5, pump_end=0.0,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_pump_requires_4d_latent_only_when_on():
+    # The structure tensor is a 2-D convolution, so FLUX's packed token sequence
+    # is unusable — but only when the pump is actually running.
+    target = torch.full((1, 64, 16), 0.1)
+    x_init = torch.randn(1, 64, 16)
+    sigmas = S.flow_matching_schedule(8, shift=3.0)
+    out = K.sample_cogent3(const_denoiser(target), x_init, sigmas,
+                           model_type="flow", shift=3.0,
+                           generator=torch.Generator().manual_seed(0))
+    assert torch.isfinite(out).all()         # plain cogent3 is fine on 3-D
+    with pytest.raises(ValueError, match="4-D"):
+        K.sample_cogent3(const_denoiser(target), x_init, sigmas,
+                         model_type="flow", shift=3.0, pump_strength=0.08,
+                         generator=torch.Generator().manual_seed(0))
+
+
+def test_cogent3_pump_registered_in_sampler_table():
+    fn = K.get_sampler("cogent3_pump")
+    assert fn.func is K.sample_cogent3
+    assert fn.keywords["pump_strength"] > 0
+
+
 # ── sampler allowlist consistency ─────────────────────────────────────
 # Each pipeline gates generation on a family allowlist AND separately looks up a
 # flow-aware set to decide which kwargs to pass. Adding a sampler to only one of

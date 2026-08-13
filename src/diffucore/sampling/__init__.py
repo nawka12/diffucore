@@ -70,6 +70,7 @@ from .samplers import (
     sample_dpmpp_2m_anneal,
     sample_uni_pc_anneal,
     sample_cogent,
+    sample_cogent3,
     get_sampler,
     SAMPLERS,
 )
@@ -141,6 +142,7 @@ __all__ = [
     "sample_dpmpp_2m_anneal",
     "sample_uni_pc_anneal",
     "sample_cogent",
+    "sample_cogent3",
     "get_sampler",
     "SAMPLERS",
 ]

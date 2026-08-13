@@ -63,6 +63,7 @@ __all__ = [
     "sample_dpmpp_2m_anneal",
     "sample_uni_pc_anneal",
     "sample_cogent",
+    "sample_cogent3",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -1357,6 +1358,301 @@ def sample_cogent(
                 x = x + _noise_like(x, generator) * sigma_next * (-2 * h * eta).expm1().neg().sqrt() * s_noise
         old_denoised, old_diff = denoised, diff
         h_last = h
+    return x
+
+
+def _cogent3_curvature_gate(second_diff: torch.Tensor,
+                            old_second_diff: Optional[torch.Tensor],
+                            ) -> torch.Tensor:
+    """Scale factor for a multistep solver's second-divided-difference
+    (3rd-order) term::
+
+        psi = (2 + 3·rho) / 5                             clamped to [0, 1]
+
+    where ``rho = cos(E_i, E_{i-1})`` is the coherence of two consecutive
+    *second* differences of the x0 history — the curvature analogue of
+    :func:`_coherence_gate`'s ``rho`` on first differences. The gate is
+    evaluated per batch sample, reduced over every dim but the first (a cosine
+    averaged over the whole latent, the same precise statistic as cogent's).
+
+    Derivation, mirroring :func:`_coherence_gate`: model ``x0_i = f_i + n_i``
+    with iid ``n_i`` of energy ``v``. Second differences are
+    ``E_i = Δ²f_i + n_i − 2·n_{i-1} + n_{i-2}``, so two consecutive ones share
+    the ``−2·n_{i-1}`` and ``n_{i-2}`` terms with opposite signs::
+
+        <E_i, E_{i-1}> = S2 − 4v        ‖E_i‖² = ‖E_{i-1}‖² = S2 + 6v
+
+    with ``S2 = <Δ²f_i, Δ²f_{i-1}>``. The Wiener shrink that minimises
+    ``E‖psi·E_i − Δ²f‖²`` is ``psi = S2/(S2 + 6v)``; writing ``u = v/S2`` and
+    ``rho = (1 − 4u)/(1 + 6u)`` gives ``u = (1 − rho)/(4 + 6·rho)`` and::
+
+        psi = 1/(1 + 6u) = (2 + 3·rho) / 5
+
+    ``rho = 1`` (clean, smoothly-curving trajectory) ⇒ ``psi = 1``; the pure-
+    noise floor of the model (``rho → −2/3``) ⇒ ``psi = 0``.
+
+    There is deliberately **no step-size floor**, unlike the 2nd-order gate.
+    cogent3's 3rd-order term is never load-bearing — worst case it reverts to
+    the gated 2nd-order behaviour — so damping it to zero on untrustworthy
+    curvature is never a failure mode. And the coherence reading itself does
+    not dual-read curvature the way the first-difference ``rho`` does: ``rho``
+    measures whether the second differences are consistent, which is precisely
+    what decides whether extrapolating them is trustworthy. ``old_second_diff
+    is None`` (no curvature history yet) returns 1.0; the caller substitutes
+    its own bootstrap for the very first 3rd-order-capable step, where the raw
+    Wiener term would be 1.0 regardless (see :func:`sample_cogent3`)."""
+    if old_second_diff is None:
+        return torch.ones(second_diff.shape[0], *([1] * (second_diff.ndim - 1)),
+                          dtype=second_diff.dtype, device=second_diff.device)
+    dims = tuple(range(1, second_diff.ndim))
+    num = (second_diff * old_second_diff).sum(dim=dims)
+    den = (second_diff.pow(2).sum(dim=dims) * old_second_diff.pow(2).sum(dim=dims)).sqrt()
+    rho = num / den.clamp_min(torch.finfo(second_diff.dtype).tiny)
+    psi = ((2.0 + 3.0 * rho) / 5.0).clamp(0.0, 1.0)
+    return psi.view(-1, *([1] * (second_diff.ndim - 1)))
+
+
+def sample_cogent3(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    pump_strength: float = 0.0,
+    pump_end: float = 0.45,
+    pump_span: float = 0.25,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """COGENT3: COGENT's measured gate carried to third order. One model
+    evaluation per step; all model families.
+
+    The deterministic core is the third-order DPM-Solver++ (3M) exponential
+    integrator in half-logSNR space, data-prediction form (Lu et al. 2022,
+    arXiv:2211.01095 — the same core as :func:`sample_dpmpp_3m_sde` with
+    ``eta=0``, which this reproduces bit-for-bit when both gates are the
+    identity — plus the ``*_anneal`` family's ``eta = eta_max·σ`` ancestral
+    burn-in). The gates are :func:`sample_cogent`'s, applied to the 2nd-order
+    term, and a new second gate on the 3rd-order term:
+
+    * **2nd-order term** — built from the first divided difference of the x0
+      history, scaled by cogent's ``psi_1 = max((1 + 2·rho_1)/3, 1 − e^(−h))``,
+      ``rho_1 = cos(D_i, D_{i-1})`` of consecutive first differences, with the
+      step-size floor (a coarse step needs the term whatever its SNR).
+    * **3rd-order term** — built from the *second* divided difference, scaled
+      by a new measured Wiener shrink ``psi_2 = (2 + 3·rho_2)/5``,
+      ``rho_2 = cos(E_i, E_{i-1})`` of consecutive second differences
+      (:func:`_cogent3_curvature_gate`), with **no floor**.
+
+    The 3rd-order term is the noisiest quantity in this family — it is a
+    difference of differences, so it amplifies both the ancestral burn-in's
+    injected noise and whatever the model itself got wrong by the square. That
+    is why the 2nd-order-only family (:func:`sample_cogent`, ``stork2``)
+    exists at all, and it is the reason cogent3's second gate exists too:
+    ``rho_2`` reads directly whether the curvature itself is trustworthy, and
+    the worst case is not a failure but a graceful degradation.
+
+    Measured on the GMM-flow toy of ``scripts/ab_cogent3.py`` (Anima's
+    shift=3.0, exact optimal denoiser, 4000-step Euler reference), relative to
+    :func:`sample_cogent` and the ungated 3M core (``dpmpp_3m_sde`` eta=0 —
+    what cogent3 would be with no gates at all):
+
+    * **Clean model, deterministic accuracy (RMSE vs the exact ODE).** cogent3
+      beats cogent at every step count measured (8..32): ~6% lower error at 8
+      steps, ~4-10% at 12-32. It sits between cogent and the ungated 3M core —
+      the gate knowingly spends a few percent of the core's clean-model edge
+      (8 steps: 0.132 vs 0.127) to buy robustness.
+    * **Rough / merged model, stochastic burn-in (eta_max=1.0, energy distance
+      to data).** The gate converts the 3M core's fragility into cogent-level
+      robustness: at 24-32 steps cogent3 is 22-27% closer to the data law than
+      the ungated 3M (which degrades to well behind plain cogent there), and
+      at 8 steps cogent3 is clearly better than cogent (e.g. freq=12, tau=0.35:
+      0.196 vs 0.238). At 16-32 steps it ties cogent within run noise.
+      Deterministically with a rough model it also tracks cogent within noise.
+
+    Prefer 24+ steps, as with cogent; scheduler pairing follows the exponential
+    core (``flow`` / ``simple`` / ``sgm_uniform``).
+
+    ``eta_max`` is the same ``*_anneal`` knob (``eta_max=0`` fully
+    deterministic); ``psi_1 = psi_2 ≡ 1`` with ``eta_max=0`` reproduces
+    :func:`sample_dpmpp_3m_sde` with ``eta=0`` bit-for-bit. Family-agnostic:
+    ``model_type="flow"`` (Anima / FLUX) anneals on σ, ``"ve"`` (SD / SDXL) on
+    ``σ/(1+σ)`` — the same quantity, as in cogent. ``shift`` offsets the first
+    σ off 1.0 for the flow map.
+
+    ----
+
+    **The high-σ coherence pump** (``pump_strength > 0``; registered as the
+    ``cogent3_pump`` sampler, off by default here).
+
+    This is :func:`sample_infinity_aether`'s one load-bearing mechanism on
+    rectified flow, isolated from the band-pass stack it ships with and given a
+    hard low-σ shutoff. Aether adds grain scaled by ``1 − C`` (the
+    structure-tensor coherence of the denoised prediction) *on top of* a
+    completed Euler step, so the next model call sees a latent noisier than the
+    σ it is handed and must explain the excess as signal — a structure-
+    generation pump aimed exactly at the regions that have not yet committed,
+    and held off the contours that have. At high σ the neighbouring modes it
+    hops between differ in coarse properties (mass, pose, proportion), which is
+    why aether reads character stature well; at low σ they differ in texture,
+    which is why the same mechanism turns skin and gradients to mush.
+
+    So the pump is gated to the top of the schedule and hard-stopped:
+
+    ```
+    nu   = pump_strength · sigma_next · clamp((sigma_frac − pump_end)/pump_span, 0, 1)
+    x   += nu · (1 − C) · noise
+    ```
+
+    Two details are the whole difference from aether, which pins both to
+    constants tuned against SD's σ range and is a substantially different
+    sampler on flow as a result (:func:`sample_infinity_aether` documents the
+    general problem; measured at 24 flow steps its ``0.30·σ_next``-vs-``0.03``
+    terminal floor injects 0.0289 into the *finished* latent, 34× what the same
+    code injects on an SDXL karras schedule):
+
+    * **The gate uses ``sigma_frac``** — the family-invariant ``σ`` (flow) /
+      ``σ/(1+σ)`` (VE) coordinate this sampler already computes for ``eta`` —
+      so ``pump_end`` means the same place on the trajectory in both families.
+    * **The amplitude uses absolute ``sigma_next``**, because the noise is being
+      added to a latent whose own noise level is σ. A fixed absolute amplitude
+      is negligible at SD's σ_max of 14.6 and enormous at flow's 1.0.
+
+    Because the pump lives in the ``sigma_next != 0`` branch it can never touch
+    the final latent: the last step is ``x = denoised``, unpumped.
+
+    The pump perturbs x, so it could in principle decorrelate consecutive x0
+    predictions and drive ``rho_1``/``rho_2`` — and the gates down with them —
+    which would leave the 3rd-order term as dead weight while it runs. Probed
+    on two toys (a Gaussian-prior denoiser and a 4-mode mixture, both 2-D and
+    structured) it does not: mean ``psi_1`` moved 0.566 → 0.567 and ``psi_2``
+    0.143 → 0.144 at ``pump_strength=0.08``. The pump and the exponential core
+    appear to occupy different scales rather than fight, which is why they
+    compose — but that is a measurement on toys, not a proof.
+
+    Defaults pump at full strength above ``sigma_frac`` 0.70, ramp to zero at
+    0.45, off below — roughly 17 pumped / 5 ramping / 9 clean steps on a
+    30-step ``smoothstep`` flow schedule. Raise ``pump_strength`` or lower
+    ``pump_end`` for more coarse-structure revision at the cost of detail.
+    ``pump_strength=0`` is bit-for-bit plain cogent3, drawing no extra noise.
+
+    **4-D latents only when the pump is on** (the structure tensor is a 2-D
+    convolution) — FLUX packs to a token sequence, so use plain ``cogent3``
+    there.
+
+    **What it turned out to be good at.** This was built to chase aether's
+    character-stature strength. On real images (user A/B, 28–32 steps,
+    ``beta_mix``) the striking win is instead **prompt coherency**, with
+    stature improved but no longer the headline. That fits the mechanism better
+    than the original target did: stature is a property of an object the model
+    has already decided to draw, so it lives in *coherent* structure that the
+    ``1 − C`` weighting deliberately protects. Prompt adherence is about what
+    gets drawn at all in regions still ambiguous — precisely the low-``C``
+    regions the pump perturbs — and each perturbation forces the CFG-guided
+    model to re-answer "what belongs here, given the conditioning?". An
+    accurate solver that commits to a partially prompt-compliant layout will
+    refine *that* layout faithfully; it has no mechanism to restructure. This
+    is a spatially-selective, coherence-gated relative of why restart /
+    stochastic sampling improves text alignment over an ODE.
+
+    Two practical consequences. The pump earns its keep in the *high-σ* band,
+    so raising ``pump_end`` (shutting off earlier) is the first thing to try if
+    detail feels soft — it should keep the coherency win while returning steps
+    to refinement. And do not pair it with a CFG guidance interval that drops
+    the uncond pass inside the pumped band: the pump's value *is* CFG
+    re-deciding, so switching CFG off there removes the point of it.
+
+    **Offline evidence, stated honestly.** The design rests on a mechanism
+    argument plus measurements of what aether actually does on flow. On a
+    4-mode toy whose modes differ only in a figure's height/width ratio, with
+    mixture weights skewed 0.70 toward the stockiest, the pump moved sampled
+    mode coverage toward the true weights (total-variation 0.0312 → 0.0238) but
+    at 320 seeds that sits inside ±0.07 (2 s.e.) — **not significant**, and the
+    toy never tested prompt adherence at all, which is what the real A/B found.
+    What does reproduce offline is the *cutoff*: pumping all the way down
+    (aether's behaviour, ``pump_end=0``) matched the gated version's coverage
+    exactly while landing consistently further from the nearest mode (0.3253 vs
+    0.3240, cogent3 0.3234) — the low-σ half costs sharpness and buys no
+    coarse-structure benefit.
+    """
+    if len(sigmas) <= 1:
+        return x
+    if pump_strength > 0 and x.ndim != 4:
+        raise ValueError(
+            f"cogent3's coherence pump needs a 4-D [B, C, H, W] latent (the "
+            f"structure tensor is a 2-D convolution); got rank {x.ndim}. FLUX "
+            f"packs the latent into a [B, L, C·p²] token sequence, so use plain "
+            f"cogent3 (pump_strength=0) there."
+        )
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    denoised_1, denoised_2, denoised_3 = None, None, None
+    h, h_1, h_2 = None, None, None
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            # σ-annealed ancestral fraction, as in cogent / dpmpp_2m_anneal.
+            sigma_frac = (float(sigma.clamp(max=1.0)) if model_type == "flow"
+                          else float(sigma / (1.0 + sigma)))
+            eta = eta_max * sigma_frac
+            lambda_s, lambda_t = lambda_fn(sigma), lambda_fn(sigma_next)
+            h = lambda_t - lambda_s
+            h_eta = h * (eta + 1)
+            alpha_t = sigma_next * lambda_t.exp()
+            x = sigma_next / sigma * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
+            if h_2 is not None:
+                r0 = h_1 / h
+                r1 = h_2 / h
+                d1_0 = (denoised - denoised_1) / r0
+                d1_1 = (denoised_1 - denoised_2) / r1
+                d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
+                d2 = (d1_0 - d1_1) / (r0 + r1)
+                phi_2 = h_eta.neg().expm1() / h_eta + 1
+                phi_3 = phi_2 / h_eta - 0.5
+                # ψ₁ reads the raw first differences (same operands as cogent);
+                # ψ₂ reads the second differences. First occurrence bootstraps
+                # ψ₂ from ψ₁ (no curvature history yet).
+                psi_1 = _coherence_gate(denoised - denoised_1,
+                                        denoised_1 - denoised_2, h)
+                e_cur = denoised - 2.0 * denoised_1 + denoised_2
+                psi_2 = (_cogent3_curvature_gate(
+                    e_cur, denoised_1 - 2.0 * denoised_2 + denoised_3)
+                    if denoised_3 is not None else psi_1)
+                x = x + psi_1 * (alpha_t * phi_2) * d1 - psi_2 * (alpha_t * phi_3) * d2
+            elif h_1 is not None:
+                rr = h_1 / h
+                d = (denoised - denoised_1) / rr
+                phi_2 = h_eta.neg().expm1() / h_eta + 1
+                psi_1 = _coherence_gate(denoised - denoised_1, None, h)
+                x = x + psi_1 * (alpha_t * phi_2) * d
+            if eta > 0 and s_noise > 0:
+                x = x + _noise_like(x, generator) * sigma_next * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+            # Coherence pump. Ramp is on the family-invariant sigma_frac, amplitude
+            # on absolute sigma_next; both zero below pump_end, where no noise is
+            # drawn at all so pump_strength=0 leaves the generator stream untouched.
+            if pump_strength > 0:
+                ramp = (1.0 if pump_span <= 0 else
+                        min(1.0, max(0.0, (sigma_frac - pump_end) / pump_span)))
+                if sigma_frac < pump_end:
+                    ramp = 0.0
+                if ramp > 0:
+                    nu = pump_strength * float(sigma_next) * ramp
+                    # Read off the denoised prediction, not the velocity: at low
+                    # sigma the velocity is mostly residual noise and its
+                    # coherence map says nothing about committed structure.
+                    c = _structure_tensor_coherence(denoised.float(), multi_scale=True)
+                    x = x + (nu * (1.0 - c)).to(x.dtype) * _noise_like(x, generator)
+        denoised_1, denoised_2, denoised_3 = denoised, denoised_1, denoised_2
+        h_1, h_2 = h, h_1
     return x
 
 
@@ -2766,6 +3062,8 @@ SAMPLERS: dict[str, Denoiser] = {
     "uni_pc_bh2": partial(sample_uni_pc, variant="bh2"),
     "uni_pc_anneal": sample_uni_pc_anneal,
     "cogent": sample_cogent,
+    "cogent3": sample_cogent3,
+    "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),
 }
 
 
