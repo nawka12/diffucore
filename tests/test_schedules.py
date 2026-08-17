@@ -311,7 +311,7 @@ def test_flow_table_schedule_dispatches_all_names():
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
     for name in ("sgm_uniform", "simple", "normal", "infinity", "infinity_htds",
                  "linear_quadratic", "smoothstep", "beta", "beta_mix",
-                 "kl_optimal"):
+                 "pump_dual", "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name
@@ -341,6 +341,11 @@ def test_flow_table_schedule_forwards_knobs():
     base_lq = S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12)
     assert torch.allclose(base_lq, S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12, threshold_noise=0.025))
     assert not torch.allclose(base_lq, S.flow_table_schedule("linear_quadratic", shift=3.0, steps=12, threshold_noise=0.2))
+
+    base_dual = S.flow_table_schedule("pump_dual", shift=3.0, steps=12)
+    assert torch.allclose(base_dual, S.flow_table_schedule("pump_dual", shift=3.0, steps=12, pump_end=0.45, pump_share=0.85))
+    assert not torch.allclose(base_dual, S.flow_table_schedule("pump_dual", shift=3.0, steps=12, pump_share=0.6))
+    assert not torch.allclose(base_dual, S.flow_table_schedule("pump_dual", shift=3.0, steps=12, pump_end=0.3))
 
     # Knob-agnostic schedulers ignore all the per-scheduler knobs.
     assert torch.allclose(
@@ -378,3 +383,190 @@ def test_flow_matching_dynamic_shift_monotonic_and_anchor():
     sig = S.flow_matching_schedule(20, shift=s_mid)
     assert sig[-1].item() == 0.0
     assert torch.all(sig[:-1] >= sig[1:])
+
+
+def _lam(sigmas):
+    """flow half-logSNR −logit(σ) of a schedule's σ run (excluding trailing 0)."""
+    sig = sigmas[:-1]
+    return -sig.logit()
+
+
+def _pumped_steps(sigmas, pump_end=0.45):
+    """Number of steps whose *starting* σ ≥ pump_end — the count of pump
+    injections the sampler performs (the pump fires after every step it
+    completes in the band)."""
+    sig = sigmas[:-1]
+    return sum(1 for i in range(len(sig) - 1) if sig[i] >= pump_end)
+
+
+def test_pump_dual_endpoints_descent_and_terminus():
+    view = _flow_view()
+    for steps in (8, 16, 32, 64):
+        sig = S.pump_dual_schedule(view, steps)
+        assert sig.shape[0] == steps + 1
+        assert sig[-1].item() == 0.0
+        assert torch.all(sig[:-1] > sig[1:])                 # strictly descending
+        assert abs(sig[0].item() - 1.0) < 1e-6               # pure-noise init
+        # terminates where `flow` does — σ(t = 1/steps), not the table floor
+        ref = S.flow_matching_schedule(steps, shift=3.0)
+        assert abs(sig[-2].item() - ref[-2].item()) < 2e-6
+
+
+def test_pump_dual_terminus_is_flows_not_the_table_floor():
+    """The load-bearing correction. Running to the σ table floor (0.003 —
+    what beta / beta_mix / kl_optimal / normal / infinity all do) is what the
+    3M exponential core measurably hates: on the ab_cogent3 toy, holding
+    everything else fixed and moving only the terminus gives 0.145 / 0.210 /
+    0.287 / 0.365 rough energy distance at σ_end 0.088 / 0.03 / 0.01 / 0.003
+    (flow: 0.141), and 16× flow's error at 8 steps. So the schedule must
+    spend *no* steps below flow's own terminus."""
+    view = _flow_view()
+    for steps in (16, 24, 32):
+        sig = S.pump_dual_schedule(view, steps)
+        floor_end = S.beta_mix_schedule(view, steps)[-2].item()
+        flow_end = S.flow_matching_schedule(steps, shift=3.0)[-2].item()
+        assert sig[-2].item() > floor_end * 10, (steps, sig[-2].item())
+        assert sum(1 for s in sig[:-1] if float(s) < flow_end) == 0, steps
+
+
+def test_pump_dual_terminus_tracks_shift():
+    """Unlike the pumped band — which is defined in σ, and so is untouched by
+    a shift that is a pure translation in λ — the terminus follows `shift`,
+    because it is σ(t = 1/steps) through the shift map."""
+    ends = [float(S.pump_dual_schedule(S.FlowSamplingView(sh), 32)[-2])
+            for sh in (1.0, 3.0, 6.0)]
+    assert ends == sorted(ends) and ends[0] < ends[-1], ends
+    for sh, end in zip((1.0, 3.0, 6.0), ends):
+        assert abs(end - float(S.flow_matching_schedule(32, shift=sh)[-2])) < 2e-6
+
+
+def test_pump_dual_uniform_lambda_share_is_one_band():
+    """At pump_share = S_hi/(S_hi + S_lo) — the point where both bands have
+    equal λ-step — the schedule is one uniform-in-λ grid (the exponential
+    core's ideal: every finite λ-step equal). With the flow terminus that
+    point drifts with the budget (≈ 0.77 at 16 steps, 0.69 at 32), and the
+    0.85 default sits above it, so the pumped band is the finer of the two."""
+    view = _flow_view()
+    for steps in (16, 24, 32):
+        s_hi = math.log(1 / 0.45 - 1) - math.log(1 / 0.99 - 1)
+        sigma_end = float(view.t_to_sigma(view.multiplier / steps))
+        s_lo = math.log(1 / sigma_end - 1) - math.log(1 / 0.45 - 1)
+        sig = S.pump_dual_schedule(view, steps, pump_share=s_hi / (s_hi + s_lo))
+        hs = [float(l) for l in (_lam(sig)[1:] - _lam(sig)[:-1]) if math.isfinite(float(l))]
+        assert max(hs) - min(hs) < 1e-3, steps
+        assert s_hi / (s_hi + s_lo) < 0.85            # the default is pump-dense
+
+
+def test_pump_dual_share_trades_injections_for_tail():
+    """Raising pump_share moves steps from the refinement band into the pumped
+    band: more pump injections (re-deciding rounds), at the cost of a coarser
+    final step — the whole trade the knob exists for."""
+    view = _flow_view()
+    for steps in (24, 32, 50):
+        counts, lasts = [], []
+        for ps in (0.5, 0.6, 0.7, 0.8, 0.85, 0.9):
+            sig = S.pump_dual_schedule(view, steps, pump_share=ps)
+            counts.append(_pumped_steps(sig))
+            lasts.append(float(_lam(sig)[-1] - _lam(sig)[-2]))
+        assert counts == sorted(counts) and counts[0] < counts[-1], (steps, counts)
+        assert lasts == sorted(lasts), (steps, lasts)       # tail coarsens with share
+
+
+def test_pump_dual_injects_at_least_as_often_as_flow():
+    """The pumped band is the schedule's only lever on the pump: every step in
+    it is one CFG re-deciding round. At the 0.85 default the count clears the
+    densest scheduler that was in the real-image A/B's neighbourhood (`flow`,
+    26 at 32 steps) and well clears `beta_mix` (21) — the first version of this
+    schedule starved the band to 13 and lost coherency."""
+    view = _flow_view()
+    for steps in (24, 28, 30, 32):
+        mine = _pumped_steps(S.pump_dual_schedule(view, steps))
+        assert mine >= _pumped_steps(S.flow_matching_schedule(steps, shift=3.0)), steps
+        assert mine > _pumped_steps(S.beta_mix_schedule(view, steps)), steps
+
+
+def test_pump_dual_degrades_to_one_band_without_room():
+    """When σ(t = 1/steps) is at or above the pump cutoff — few steps, or a
+    high shift — there is no refinement band to place, and the run is one
+    uniform-λ grid pumped end to end (as `flow` is at that budget). The
+    boundary case is exact equality: shift 9 at 12 steps puts σ(t=1/12) on
+    0.45 itself, which a naive two-band split turns into a zero-width tail of
+    duplicate sigmas."""
+    for shift, steps in ((9.0, 12), (9.0, 8), (3.0, 4)):
+        sig = S.pump_dual_schedule(S.FlowSamplingView(shift), steps)
+        assert torch.all(sig[:-1] > sig[1:]), (shift, steps)
+        hs = [float(l) for l in (_lam(sig)[2:] - _lam(sig)[1:-1])]
+        assert max(hs) - min(hs) < 1e-3, (shift, steps, hs)   # single uniform-λ band
+
+
+def test_pump_dual_join_lands_at_pump_end():
+    """The band knee sits on the sampler's pump cutoff: above it the λ-steps
+    are the pump band's (fine, ~0.18 λ at the default — many re-deciding
+    rounds), below it the refinement band's (coarser, ~0.46 λ)."""
+    view = _flow_view()
+    sig = S.pump_dual_schedule(view, 32)
+    run = sig[:-1]
+    l = _lam(sig)
+    steps = [float(l[i + 1] - l[i]) for i in range(len(run) - 1)]
+    pumped = [s for i, s in enumerate(steps) if math.isfinite(s)
+              and run[i + 1] >= 0.45 and run[i] < 1.0]
+    fine = [s for i, s in enumerate(steps) if run[i + 1] < 0.45]
+    assert max(pumped) < min(fine), (max(pumped), min(fine))
+    # the knee point itself is at the requested pump_end
+    lo, hi = None, None
+    for i in range(len(run) - 1):
+        if run[i] > 0.45 >= run[i + 1]:
+            lo, hi = run[i + 1], run[i]
+    assert lo is not None and hi is not None
+    assert abs(float(hi) - 0.45) < 0.15 and abs(float(lo) - 0.45) < 0.15
+
+
+def test_pump_dual_pump_end_moves_the_knee():
+    view = _flow_view()
+    for pe in (0.3, 0.6):
+        sig = S.pump_dual_schedule(view, 32, pump_end=pe)
+        assert torch.all(sig[:-1] > sig[1:])
+        # knee follows: the boundary σ straddles pump_end
+        run = sig[:-1]
+        lo = hi = None
+        for i in range(len(run) - 1):
+            if run[i] > pe >= run[i + 1]:
+                lo, hi = run[i + 1], run[i]
+        assert lo is not None and hi is not None
+        assert abs(float(hi) - pe) < 0.15
+
+
+def test_pump_dual_top_sigma_caps_the_wasteful_top():
+    """The model is σ-invariant at σ ≈ 1, so a λ-uniform grid run all the way
+    to σ_max would spend several near-identical calls there (the naive version
+    of this schedule put 9 of 32 σ at ≥ 0.995; flow puts 1). top_sigma caps the
+    grid so the run's first step is a real burn-in jump to ~0.99, in-family
+    with flow (0.989) and beta_mix (0.995)."""
+    view = _flow_view()
+    for ps in (0.5, 0.65, 0.8):
+        sig = S.pump_dual_schedule(view, 32, pump_share=ps)
+        run = sig[:-1]
+        assert int((run >= 0.995).sum()) <= 2, ps       # no near-identical calls
+        assert 0.98 < float(run[1]) < 0.995            # first step lands in-family
+    # the knob moves the cap: a higher top_sigma lands the first post-burn-in
+    # point higher (closer to σ_max), so the pumped grid's top is where the
+    # model actually starts responding
+    low = float(S.pump_dual_schedule(view, 32, top_sigma=0.98)[1])
+    high = float(S.pump_dual_schedule(view, 32, top_sigma=0.995)[1])
+    assert 0.96 < low < high < 0.995
+
+
+def test_pump_dual_invalid_args_raise():
+    import pytest
+
+    view = _flow_view()
+    with pytest.raises(ValueError):
+        S.pump_dual_schedule(view, 2)                 # needs ≥ 3 steps
+    with pytest.raises(ValueError):
+        S.pump_dual_schedule(view, 20, pump_share=0.0)
+    with pytest.raises(ValueError):
+        S.pump_dual_schedule(view, 20, pump_share=1.0)
+    with pytest.raises(ValueError):
+        S.pump_dual_schedule(view, 20, pump_end=0.0)
+    with pytest.raises(ValueError):
+        S.pump_dual_schedule(view, 20, pump_end=1.0)

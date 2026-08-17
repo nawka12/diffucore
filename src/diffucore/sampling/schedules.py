@@ -34,6 +34,7 @@ __all__ = [
     "smoothstep_schedule",
     "beta_schedule",
     "beta_mix_schedule",
+    "pump_dual_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
 ]
@@ -525,6 +526,113 @@ def beta_mix_schedule(schedule, steps: int, *, weight: float = 0.5,
     return append_zero(sigmas)
 
 
+def pump_dual_schedule(schedule, steps: int, *, pump_end: float = 0.45,
+                       pump_share: float = 0.85, top_sigma: float = 0.99,
+                       device: torch.device | str = "cpu",
+                       dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Two-band schedule for ``cogent3_pump``: a step-dense pumped band and a
+    short refinement band, joined at the pump's own cutoff, terminating where
+    ``flow`` terminates.
+
+    ``cogent3_pump``'s coherence pump is hard-stopped below ``pump_end`` (in
+    the ``sigma_frac`` coordinate, which for flow is ``sigma``). Each step in
+    the pumped band injects coherence-gated noise that the next CFG-guided
+    model call must re-answer — one *re-deciding round* for the prompt per
+    injected step — so the band's step count is the schedule's main lever on
+    what the pump can do. Below the cutoff the sampler is plain ``cogent3`` on
+    the 3M exponential core.
+
+    The schedule is a single uniform-in-``u`` grid of ``steps`` points run
+    through a piecewise-linear warp of the half-logSNR coordinate
+    ``λ = −logit(σ)``:
+
+    * **First step** — the run's universal burn-in: ``σ_max`` → ``top_sigma``
+      (a ≈ 5.9 λ jump at the default), matching the first-step sizing of the
+      whole family. The model is σ-invariant at ``σ ≈ 1``, so a uniform-λ
+      grid run all the way to ``σ_max`` would waste several near-identical
+      calls (``beta_mix`` spends 2 at ``σ ≥ 0.995``, ``flow`` 1; a naive
+      uniform-λ grid spends 9); the cap hands that budget to steps that move.
+    * **Pumped band** — ``pump_share`` of the run's steps (default 0.85, i.e.
+      27 of 32), spaced uniformly in λ (~0.18 λ each at the default).
+    * **Refinement band** — the remaining steps, also uniform in λ, ending at
+      ``σ(t = 1/steps)`` — **``flow``'s own terminus**, not the σ table floor.
+
+    Terminating at the table floor (σ ≈ 0.003, what ``beta`` / ``beta_mix`` /
+    ``kl_optimal`` / ``normal`` / ``infinity`` all do) is what this schedule
+    got wrong first. Measured on ``scripts/ab_cogent3.py``'s toy with the
+    terminus as the *only* variable (32 steps, ``eta_max=1.0``, rough model,
+    5 seeds): σ_end 0.0882 → 0.145, 0.03 → 0.210, 0.01 → 0.287, 0.003 → 0.365
+    energy distance, against ``flow``'s 0.141 — monotone in depth, and 16×
+    worse than ``flow`` at 8 steps. It is the terminus, not the last λ-step:
+    holding σ_end at 0.003 and making the final step *finer* (0.52 → 0.24 λ)
+    makes it worse still (0.370 → 0.420), while ``flow``'s much coarser 0.73 λ
+    final step at σ_end 0.088 is fine. Across the eleven schedulers of
+    ``docs/cogent.md`` §6 the same ordering holds: Spearman ρ of the published
+    rough-32 ranking is +0.91 against terminal depth and +0.94 against final
+    λ-step, but only +0.46 against the *minimum* λ-step that section names as
+    the mechanism, and −0.19 against pumped-step count.
+
+    With ``S_hi = λ(pump_end) − λ(top_sigma)`` and
+    ``S_lo = λ(σ_end) − λ(pump_end)``, the warp is
+    ``λ(u) = λ_top + (S_hi/pump_share)·u`` on ``u ≤ pump_share`` and
+    ``λ(u) = λ_knee + (S_lo/(1 − pump_share))·(u − pump_share)`` after — so
+    the pumped band's λ-step is ``S_hi/(pump_share·(steps−1))`` and the
+    refinement band's is ``S_lo/((1−pump_share)·(steps−1))``, with one blended
+    step across the join (where the pump itself is ramping to zero). At
+    ``pump_share = S_hi/(S_hi + S_lo)`` — ≈ 0.69 at 32 steps, drifting with
+    the budget — the two collapse into one uniform-λ grid; the 0.85 default
+    sits above it, so the pumped band is the finer of the two. On the same toy
+    that default beats ``flow`` on both metrics at 24–40 steps (rough 0.127 vs
+    0.141, deterministic RMSE 0.0121 vs 0.0156 at 32) while firing 27 pump
+    injections against ``flow``'s 26 and ``beta_mix``'s 21. Raising it further
+    is the sharp edge: 0.95 collapses (the 2-step tail goes to 1.4 λ).
+
+    When ``σ(t = 1/steps)`` still sits above ``pump_end`` — few steps, or a
+    high ``shift`` — there is no room for a refinement band and the whole run
+    is one uniform-λ grid, pumped end to end, as ``flow`` is at that budget.
+
+    Flow-only, like the other band-shaped table schedulers: it is evaluated
+    against a :class:`FlowSamplingView` whose ``σ_max`` is exactly 1.0.
+    ``pump_end`` pairs with ``sample_cogent3``'s own ``pump_end=0.45`` /
+    ``pump_span=0.25``, so the schedule knee sits on the sampler's hard
+    cutoff; the two must be changed together. Note the pumped band is defined
+    in σ and the flow ``shift`` is a pure translation in λ, so ``shift``
+    reaches this schedule only through the terminus — unlike every other flow
+    scheduler, where it also sets the high-σ density.
+    Returns ``steps + 1`` descending sigmas ending at 0."""
+    if steps < 3:
+        raise ValueError("steps must be >= 3")
+    if not 0.0 < pump_share < 1.0:
+        raise ValueError(f"pump_share must be in (0, 1); got {pump_share}")
+    if not 0.0 < pump_end < 1.0:
+        raise ValueError(f"pump_end must be in (0, 1); got {pump_end}")
+    sigma_max = float(schedule.sigma_max)
+    sigma_min = float(schedule.sigma_min)
+    if not sigma_min < pump_end < sigma_max:
+        raise ValueError(f"pump_end {pump_end} must be in ({sigma_min}, {sigma_max})")
+    if not pump_end < top_sigma < sigma_max:
+        raise ValueError(f"top_sigma {top_sigma} must be in ({pump_end}, {sigma_max})")
+
+    def lam(sig: float) -> float:
+        return math.log(1.0 / sig - 1.0)  # flow half-logSNR log((1-σ)/σ)
+
+    # `flow`'s terminus, σ(t = 1/steps) — shift-aware, and the one geometric
+    # property that predicts this core's measured scheduler ranking.
+    sigma_end = float(schedule.t_to_sigma(schedule.multiplier / steps))
+    lam_top, lam_fin, lam_knee = lam(top_sigma), lam(sigma_end), lam(pump_end)
+    u = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    if lam_fin - lam_knee <= 1e-6:
+        lamv = lam_top + (lam_fin - lam_top) * u       # one band, pumped throughout
+    else:
+        u_b = pump_share
+        lamv = torch.where(u < u_b,
+                           lam_top + ((lam_knee - lam_top) / u_b) * u,
+                           lam_knee + ((lam_fin - lam_knee) / (1.0 - u_b)) * (u - u_b))
+    sigmas = (-lamv).sigmoid()
+    sigmas[0] = sigma_max
+    return append_zero(sigmas.to(device=device, dtype=dtype))
+
+
 # Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
 # / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
 # routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
@@ -540,6 +648,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "smoothstep": smoothstep_schedule,
     "beta": beta_schedule,
     "beta_mix": beta_mix_schedule,
+    "pump_dual": pump_dual_schedule,
 }
 
 
@@ -549,18 +658,21 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
                         bm_weight: float = 0.5,
                         bm_alpha1: float = 0.8, bm_beta1: float = 2.0,
                         bm_alpha2: float = 3.0, bm_beta2: float = 0.7,
+                        pump_end: float = 0.45, pump_share: float = 0.85,
                         device: torch.device | str = "cpu",
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Build a flow sigma schedule for the table/timestep-based schedulers by
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
     model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``infinity``,
     ``infinity_htds``, ``linear_quadratic``, ``smoothstep``, ``beta``,
-    ``beta_mix`` and ``kl_optimal``.
+    ``beta_mix``, ``pump_dual`` and ``kl_optimal``.
 
     ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint
     density; ``bm_*`` tune the ``beta_mix`` two-Beta mixture;
-    ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee.
-    All are ignored by the schedulers that don't take them."""
+    ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee;
+    ``pump_end``/``pump_share`` tune ``pump_dual``'s band join and the pumped
+    band's share of steps. All are ignored by the schedulers that don't take
+    them."""
     view = FlowSamplingView(shift, device=device, dtype=dtype)
     if scheduler == "kl_optimal":
         return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),
@@ -577,4 +689,6 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
                  "alpha2": bm_alpha2, "beta2": bm_beta2}
     elif scheduler == "linear_quadratic":
         extra = {"threshold_noise": threshold_noise}
+    elif scheduler == "pump_dual":
+        extra = {"pump_end": pump_end, "pump_share": pump_share}
     return fn(view, steps, device=device, dtype=dtype, **extra)
