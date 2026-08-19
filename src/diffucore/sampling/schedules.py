@@ -22,6 +22,7 @@ __all__ = [
     "exponential_schedule",
     "polyexponential_schedule",
     "kl_optimal_schedule",
+    "align_your_steps_schedule",
     "flow_matching_schedule",
     "flow_matching_dynamic_shift",
     "simple_schedule",
@@ -123,6 +124,92 @@ def kl_optimal_schedule(
     ramp = torch.arange(steps, device=device, dtype=dtype) / max(steps - 1, 1)
     sigmas = (ramp * math.atan(sigma_min) + (1.0 - ramp) * math.atan(sigma_max)).tan()
     return append_zero(sigmas)
+
+
+# AYS optimized schedules (Sabour, Fidler & Kreis, "Align Your Steps", ICML 2024,
+# arXiv:2404.14507, Table 3). The values are the noise levels σ(t_n)..σ(t_0) of
+# the 10-step schedule the paper optimized per model family — descending from
+# the training σ_max to the training σ_min, with the sampler appending the final
+# 0. These exact lists (SD1.5/SDXL, plus SVD/DeepFloyd for completeness) are the
+# ones shipped by NVIDIA's AYS project page and carried verbatim by the A1111 /
+# ComfyUI-AlignYourSteps integrations.
+_AYS_TABLES = {
+    "sd15": [14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.029],
+    "sdxl": [14.615, 6.315, 3.771, 2.181, 1.342, 0.862, 0.555, 0.380, 0.234, 0.113, 0.029],
+    "svd": [700.00, 54.5, 15.886, 7.977, 4.248, 1.789, 0.981, 0.403, 0.173, 0.034, 0.002],
+    "deepfloyd": [160.41, 8.081, 3.315, 1.885, 1.207, 0.785, 0.553, 0.293, 0.186, 0.030, 0.006],
+}
+
+
+def _loglinear_interp(t_steps, num_steps: int) -> torch.Tensor:
+    """Log-linear interpolation of a descending sequence to ``num_steps`` points
+    (NVIDIA's AYS ``loglinear_interp``): linear interpolation in ``log(sigma)``
+    over the normalized index, which preserves the geometric spacing of the
+    optimized points. Returns ``num_steps`` values, still descending, including
+    both original endpoints. Pure-torch equivalent of the reference ``np.interp``."""
+    t = torch.as_tensor(t_steps, dtype=torch.float64)
+    ys = t.flip(0).log()                                  # ascending in index
+    pos = torch.linspace(0, 1, num_steps, dtype=torch.float64) * (len(t) - 1)
+    lo = pos.floor().long()
+    hi = pos.ceil().long().clamp(max=len(t) - 1)
+    w = (pos - lo).clamp(0.0, 1.0)
+    interp = (ys[lo] * (1.0 - w) + ys[hi] * w).exp()
+    return interp.flip(0)
+
+
+def align_your_steps_schedule(
+    steps: int,
+    sigma_min: float | None = None,
+    sigma_max: float | None = None,
+    model: str = "sdxl",
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Align Your Steps (AYS) schedule (Sabour, Fidler & Kreis, ICML 2024,
+    arXiv:2404.14507).
+
+    The paper optimizes the *sampling schedule* — where the solver's steps land
+    on the trajectory — by minimizing an upper bound on the KL divergence
+    between the true and linearized generative SDEs, and shows the result beats
+    hand-crafted schedules (Karras, uniform, log-SNR) especially in the few-step
+    regime. The optimization itself needs the denoiser, so the practical
+    deliverable is the per-family schedule it produced; this scheduler stores
+    those 10-step tables (:data:`_AYS_TABLES`) and, for any other step count,
+    extends them by log-linear interpolation — the exact recipe the authors
+    recommend ("log-linearly interpolating the noise levels works well in
+    practice", NVIDIA AYS project page) and the one A1111 / the ComfyUI node
+    ship. The interpolation runs through all 11 table points (both endpoints
+    preserved), so at ``steps == 10`` the returned schedule is the log-linear
+    fit through the paper's Table 3 points ending at the table's σ_min — the
+    same output as A1111's ``get_align_your_steps_sigmas``. ``model`` selects
+    the family: ``"sd15"`` (SD 1.5), ``"sdxl"``, ``"svd"`` or ``"deepfloyd"``.
+    When ``sigma_min``/``sigma_max`` are supplied they are validated against
+    the table's range (a hard error if the model's schedule is far off, e.g. a
+    zero-terminal-SNR checkpoint with σ_max ~ 4500 — AYS was not optimized for
+    those); they are *not* used to rescale the schedule, matching the reference
+    integrations.
+
+    VE-only: the tables live on the variance-exploding σ scale (σ_max ≈ 14.6),
+    so this scheduler is for SD / SDXL, not the σ ∈ (0, 1] rectified-flow
+    families. Returns ``steps + 1`` descending sigmas ending at 0."""
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+    try:
+        table = _AYS_TABLES[model]
+    except KeyError:
+        raise ValueError(
+            f"unknown AYS model {model!r}; available: {sorted(_AYS_TABLES)}") from None
+    if sigma_min is not None and sigma_max is not None:
+        t_min, t_max = min(table), max(table)
+        if sigma_max > 1.05 * t_max or sigma_min < 0.95 * t_min:
+            raise ValueError(
+                f"AYS schedule for {model!r} spans σ ∈ [{t_min:g}, {t_max:g}]; "
+                f"model reports [{sigma_min:g}, {sigma_max:g}]. AYS is not "
+                f"defined for this noise range (zero-terminal-SNR checkpoints "
+                f"should use 'karras').")
+    sigmas = _loglinear_interp(table, steps)
+    return append_zero(sigmas.to(device=device, dtype=dtype))
 
 
 def flow_matching_schedule(

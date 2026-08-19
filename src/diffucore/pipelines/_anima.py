@@ -49,6 +49,7 @@ _ANIMA_SAMPLERS = {
     "res_multistep_ancestral", "gradient_estimation", "stork2", "infinity",
     "infinity_realism", "infinity_nano", "infinity_omega", "infinity_aether",
     "lms", "lcm",
+    "sa_solver", "sa_solver_pece",
     "secant", "secant_anneal",
     "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
     "cogent", "cogent3", "cogent3_pump",
@@ -58,6 +59,7 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "dpmpp_2m_anneal",
     "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump",
+    "sa_solver", "sa_solver_pece",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.

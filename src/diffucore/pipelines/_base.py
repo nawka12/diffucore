@@ -27,6 +27,7 @@ from ..sampling import (
     EpsScaling,
     ModelDenoiser,
     VScaling,
+    align_your_steps_schedule,
     ddim_uniform_schedule,
     exponential_schedule,
     get_sampler,
@@ -237,6 +238,28 @@ class _Pipeline:
 
     def _sigmas(self, scheduler, steps, device, dtype):
         """The full descending sigma schedule ([steps + 1] values, ending at 0)."""
+        if scheduler == "align_your_steps":
+            # AYS tables are per-family and defined on the standard VE range
+            # (σ_max ≈ 14.6); SD/SDXL only (flow families route through their
+            # own dispatch, which never offers it). A zero-terminal-SNR model
+            # has σ_max ~ 4500, outside the table — degrade to karras instead
+            # of erroring, matching how the engine degrades "oss".
+            if getattr(self.model.spec, "zero_terminal_snr", False):
+                return karras_schedule(
+                    steps,
+                    self.model.schedule.sigma_min.item(),
+                    self.model.schedule.sigma_max.item(),
+                    device=device,
+                    dtype=dtype,
+                )
+            return align_your_steps_schedule(
+                steps,
+                self.model.schedule.sigma_min.item(),
+                self.model.schedule.sigma_max.item(),
+                model="sdxl" if self.model.spec.architecture == "sdxl" else "sd15",
+                device=device,
+                dtype=dtype,
+            )
         if scheduler in _SCHEDULE_FROM_MODEL:
             return _SCHEDULE_FROM_MODEL[scheduler](
                 self.model.schedule, steps, device=device, dtype=dtype
@@ -244,7 +267,7 @@ class _Pipeline:
         try:
             schedule_fn = _SCHEDULERS[scheduler]
         except KeyError:
-            available = sorted([*_SCHEDULERS, *_SCHEDULE_FROM_MODEL])
+            available = sorted([*_SCHEDULERS, *_SCHEDULE_FROM_MODEL, "align_your_steps"])
             raise ValueError(f"unknown scheduler {scheduler!r}; available: {available}") from None
         return schedule_fn(
             steps,

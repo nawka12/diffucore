@@ -42,12 +42,13 @@ _FLUX_SAMPLERS = {
     "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
     "gradient_estimation", "stork2", "infinity", "lms", "lcm", "secant",
+    "sa_solver", "sa_solver_pece",
     "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "cogent", "cogent3",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
-    "cogent", "cogent3",
+    "cogent", "cogent3", "sa_solver", "sa_solver_pece",
 }
 # "ddim_uniform" omitted on flow: it starts below σ_max, clashing with the
 # pure-noise init. See schedules._FLOW_TABLE_SCHEDULERS.

@@ -58,6 +58,8 @@ __all__ = [
     "sample_lms",
     "sample_lcm",
     "sample_ddpm",
+    "sample_sa_solver",
+    "sample_sa_solver_pece",
     "sample_secant",
     "sample_secant_anneal",
     "sample_dpmpp_2m_anneal",
@@ -2999,6 +3001,222 @@ def sample_lcm(
     return x
 
 
+def _sa_solver_exponential_coeffs(s: torch.Tensor, t: torch.Tensor, solver_order: int,
+                                  tau_t: float) -> torch.Tensor:
+    """Exponential integrator coefficients for SA-Solver (see :func:`sample_sa_solver`).
+
+    Computes ``(1 + τ²)·∫_s^t exp((1+τ²)·x)·x^p dx`` with ``exp((1+τ²)·t)``
+    factored out, for ``p = 0..solver_order−1``, via the integration-by-parts
+    recurrence of the reference implementation (the recursion matrix is the
+    lower-triangular coefficient table from the SA-Solver codebase)."""
+    tau_mul = 1 + tau_t ** 2
+    h = t - s
+    p = torch.arange(solver_order, dtype=s.dtype, device=s.device)
+    # x^p·exp((1+τ²)·x)/(1+τ²) at x=s factored by exp((1+τ²)·t); the (1+τ²)
+    # cancels the outside factor.
+    product_terms_factored = (t ** p - s ** p * (-tau_mul * h).exp())
+    recursive_depth_mat = p.unsqueeze(1) - p.unsqueeze(0)
+    log_factorial = (p + 1).lgamma()
+    recursive_coeff_mat = log_factorial.unsqueeze(1) - log_factorial.unsqueeze(0)
+    if tau_t > 0:
+        recursive_coeff_mat = recursive_coeff_mat - (recursive_depth_mat * math.log(tau_mul))
+    signs = torch.where(recursive_depth_mat % 2 == 0, 1.0, -1.0)
+    recursive_coeff_mat = (recursive_coeff_mat.exp() * signs).tril()
+    return recursive_coeff_mat @ product_terms_factored
+
+
+def _sa_solver_simple_b_coeffs(sigma_next: torch.Tensor, curr_lambdas: torch.Tensor,
+                               lambda_s: torch.Tensor, lambda_t: torch.Tensor,
+                               tau_t: float, is_corrector_step: bool = False) -> torch.Tensor:
+    """The SA-Solver paper's closed-form order-2 b-coefficients (Appendix D),
+    for the ``simple_order_2`` fast path. Returns ``[b_2, b_1]``."""
+    tau_mul = 1 + tau_t ** 2
+    h = lambda_t - lambda_s
+    alpha_t = sigma_next * lambda_t.exp()
+    if is_corrector_step:
+        b_1 = alpha_t * (0.5 * tau_mul * h)
+        b_2 = alpha_t * (-h * tau_mul).expm1().neg() - b_1
+    else:
+        b_2 = alpha_t * (0.5 * tau_mul * h ** 2) / (curr_lambdas[-2] - lambda_s)
+        b_1 = alpha_t * (-h * tau_mul).expm1().neg() - b_2
+    return torch.stack([b_2, b_1])
+
+
+def _sa_solver_b_coeffs(sigma_next: torch.Tensor, curr_lambdas: torch.Tensor,
+                        lambda_s: torch.Tensor, lambda_t: torch.Tensor,
+                        tau_t: float, simple_order_2: bool = False,
+                        is_corrector_step: bool = False) -> torch.Tensor:
+    """SA-Solver's ``b_i`` coefficients (paper eqs. 15 and 18), data-prediction
+    (x0) form. The solver order is the number of half-logSNR points in
+    ``curr_lambdas``: the coefficients are the Lagrange-basis integrals of the
+    exponential integrator over the step, found by solving a Vandermonde
+    system against the analytically-integrated exponential terms."""
+    num_timesteps = curr_lambdas.shape[0]
+    if simple_order_2 and num_timesteps == 2:
+        return _sa_solver_simple_b_coeffs(sigma_next, curr_lambdas, lambda_s,
+                                          lambda_t, tau_t, is_corrector_step)
+    exp_integral_coeffs = _sa_solver_exponential_coeffs(
+        lambda_s, lambda_t, num_timesteps, tau_t)
+    vandermonde_matrix_T = torch.vander(curr_lambdas, num_timesteps, increasing=True).T
+    lagrange_integrals = torch.linalg.solve(vandermonde_matrix_T, exp_integral_coeffs)
+    alpha_t = sigma_next * lambda_t.exp()
+    return alpha_t * lagrange_integrals
+
+
+def _sa_solver_tau_interval(sigmas: torch.Tensor, eta: float):
+    """Default SA-Solver stochasticity window: constant ``eta`` on the middle
+    20%–80% of the run, zero elsewhere.
+
+    ComfyUI builds the same band through the model's ``percent_to_sigma``; here
+    it is read off the actual schedule instead (``start = sigmas[round(0.2·n)]``,
+    ``end = sigmas[round(0.8·n)]``), which is the same geometry and needs no
+    model access. ``eta <= 0`` makes the whole run deterministic (pure ODE)."""
+    if eta <= 0:
+        return lambda sigma: 0.0
+    n = len(sigmas) - 1
+    start_sigma = float(sigmas[min(n, round(0.2 * n))])
+    end_sigma = float(sigmas[min(n, round(0.8 * n))])
+    return lambda sigma: float(eta) if start_sigma >= float(sigma) >= end_sigma else 0.0
+
+
+def sample_sa_solver(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    tau_func=None,
+    s_noise: float = 1.0,
+    predictor_order: int = 3,
+    corrector_order: int = 4,
+    use_pece: bool = False,
+    simple_order_2: bool = False,
+    eta: float = 1.0,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """SA-Solver: Stochastic Adams predictor-corrector solver (Xue et al.,
+    "SA-Solver: Stochastic Adams Solver for Fast Sampling of Diffusion
+    Models", NeurIPS 2023, arXiv:2309.05019).
+
+    A multi-step Adams solver in half-logSNR space, data-prediction (x0) form,
+    with a predictor-corrector structure: each step first *corrects* the
+    current latent using all available x0 estimates (re-deriving it more
+    accurately than the prediction), then *predicts* the next latent with the
+    exponential-integrator coefficients. The stochastic (SDE) form re-injects
+    Gaussian noise with strength ``τ(sigma)`` on a middle band of the schedule
+    (default 20%–80%, via :func:`_sa_solver_tau_interval`); ``eta <= 0``
+    recovers the deterministic ODE solver.
+
+    Solver order grows with history: the predictor/corrector use the last
+    ``predictor_order`` / ``corrector_order`` x0 estimates, ramping from
+    first order on the opening steps and winding back down near σ → 0 (the
+    reference's ``lower_order_to_end`` stability rule; our schedules always end
+    at exactly 0, so it is always active). ``use_pece=True`` adds the final
+    "E" — a re-evaluation of the model at the corrected state — which costs one
+    extra NFE per corrected step in exchange for accuracy (registered as
+    ``sa_solver_pece``). ``simple_order_2`` uses the paper's closed-form
+    second-order coefficients instead of solving the Vandermonde system.
+
+    Flow-aware via the shared half-logSNR map: ``model_type="flow"`` (Anima /
+    FLUX) uses ``log((1−σ)/σ)`` with ``shift`` offsetting the first σ off 1.0,
+    ``"ve"`` (SD / SDXL) uses ``−log σ`` — the same convention as the DPM++
+    SDE family. Noise is seeded Gaussian (``generator``), matching every other
+    stochastic sampler in this registry.
+
+    Reference: the official SA-Solver codebase (github.com/scxue/SA-Solver),
+    as carried in ComfyUI's ``comfy/k_diffusion/sa_solver.py``. Two deliberate
+    deviations: the tau window is read off the schedule (see
+    :func:`_sa_solver_tau_interval`) instead of the model's
+    ``percent_to_sigma``, and ``s_noise`` is not scaled by a model ``noise_scale``
+    (this engine has none; the parameter is the effective scale)."""
+    if len(sigmas) <= 1:
+        return x
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    lambdas = lambda_fn(sigmas)
+
+    if tau_func is None:
+        tau_func = _sa_solver_tau_interval(sigmas, eta)
+
+    max_used_order = max(predictor_order, corrector_order)
+    x_pred = x
+    h = 0.0
+    tau_t = 0.0
+    noise = 0.0
+    pred_list = []
+    lower_order_to_end = bool(sigmas[-1] == 0)
+
+    for i in range(len(sigmas) - 1):
+        denoised = model(x_pred, sigmas[i] * s_in)
+        if callback is not None:
+            callback(i, sigmas[i], x_pred, denoised)
+        pred_list.append(denoised)
+        pred_list = pred_list[-max_used_order:]
+
+        predictor_order_used = min(predictor_order, len(pred_list))
+        if i == 0 or (bool(sigmas[i + 1] == 0) and not use_pece):
+            corrector_order_used = 0
+        else:
+            corrector_order_used = min(corrector_order, len(pred_list))
+        if lower_order_to_end:
+            predictor_order_used = min(predictor_order_used, len(sigmas) - 2 - i)
+            corrector_order_used = min(corrector_order_used, len(sigmas) - 1 - i)
+
+        # Corrector: re-derive the current state at sigma[i] from the x0 history.
+        if corrector_order_used == 0:
+            x = x_pred
+        else:
+            curr_lambdas = lambdas[i - corrector_order_used + 1:i + 1]
+            b_coeffs = _sa_solver_b_coeffs(
+                sigmas[i], curr_lambdas, lambdas[i - 1], lambdas[i],
+                tau_t, simple_order_2, True,
+            )
+            pred_mat = torch.stack(pred_list[-corrector_order_used:], dim=1)
+            corr_res = torch.tensordot(pred_mat, b_coeffs, dims=([1], [0]))
+            x = sigmas[i] / sigmas[i - 1] * (-(tau_t ** 2) * h).exp() * x + corr_res
+            if tau_t > 0 and s_noise > 0:
+                x = x + noise
+            if use_pece:
+                denoised = model(x, sigmas[i] * s_in)
+                pred_list[-1] = denoised
+
+        # Predictor: exponential-integrator step to sigma[i+1].
+        if bool(sigmas[i + 1] == 0):
+            x_pred = denoised
+        else:
+            tau_t = tau_func(sigmas[i + 1])
+            curr_lambdas = lambdas[i - predictor_order_used + 1:i + 1]
+            b_coeffs = _sa_solver_b_coeffs(
+                sigmas[i + 1], curr_lambdas, lambdas[i], lambdas[i + 1],
+                tau_t, simple_order_2, False,
+            )
+            pred_mat = torch.stack(pred_list[-predictor_order_used:], dim=1)
+            pred_res = torch.tensordot(pred_mat, b_coeffs, dims=([1], [0]))
+            h = lambdas[i + 1] - lambdas[i]
+            x_pred = sigmas[i + 1] / sigmas[i] * (-(tau_t ** 2) * h).exp() * x + pred_res
+            if tau_t > 0 and s_noise > 0:
+                noise = _noise_like(x_pred, generator) * sigmas[i + 1] \
+                    * (-2 * tau_t ** 2 * h).expm1().neg().sqrt() * s_noise
+                x_pred = x_pred + noise
+    return x_pred
+
+
+def sample_sa_solver_pece(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    **kwargs,
+) -> torch.Tensor:
+    """SA-Solver in PECE mode: predict, evaluate, correct, and re-evaluate the
+    corrected state (``use_pece=True`` in :func:`sample_sa_solver`). The extra
+    evaluation per corrected step buys accuracy; see the main docstring."""
+    kwargs["use_pece"] = True
+    return sample_sa_solver(model, x, sigmas, **kwargs)
+
+
 def sample_ddpm(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
                 generator: Optional[torch.Generator] = None, callback: Callback = None) -> torch.Tensor:
     """DDPM ancestral sampling (Ho et al., 2020), expressed in Karras σ space via
@@ -3054,6 +3272,8 @@ SAMPLERS: dict[str, Denoiser] = {
     "lms": sample_lms,
     "lcm": sample_lcm,
     "ddpm": sample_ddpm,
+    "sa_solver": sample_sa_solver,
+    "sa_solver_pece": sample_sa_solver_pece,
     "secant": sample_secant,
     "secant_anneal": sample_secant_anneal,
     "dpmpp_2m_anneal": sample_dpmpp_2m_anneal,

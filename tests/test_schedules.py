@@ -94,6 +94,53 @@ def test_kl_optimal_endpoints_and_descent():
     assert abs(sig[-2].item() - 0.0292) < 1e-3
 
 
+# ── Align Your Steps (AYS) ───────────────────────────────────────────
+# Sabour, Fidler & Kreis, "Align Your Steps", ICML 2024 (arXiv:2404.14507),
+# Table 3: the paper's per-family optimized 10-step noise levels, extended to
+# arbitrary step counts by the authors' recommended log-linear interpolation.
+# The reference values below are the output of A1111's
+# `get_align_your_steps_sigmas` (numpy loglinear_interp + trailing 0), which
+# this implementation matches bit-for-bit.
+
+
+def test_align_your_steps_endpoints_and_descent():
+    sig = S.align_your_steps_schedule(20, sigma_min=0.029, sigma_max=14.615, model="sdxl")
+    assert sig.shape[0] == 21
+    assert sig[-1].item() == 0.0
+    assert torch.all(sig[:-1] >= sig[1:])
+    assert torch.isfinite(sig).all()
+    assert abs(sig[0].item() - 14.615) < 1e-4          # table σ_max preserved
+    assert abs(sig[-2].item() - 0.029) < 1e-4          # table σ_min preserved
+
+
+def test_align_your_steps_10_matches_a1111_reference():
+    # The 10-step SDXL schedule as produced by A1111 (log-linear fit through
+    # the paper's 11 table points, then the trailing 0).
+    expected = [14.615, 5.963397, 3.338965, 1.855046, 1.102326, 0.674959,
+                0.431142, 0.260621, 0.122519, 0.029, 0.0]
+    sig = S.align_your_steps_schedule(10, sigma_min=0.029, sigma_max=14.615, model="sdxl")
+    assert torch.allclose(sig, torch.tensor(expected), atol=1e-5)
+
+
+def test_align_your_steps_sd15_differs_from_sdxl():
+    a = S.align_your_steps_schedule(10, sigma_min=0.029, sigma_max=14.615, model="sd15")
+    b = S.align_your_steps_schedule(10, sigma_min=0.029, sigma_max=14.615, model="sdxl")
+    assert not torch.allclose(a, b, atol=1e-6)
+    assert abs(a[0].item() - 14.615) < 1e-4
+    assert abs(a[-2].item() - 0.029) < 1e-4
+
+
+def test_align_your_steps_invalid_args_raise():
+    import pytest
+    with pytest.raises(ValueError):
+        S.align_your_steps_schedule(0, model="sdxl")
+    with pytest.raises(ValueError):
+        S.align_your_steps_schedule(10, model="not_a_model")
+    # A zero-terminal-SNR range (σ_max ~ 4500) is far outside the AYS tables.
+    with pytest.raises(ValueError):
+        S.align_your_steps_schedule(10, sigma_min=0.03, sigma_max=4500.0, model="sdxl")
+
+
 def _flow_view(shift=3.0):
     return S.FlowSamplingView(shift)
 

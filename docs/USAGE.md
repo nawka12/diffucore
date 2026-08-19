@@ -47,7 +47,8 @@ image = TextToImage(model)(
   `dpm_2_ancestral`, `dpmpp_2s_ancestral`, `dpmpp_2m`, `dpmpp_2m_sde`,
   `dpmpp_2m_sde_heun`, `dpmpp_sde`, `dpmpp_3m_sde`, `ipndm`, `ipndm_v`,
   `res_multistep`, `res_multistep_ancestral`, `gradient_estimation`, `lms`,
-  `er_sde`, `lcm`, `secant`, plus `ddpm` (SD/SDXL only — a VP/VE sampler) and
+  `er_sde`, `lcm`, `sa_solver`, `sa_solver_pece`, `secant`, plus `ddpm`
+  (SD/SDXL only — a VP/VE sampler) and
   `secant_anneal` (Anima only — σ-annealed ancestral burn-in at high σ handing
   off to `secant`'s 2nd-order x0 refinement as σ→0; spans `euler_ancestral_anneal`
   at `curvature=0` and deterministic `secant` at `eta_max=0`), and
@@ -72,15 +73,28 @@ image = TextToImage(model)(
   damps itself back to cogent's 2nd-order behaviour instead of amplifying the
   error. `psi_2` has no floor — the term is never load-bearing. Prefer 24+
   steps).
+  `sa_solver` (all families — a stochastic Adams predictor-corrector multistep
+  in half-logSNR space, Xue et al., NeurIPS 2023, arXiv:2309.05019: each step
+  re-derives the current latent from the x0 history, then predicts the next
+  with exponential-integrator coefficients; Gaussian noise is re-injected on a
+  middle 20–80% band of the schedule, `eta=0` is the deterministic ODE.
+  Strong at low step counts). `sa_solver_pece` is the same solver with the
+  final "E" — a re-evaluation of the corrected state — for a few extra NFEs of
+  accuracy.
   Ancestral samplers are rectified-flow-aware on Anima/FLUX.
 - **Schedulers** — `karras`, `exponential`, `polyexponential`, `kl_optimal`,
-  `sgm_uniform`, `simple`, `normal`, `ddim_uniform`, `linear_quadratic`
-  (SD/SDXL); `flow` (default), `flow_dyn`, `oss`, `sgm_uniform`, `simple`,
+  `align_your_steps`, `sgm_uniform`, `simple`, `normal`, `ddim_uniform`,
+  `linear_quadratic` (SD/SDXL); `flow` (default), `flow_dyn`, `oss`,
+  `sgm_uniform`, `simple`,
   `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep`, `beta`,
   `beta_mix` (Anima); `flux` (default), `flow`,
   `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
   `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
   pipelines' σ_max = 1 init assumes).
+  `align_your_steps` (SD/SDXL) is the AYS schedule (Sabour et al., ICML 2024,
+  arXiv:2404.14507): the paper's per-family optimized 10-step noise tables,
+  extended to any step count by log-linear interpolation. Best in the few-step
+  regime (~10–20 steps); zero-terminal-SNR models fall back to `karras`.
   `flow_dyn` is `flow` with a Flux-style resolution-aware shift (auto-derived
   from the image's token count; the `shift` value is ignored — and the UI has
   no shift control, so plain `flow` always runs shift=3.0). `oss` is a

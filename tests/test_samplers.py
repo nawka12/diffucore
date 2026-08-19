@@ -358,6 +358,96 @@ def test_ddpm_finite_and_converges():
     assert torch.allclose(out, target, atol=0.1)
 
 
+# ── SA-SOLVER ─────────────────────────────────────────────────────────
+# Xue et al., "SA-Solver: Stochastic Adams Solver for Fast Sampling of
+# Diffusion Models", NeurIPS 2023 (arXiv:2309.05019), as carried in ComfyUI's
+# comfy/k_diffusion/sa_solver.py. Predictor-corrector multistep in half-logSNR
+# space, data-prediction form; with a constant-x0 denoiser every consistent
+# solver lands on target (the final step clean-snaps), and eta=0 is the
+# deterministic ODE form.
+
+
+@pytest.mark.parametrize("model_type", ["ve", "flow"])
+def test_sa_solver_deterministic_lands_on_target(model_type):
+    target = torch.full((1, 4, 4, 4), 0.2)
+    sigmas = _flow_sigmas() if model_type == "flow" else _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    out = K.sample_sa_solver(const_denoiser(target), x_init.clone(), sigmas,
+                             eta=0.0, model_type=model_type, shift=3.0)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+@pytest.mark.parametrize("model_type", ["ve", "flow"])
+def test_sa_solver_stochastic_lands_clean_and_is_seed_reproducible(model_type):
+    # The default stochastic form re-injects noise on the middle band, but the
+    # final step (σ_next == 0) clean-snaps to the constant prediction.
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = _flow_sigmas() if model_type == "flow" else _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+
+    def run(seed):
+        return K.sample_sa_solver(
+            const_denoiser(target), x_init.clone(), sigmas,
+            generator=torch.Generator().manual_seed(seed),
+            model_type=model_type, shift=3.0,
+        )
+
+    a, b = run(7), run(7)
+    assert torch.isfinite(a).all()
+    assert torch.equal(a, b)
+    assert torch.allclose(a, target, atol=1e-4)
+
+
+def test_sa_solver_stochastic_differs_from_deterministic_midtrajectory():
+    # eta=0 (pure ODE) must actually differ from the stochastic run before the
+    # clean-snap, i.e. the SDE re-injection is live. Capture the last non-zero
+    # sigma via the callback.
+    sigmas = _flow_sigmas()
+    x_init = torch.randn(1, 4, 4, 4)
+
+    def model(x, sigma):  # σ-dependent so the trajectory is not trivially linear
+        return 0.3 * torch.tanh(x)
+
+    def run(eta, seed=1):
+        last = {}
+        K.sample_sa_solver(
+            model, x_init.clone(), sigmas, eta=eta,
+            generator=torch.Generator().manual_seed(seed), model_type="flow", shift=3.0,
+            callback=lambda i, s, x, d: last.__setitem__("x", x.clone()),
+        )
+        return last["x"]
+
+    assert not torch.allclose(run(0.0), run(1.0), atol=1e-3)
+
+
+def test_sa_solver_pece_lands_on_target_and_registered():
+    target = torch.zeros(1, 4, 4, 4)
+    sigmas = _ve_sigmas()
+    x_init = torch.randn(1, 4, 4, 4) * sigmas[0]
+    out = K.sample_sa_solver_pece(const_denoiser(target), x_init.clone(), sigmas,
+                                  generator=torch.Generator().manual_seed(0), model_type="ve")
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+    assert K.get_sampler("sa_solver_pece") is K.sample_sa_solver_pece
+
+
+def test_sa_solver_simple_order_2_path_is_finite():
+    # The paper's closed-form order-2 b-coefficients (simple_order_2) must not
+    # blow up and must still land on the constant prediction.
+    target = torch.full((1, 4, 4, 4), 0.1)
+    sigmas = _flow_sigmas()
+    x_init = torch.randn(1, 4, 4, 4)
+    out = K.sample_sa_solver(const_denoiser(target), x_init.clone(), sigmas,
+                             eta=0.0, simple_order_2=True, model_type="flow", shift=3.0)
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out, target, atol=1e-4)
+
+
+def test_sa_solver_registered_in_sampler_table():
+    assert K.get_sampler("sa_solver") is K.sample_sa_solver
+
+
 # ── SECANT-ANNEAL ─────────────────────────────────────────────────────
 
 
