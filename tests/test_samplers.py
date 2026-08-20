@@ -964,7 +964,7 @@ def test_cogent_gate_of_one_equals_dpmpp_2m_anneal(monkeypatch):
     sigmas = S.flow_matching_schedule(16, shift=3.0)
     x_init = torch.randn(1, 4, 8, 8)
 
-    monkeypatch.setattr(K, "_coherence_gate", lambda d, od, h: torch.ones(
+    monkeypatch.setattr(K, "_coherence_gate", lambda d, od, h, **kw: torch.ones(
         d.shape[0], *([1] * (d.ndim - 1))))
     got = _last_nonzero_latent(K.sample_cogent, model, x_init, sigmas,
                                eta_max=0.0, model_type="flow", shift=3.0)
@@ -987,7 +987,7 @@ def test_cogent_step_size_floor_keeps_the_correction_alive(monkeypatch):
 
     real_gate = K._coherence_gate
     monkeypatch.setattr(K, "_coherence_gate",
-                        lambda d, od, h: real_gate(d, -d, h))   # rho = -1 ⇒ floor only
+                        lambda d, od, h, **kw: real_gate(d, -d, h))   # rho = -1 ⇒ floor only
     got = _last_nonzero_latent(K.sample_cogent, model, x_init, sigmas,
                                eta_max=0.0, model_type="flow", shift=3.0)
 
@@ -1069,7 +1069,7 @@ def test_cogent_registered_in_sampler_table():
 
 
 def _curv_gate_ones_or_zero(value):
-    return lambda d, od: torch.full((d.shape[0], *([1] * (d.ndim - 1))), value)
+    return lambda d, od, **kw: torch.full((d.shape[0], *([1] * (d.ndim - 1))), value)
 
 
 def test_cogent3_curvature_gate_maps_rho_to_wiener_factor():
@@ -1116,7 +1116,7 @@ def test_cogent3_gate_of_one_equals_dpmpp_3m_sde_deterministic(monkeypatch):
     x_init = torch.randn(1, 4, 8, 8)
 
     monkeypatch.setattr(K, "_coherence_gate",
-                        lambda d, od, h: torch.ones(d.shape[0], *([1] * (d.ndim - 1))))
+                        lambda d, od, h, **kw: torch.ones(d.shape[0], *([1] * (d.ndim - 1))))
     monkeypatch.setattr(K, "_cogent3_curvature_gate", _curv_gate_ones_or_zero(1.0))
     got = _last_nonzero_latent(K.sample_cogent3, model, x_init, sigmas,
                                eta_max=0.0, model_type="flow", shift=3.0)
@@ -2164,3 +2164,280 @@ def test_infinity_aether_absolute_thresholds_land_differently_per_family():
 
 def test_infinity_aether_registered_in_sampler_table():
     assert K.get_sampler("infinity_aether") is K.sample_infinity_aether
+
+
+# ── COGENT4: measurement instrumentation + the per-channel gate ────────
+# The [CDX]-/[CLC]-approved subset of the cogent4 design (COGENT-IMPROVE.md):
+# (1) the raw statistics the 2nd-order gate already computes are exposed via
+# `stats_out` for the measurement-falsification harness — `v_est`,
+# `s_est`, pre-floor `rho`, `psi_linear`, and a `floor_active` flag — and
+# (2) `reduce="per_channel"` scales each channel of the correction by its own
+# shrink (a *different* estimator from the global cosine, default-off;
+# `reduce="all"` is the shipped gate bit-for-bit). Lag-2, `v_model`, and the
+# closed-loop scheduler are deliberately NOT implemented.
+
+
+def _constant_increment_tensors(seed, D=4096, s_norm=1.0, v=0.35):
+    # s_i = s_{i-1} = s (constant increment), n_i iid of energy v:
+    # D_i = s + n_i - n_{i-1}, D_{i-1} = s + n_{i-1} - n_{i-2}.
+    g = torch.Generator().manual_seed(seed)
+    s = torch.randn(D, generator=g, dtype=torch.float64)
+    s = s / s.norm() * s_norm
+    n = lambda: torch.randn(D, generator=g, dtype=torch.float64) * (v / D) ** 0.5
+    n2, n1, n0 = n(), n(), n()
+    return s, (s + n2 - n1), (s + n1 - n0)
+
+
+def test_coherence_gate_stats_match_the_model():
+    # Under the gate's own model (constant-increment signal, iid noise of energy
+    # v), stats_out must read the truth: rho=(S-v)/(S+2v), v_est→v, s_est→S,
+    # psi_linear→S/(S+2v), and the floor inactive at fine h.
+    s, diff, old_diff = _constant_increment_tensors(0)
+    stats = {}
+    psi = K._coherence_gate(diff.unsqueeze(0), old_diff.unsqueeze(0), _TINY_H,
+                            stats_out=stats)
+    S, v = 1.0, 0.35
+    assert float(stats["v_est"]) == pytest.approx(v, abs=0.05)
+    assert float(stats["s_est"]) == pytest.approx(S, abs=0.05)
+    assert float(stats["rho"]) == pytest.approx((S - v) / (S + 2 * v), abs=0.02)
+    assert float(stats["psi_linear"]) == pytest.approx(S / (S + 2 * v), abs=0.02)
+    assert float(psi) == pytest.approx(S / (S + 2 * v), abs=0.02)
+    assert not stats["floor_active"] and not stats["bootstrap"]
+
+
+def test_coherence_gate_stats_floor_flag_and_bootstrap():
+    # A huge h pushes the floor above the Wiener reading: floor_active must flip,
+    # and the returned gate must equal the floor. The no-history bootstrap step
+    # reports floor_active with no statistics at all.
+    s, diff, old_diff = _constant_increment_tensors(1)
+    h = torch.tensor(3.0, dtype=torch.float64)          # floor ≈ 0.95
+    stats = {}
+    psi = K._coherence_gate(diff.unsqueeze(0), old_diff.unsqueeze(0), h,
+                            stats_out=stats)
+    floor = float((-h).expm1().neg())
+    assert stats["floor_active"]
+    assert float(psi) == pytest.approx(floor)
+    assert float(stats["psi_linear"]) < floor           # floor really won
+    stats2 = {}
+    psi2 = K._coherence_gate(diff.unsqueeze(0), None, h, stats_out=stats2)
+    assert stats2["bootstrap"] and stats2["floor_active"]
+    assert float(psi2) == pytest.approx(floor)
+
+
+def test_coherence_gate_stats_do_not_perturb_the_gate():
+    # stats_out is write-only: the returned gate must be bit-identical with and
+    # without collection. Logged tensors must also be detached so collecting a
+    # run cannot retain one denoiser graph per sampled step.
+    torch.manual_seed(3)
+    a = torch.randn(3, 4, 8, 8, dtype=torch.float32, requires_grad=True)
+    b = torch.randn(3, 4, 8, 8, dtype=torch.float32, requires_grad=True)
+    h = torch.tensor(0.2, dtype=torch.float32)
+    plain = K._coherence_gate(a, b, h)
+    stats = {}
+    logged = K._coherence_gate(a, b, h, stats_out=stats)
+    assert torch.equal(plain, logged)
+    assert logged.requires_grad
+    assert all(not value.requires_grad for value in stats.values()
+               if isinstance(value, torch.Tensor))
+    pc_plain = K._coherence_gate(a, b, h, reduce="per_channel")
+    pc_stats = {}
+    pc_logged = K._coherence_gate(a, b, h, reduce="per_channel", stats_out=pc_stats)
+    assert torch.equal(pc_plain, pc_logged)
+    assert all(not value.requires_grad for value in pc_stats.values()
+               if isinstance(value, torch.Tensor))
+
+
+def test_coherence_gate_per_channel_is_a_different_estimator():
+    # The [CDX]/[CLC] counterexample: two channels both aligned with cosine 1,
+    # but channel-norm vectors swap between the two differences. Per-channel
+    # gates are [1, 1]; the concatenated global cosine is ~0.02 ⇒ psi ≈ 0.347.
+    u = torch.randn(1, 8, 16, dtype=torch.float64)
+    u = u / u.norm()
+    w = torch.randn(1, 8, 16, dtype=torch.float64)
+    w = w - (u * w).sum() * u
+    w = w / w.norm()
+    d = torch.cat([1.0 * u, 100.0 * w], dim=0).unsqueeze(0)
+    od = torch.cat([100.0 * u, 1.0 * w], dim=0).unsqueeze(0)
+    pc = K._coherence_gate(d, od, _TINY_H, reduce="per_channel")
+    g = K._coherence_gate(d, od, _TINY_H)
+    assert torch.allclose(pc, torch.ones(1, 2, 1, 1, dtype=torch.float64), atol=1e-6)
+    assert float(g) == pytest.approx((1 + 2 * 0.02) / 3, abs=0.02)  # global ≈ 0.347
+    assert not torch.allclose(pc, g, atol=0.2)                     # genuinely different
+
+
+def test_coherence_gate_per_channel_shape_reduce_all_pinned_and_reshape():
+    # per_channel on a 4-D latent → [B, C, 1, 1]; non-4-D falls back to "all"
+    # (the documented non-4-D path); reduce="all" on the [B, 4, 8, 16] reshape
+    # is bit-identical to [B, 512] (the same 512 elements, the same reduction).
+    torch.manual_seed(4)
+    a = torch.randn(2, 4, 8, 16, dtype=torch.float32)
+    b = torch.randn(2, 4, 8, 16, dtype=torch.float32)
+    h = torch.tensor(0.1, dtype=torch.float32)
+    pc = K._coherence_gate(a, b, h, reduce="per_channel")
+    assert pc.shape == (2, 4, 1, 1)
+    fallback = K._coherence_gate(a.reshape(2, -1), b.reshape(2, -1), h,
+                                 reduce="per_channel")
+    assert fallback.shape == (2, 1)
+    assert torch.equal(fallback, K._coherence_gate(a.reshape(2, -1),
+                                                   b.reshape(2, -1), h))
+    # Same estimator, same 512 elements in the same order: the 4-D "all"
+    # reduction is bit-identical to the flat reduction (measured across the
+    # test suite's seeds). Compare flattened — torch.equal/allclose on the
+    # differently-shaped views is a shape check, not a value check.
+    assert torch.equal(K._coherence_gate(a, b, h).flatten(),
+                       K._coherence_gate(a.reshape(2, -1), b.reshape(2, -1), h).flatten())
+    with pytest.raises(ValueError):
+        K._coherence_gate(a, b, h, reduce="bogus")
+
+
+def test_cogent_gate_reduce_validation_is_eager_on_bootstrap_and_noop_runs():
+    # Invalid modes must not be accepted merely because the gate has no old
+    # difference yet (or because a sampler has no steps). Validation that only
+    # happens on the full-history branch makes the same argument fail or pass
+    # depending on the schedule length.
+    a = torch.randn(1, 4, 8, 8)
+    h = torch.tensor(0.1)
+    with pytest.raises(ValueError, match="reduce must be"):
+        K._coherence_gate(a, None, h, reduce="bogus")
+    with pytest.raises(ValueError, match="reduce must be"):
+        K._cogent3_curvature_gate(a, None, reduce="bogus")
+
+    sigmas = torch.ones(1)
+    model = const_denoiser(torch.zeros_like(a))
+    with pytest.raises(ValueError, match="reduce must be"):
+        K.sample_cogent(model, a, sigmas, gate_reduce="bogus")
+    with pytest.raises(ValueError, match="reduce must be"):
+        K.sample_cogent3(model, a, sigmas, gate_reduce="bogus")
+
+
+def test_cogent3_gate_reduce_all_reshape_pin():
+    # The per-channel toy reshapes the [B, 512] latent to [B, 4, 8, 16]; with
+    # gate_reduce="all" the sampler must reproduce the flat-latent run to float
+    # precision (same estimator, same elements; only torch's reduction-tree
+    # order differs — see the shape/reshape gate test above).
+    torch.manual_seed(7)
+    target = torch.randn(1, 4, 8, 8)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_flat = torch.randn(1, 4, 8, 8)
+
+    def run(x, tgt, **kw):
+        return _last_nonzero_latent(
+            K.sample_cogent3, _anneal_sigma_dependent_model(tgt), x, sigmas,
+            model_type="flow", shift=3.0, **kw)
+
+    a = run(x_flat, target, gate_reduce="all", eta_max=0.0)
+    b = run(x_flat, target, eta_max=0.0)        # default == "all"
+    c = run(x_flat.reshape(1, 2, 8, 16), target.reshape(1, 2, 8, 16),
+            gate_reduce="all", eta_max=0.0)
+    assert torch.equal(a, b)                    # explicit "all" == default, bit-for-bit
+    assert torch.equal(a.flatten(), c.flatten())  # reshape pin, bit-for-bit
+    assert c.shape == (1, 2, 8, 16)
+
+
+# ── Stage A: the measurement-falsification oracles (COGENT-IMPROVE.md [CLC] 7) ─
+# The lag-1 estimator must be checked against the truth *under its own model*
+# before it is read against the real toy. A1 pins the published Wiener identity
+# (constant-increment signal, homoscedastic noise); A2 scores the raw cosine
+# against the heteroscedastic oracle; A3 exposes the signal term that a naive
+# target would misread as estimator bias.
+
+def _draw_diff(signal_i, signal_im1, noise_energy, seed, D=4096):
+    # D_i = s_i + n_i - n_{i-1} given s_i and s_{i-1} (through the shared n_{i-1}).
+    g = torch.Generator().manual_seed(seed)
+    v = lambda e: torch.randn(D, generator=g, dtype=torch.float64) * (e / D) ** 0.5
+    n_i, n_im1, n_im2 = v(noise_energy[2]), v(noise_energy[1]), v(noise_energy[0])
+    return (signal_i + n_i - n_im1), (signal_im1 + n_im1 - n_im2)
+
+
+def test_stage_a1_wiener_identity():
+    # Constant-increment signal (s_i = s_{i-1} = s, S = 1) and homoscedastic
+    # noise (v = 0.35): mean v_est → v and mean psi → S/(S+2v), i.e. the gate's
+    # own published identity, over 200 seeds.
+    s = torch.randn(4096, dtype=torch.float64)
+    s = s / s.norm()
+    v = 0.35
+    vests, psis = [], []
+    for seed in range(200):
+        diff, old_diff = _draw_diff(s, s, (v, v, v), seed)
+        stats = {}
+        K._coherence_gate(diff.unsqueeze(0), old_diff.unsqueeze(0), _TINY_H,
+                          stats_out=stats)
+        vests.append(float(stats["v_est"]))
+        psis.append(float(stats["psi_linear"]))
+    assert sum(vests) / len(vests) == pytest.approx(v, rel=0.02)
+    assert sum(psis) / len(psis) == pytest.approx(1.0 / (1.0 + 2.0 * v), rel=0.02)
+
+
+def test_stage_a2_heteroscedastic_oracle():
+    # Stationary signal energy S, unequal per-step noise energies v_i. The raw
+    # cosine concentrates on the heteroscedastic oracle (not the homoscedastic
+    # S-v form): rho = (S - v_{i-1}) / sqrt((S+v_i+v_{i-1})(S+v_{i-1}+v_{i-2})).
+    s = torch.randn(4096, dtype=torch.float64)
+    s = s / s.norm()
+    vim2, vim1, vi = 0.20, 0.50, 0.90
+    oracle = (1.0 - vim1) / ((1.0 + vi + vim1) * (1.0 + vim1 + vim2)) ** 0.5
+    rhos = []
+    for seed in range(200):
+        diff, old_diff = _draw_diff(s, s, (vim2, vim1, vi), seed)
+        stats = {}
+        K._coherence_gate(diff.unsqueeze(0), old_diff.unsqueeze(0), _TINY_H,
+                          stats_out=stats)
+        rhos.append(float(stats["rho"]))
+    assert sum(rhos) / len(rhos) == pytest.approx(oracle, abs=0.01)
+    # ... and the homoscedastic target is the wrong oracle at this spread.
+    homosced = (1.0 - vi) / (1.0 + 2.0 * vi)
+    assert abs(sum(rhos) / len(rhos) - oracle) < abs(sum(rhos) / len(rhos) - homosced)
+
+
+def test_stage_a3_signal_bias_expectation():
+    # Non-stationary signal: s_i ≠ s_{i-1}. The exact expectation of the lag-1
+    # statistic is E[3·v_est] = ‖s_i‖² - <s_i, s_{i-1}> + v_i + 2·v_{i-1} — a
+    # signal term rides along, and scoring v_est against v alone would report
+    # it as estimator bias. Reproduce the measured/predicted 1.6 from the
+    # design record.
+    s_i = torch.randn(4096, dtype=torch.float64)
+    s_i = s_i / s_i.norm()
+    rot = torch.randn(4096, dtype=torch.float64)
+    rot = rot - (s_i * rot).sum() * s_i
+    rot = rot / rot.norm()
+    s_im1 = 0.6 * s_i + 0.8 * rot                       # <s_i, s_{i-1}> = 0.6
+    vim2, vim1, vi = 0.20, 0.35, 0.50
+    expect = 1.0 - 0.6 + vi + 2.0 * vim1                # = 1.6
+    got = []
+    for seed in range(200):
+        diff, old_diff = _draw_diff(s_i, s_im1, (vim2, vim1, vi), seed)
+        stats = {}
+        K._coherence_gate(diff.unsqueeze(0), old_diff.unsqueeze(0), _TINY_H,
+                          stats_out=stats)
+        got.append(3.0 * float(stats["v_est"]))
+    assert sum(got) / len(got) == pytest.approx(expect, abs=0.05)
+    assert sum(got) / len(got) > vi + 2.0 * vim1        # naive target is low
+
+
+def test_cogent3_gate_stats_collection_does_not_perturb_output():
+    # gate_stats collects one dict per correctable step (the first of which is
+    # the floor-only bootstrap), with the raw measurement keys, and the run is
+    # bit-identical to one that collects nothing.
+    torch.manual_seed(9)
+    target = torch.randn(1, 4, 8, 8)
+    sigmas = S.flow_matching_schedule(12, shift=3.0)
+    x_init = torch.randn(1, 4, 8, 8)
+    stats = []
+    got = _last_nonzero_latent(K.sample_cogent3, _anneal_sigma_dependent_model(target),
+                               x_init, sigmas, gate_stats=stats,
+                               eta_max=1.0, model_type="flow", shift=3.0,
+                               generator=torch.Generator().manual_seed(1))
+    want = _last_nonzero_latent(K.sample_cogent3, _anneal_sigma_dependent_model(target),
+                                x_init, sigmas,
+                                eta_max=1.0, model_type="flow", shift=3.0,
+                                generator=torch.Generator().manual_seed(1))
+    assert torch.equal(got, want)                       # collection is write-only
+    # 13 sigmas → 12 steps; the last (σ_next=0) never gates, and step 0 has no
+    # x0 history, so 10 entries: 1 floor-only bootstrap + 9 full reads.
+    assert len(stats) == len(sigmas) - 3
+    assert stats[0]["bootstrap"] and stats[0]["floor_active"]
+    for entry in stats[1:]:
+        for key in ("rho", "s_est", "v_est", "psi_linear", "floor_active",
+                    "bootstrap", "step", "sigma", "sigma_next", "h"):
+            assert key in entry
+        assert entry["bootstrap"] is False

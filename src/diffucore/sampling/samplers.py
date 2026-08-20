@@ -1175,8 +1175,15 @@ def sample_dpmpp_2m_anneal(
     return x
 
 
+def _validate_gate_reduce(reduce: str) -> None:
+    """Validate the reduction mode shared by cogent's two gates."""
+    if reduce not in ("all", "per_channel"):
+        raise ValueError(f"reduce must be 'all' or 'per_channel', got {reduce!r}")
+
+
 def _coherence_gate(diff: torch.Tensor, old_diff: Optional[torch.Tensor],
-                    h: torch.Tensor) -> torch.Tensor:
+                    h: torch.Tensor, *, reduce: str = "all",
+                    stats_out: Optional[dict] = None) -> torch.Tensor:
     """Scale factor for a multistep solver's divided-difference term::
 
         psi = max( (1 + 2·rho)/3 ,  1 - e^(-h) )        clamped to [0, 1]
@@ -1219,16 +1226,70 @@ def _coherence_gate(diff: torch.Tensor, old_diff: Optional[torch.Tensor],
     damp the correction below the weight the step itself gives it". It is not a
     tuned constant, and it vanishes as ``h -> 0`` (fine steps, where the coherence
     reading is trustworthy and can damp all the way to zero).
+
+    **Spatial reduction** (``reduce``). ``"all"`` (the default) reduces over every
+    dim but the batch — the gate described above, bit-for-bit the family's
+    shipped behaviour. ``"per_channel"`` reduces over the spatial axes ``(H, W)``
+    of a 4-D latent only, giving a length-``C`` vector of shrinks (broadcast
+    ``[B, C, 1, 1]``) so each channel of the correction term is scaled by its own
+    coherence reading. The per-channel gate is a *different* estimator, not a
+    refinement of the global one: with equal per-channel cosines the global cosine
+    equals them only when the channel-norm vectors of the two differences are
+    proportional (the global cosine is a sub-convex combination of the channel
+    cosines and 0). Per-channel is the cogent4 spatial gate, default-off; on
+    non-4-D latents there are no spatial axes, so ``"per_channel"`` falls back to
+    ``"all"`` (bit-for-bit ``cogent3``), matching the documented non-4-D path.
+
+    **Measurement hook** (``stats_out``). When given a dict, the raw statistics
+    the gate computes are written into it — the pre-floor ``rho``, the lag-1
+    noise-energy and signal-energy estimates the model above implies
+    (``v_est = (‖D_i‖² - <D_i, D_{i-1}>)/3``, ``s_est = (2·<D_i, D_{i-1}> + ‖D_i‖²)/3``),
+    the unfloored Wiener shrink ``psi_linear``, and whether the step-size floor
+    won over it. These are the family's first direct readings of its own
+    measurement, and they are the quantities the measurement-falsification
+    harness (``scripts/ab_cogent3.py --measure``) logs against known truth.
+    ``stats_out`` is write-only: values are detached logging tensors, so
+    collecting them neither changes the returned gate nor retains its autograd
+    graph.
+    Shapes follow ``reduce``: ``[B]`` for ``"all"``, ``[B, C]`` for
+    ``"per_channel"``.
     """
+    # Validate before the bootstrap return. Otherwise an invalid mode is
+    # silently accepted on the first correctable step and only fails once more
+    # history happens to exist, making validation depend on the step count.
+    _validate_gate_reduce(reduce)
     floor = (-h).expm1().neg()
     if old_diff is None:
+        if stats_out is not None:
+            stats_out["bootstrap"] = True
+            stats_out["floor_active"] = True
         return floor
-    dims = tuple(range(1, diff.ndim))
+    if reduce == "per_channel":
+        if diff.ndim == 4:
+            dims = (2, 3)                                   # spatial (H, W) only
+        else:
+            reduce = "all"                                  # no spatial axes to reduce over
+            dims = tuple(range(1, diff.ndim))
+    else:  # reduce == "all"
+        dims = tuple(range(1, diff.ndim))
     num = (diff * old_diff).sum(dim=dims)
-    den = (diff.pow(2).sum(dim=dims) * old_diff.pow(2).sum(dim=dims)).sqrt()
+    d2 = diff.pow(2).sum(dim=dims)
+    o2 = old_diff.pow(2).sum(dim=dims)
+    den = (d2 * o2).sqrt()
     rho = num / den.clamp_min(torch.finfo(diff.dtype).tiny)
     psi = ((1.0 + 2.0 * rho) / 3.0).clamp(0.0, 1.0)
-    return torch.maximum(psi.view(-1, *([1] * (diff.ndim - 1))), floor)
+    if stats_out is not None:
+        # This is a logging hook, not a differentiable auxiliary output. Keep
+        # the sampled result's graph intact while preventing a stats list from
+        # retaining the denoiser graph for every step.
+        stats_out["rho"] = rho.detach()
+        stats_out["d2"] = d2.detach()
+        stats_out["s_est"] = ((2.0 * num + d2) / 3.0).detach()
+        stats_out["v_est"] = ((d2 - num) / 3.0).detach()
+        stats_out["psi_linear"] = psi.detach()
+        stats_out["floor_active"] = (floor > psi).detach()
+        stats_out["bootstrap"] = False
+    return torch.maximum(psi.view(*psi.shape, *([1] * (diff.ndim - psi.ndim))), floor)
 
 
 def sample_cogent(
@@ -1242,6 +1303,7 @@ def sample_cogent(
     callback: Callback = None,
     model_type: str = "ve",
     shift: float = 1.0,
+    gate_reduce: str = "all",
 ) -> torch.Tensor:
     """COGENT: coherence-gated exponential multistep with a σ-annealed ancestral
     noise level. One model evaluation per step; all model families.
@@ -1317,6 +1379,12 @@ def sample_cogent(
     :func:`sample_dpmpp_2m_anneal` exactly. The first correctable step has no
     second difference to measure against and simply runs at the floor.
 
+    ``gate_reduce`` selects how the coherence gate reduces over the latent:
+    ``"all"`` (the default) is the shipped global gate, bit-for-bit; the cogent4
+    ``"per_channel"`` option reduces over the spatial axes of a 4-D latent only,
+    scaling each channel of the correction by its own shrink. It is default-off
+    (see :func:`_coherence_gate`).
+
     Family-agnostic: ``model_type="flow"`` (Anima / FLUX) uses the rectified-flow
     half-logSNR map, where ``eta_i = eta_max·σ_i`` literally; ``"ve"`` (SD / SDXL)
     uses the VE map, where the annealing variable is the equivalent noise fraction
@@ -1324,6 +1392,7 @@ def sample_cogent(
     the anneal means the same thing on both. ``shift`` offsets the first σ off 1.0
     for the flow map.
     """
+    _validate_gate_reduce(gate_reduce)
     if len(sigmas) <= 1:
         return x
     s_in = x.new_ones([x.shape[0]])
@@ -1351,7 +1420,7 @@ def sample_cogent(
             alpha_t = sigma_next * lambda_t.exp()
             x = sigma_next / sigma * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
             if diff is not None:
-                psi = _coherence_gate(diff, old_diff, h)
+                psi = _coherence_gate(diff, old_diff, h, reduce=gate_reduce)
                 # Same operand order as sample_dpmpp_2m_anneal, so psi == 1
                 # reproduces it bit-for-bit rather than merely closely.
                 rr = h_last / h
@@ -1365,6 +1434,7 @@ def sample_cogent(
 
 def _cogent3_curvature_gate(second_diff: torch.Tensor,
                             old_second_diff: Optional[torch.Tensor],
+                            *, reduce: str = "all",
                             ) -> torch.Tensor:
     """Scale factor for a multistep solver's second-divided-difference
     (3rd-order) term::
@@ -1402,16 +1472,34 @@ def _cogent3_curvature_gate(second_diff: torch.Tensor,
     what decides whether extrapolating them is trustworthy. ``old_second_diff
     is None`` (no curvature history yet) returns 1.0; the caller substitutes
     its own bootstrap for the very first 3rd-order-capable step, where the raw
-    Wiener term would be 1.0 regardless (see :func:`sample_cogent3`)."""
+    Wiener term would be 1.0 regardless (see :func:`sample_cogent3`).
+
+    ``reduce`` mirrors :func:`_coherence_gate`: ``"all"`` (default) reduces
+    over every dim but the batch — the shipped behaviour, bit-for-bit —
+    ``"per_channel"`` reduces over the spatial axes of a 4-D latent only
+    (falling back to ``"all"`` on non-4-D inputs), for the cogent4 spatial
+    gate. Per-channel is default-off and never engaged unless the sampler is
+    asked for it.
+    """
+    # As with the first-difference gate, validation must not depend on whether
+    # enough history exists to leave the bootstrap path.
+    _validate_gate_reduce(reduce)
     if old_second_diff is None:
         return torch.ones(second_diff.shape[0], *([1] * (second_diff.ndim - 1)),
                           dtype=second_diff.dtype, device=second_diff.device)
-    dims = tuple(range(1, second_diff.ndim))
+    if reduce == "per_channel":
+        if second_diff.ndim == 4:
+            dims = (2, 3)
+        else:
+            reduce = "all"
+            dims = tuple(range(1, second_diff.ndim))
+    else:  # reduce == "all"
+        dims = tuple(range(1, second_diff.ndim))
     num = (second_diff * old_second_diff).sum(dim=dims)
     den = (second_diff.pow(2).sum(dim=dims) * old_second_diff.pow(2).sum(dim=dims)).sqrt()
     rho = num / den.clamp_min(torch.finfo(second_diff.dtype).tiny)
     psi = ((2.0 + 3.0 * rho) / 5.0).clamp(0.0, 1.0)
-    return psi.view(-1, *([1] * (second_diff.ndim - 1)))
+    return psi.view(*psi.shape, *([1] * (second_diff.ndim - psi.ndim)))
 
 
 def sample_cogent3(
@@ -1428,6 +1516,8 @@ def sample_cogent3(
     callback: Callback = None,
     model_type: str = "ve",
     shift: float = 1.0,
+    gate_reduce: str = "all",
+    gate_stats: Optional[list] = None,
 ) -> torch.Tensor:
     """COGENT3: COGENT's measured gate carried to third order. One model
     evaluation per step; all model families.
@@ -1484,6 +1574,21 @@ def sample_cogent3(
     ``model_type="flow"`` (Anima / FLUX) anneals on σ, ``"ve"`` (SD / SDXL) on
     ``σ/(1+σ)`` — the same quantity, as in cogent. ``shift`` offsets the first
     σ off 1.0 for the flow map.
+
+    ``gate_reduce`` selects the coherence gate's reduction over the latent:
+    ``"all"`` (the default) is the shipped global gate, bit-for-bit; the cogent4
+    ``"per_channel"`` option reduces over the spatial axes of a 4-D latent only,
+    scaling each channel of the correction by its own shrink (falling back to
+    ``"all"`` on non-4-D latents — see :func:`_coherence_gate`). Default-off.
+
+    ``gate_stats``, when given a list, collects one dict per correctable step
+    with the raw measurement statistics the 2nd-order gate computed — the
+    pre-floor ``rho``, the lag-1 estimates ``v_est`` and ``s_est``, the
+    unfloored ``psi_linear``, and whether the step-size floor won (see
+    :func:`_coherence_gate`). Collecting stats never changes the sampled output.
+    This is the instrumentation the measurement-falsification harness
+    (``scripts/ab_cogent3.py --measure``) logs through, so the estimator under
+    test is the sampler's own code path rather than a reimplementation.
 
     ----
 
@@ -1580,6 +1685,7 @@ def sample_cogent3(
     0.3240, cogent3 0.3234) — the low-σ half costs sharpness and buys no
     coarse-structure benefit.
     """
+    _validate_gate_reduce(gate_reduce)
     if len(sigmas) <= 1:
         return x
     if pump_strength > 0 and x.ndim != 4:
@@ -1594,6 +1700,7 @@ def sample_cogent3(
     sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
     denoised_1, denoised_2, denoised_3 = None, None, None
     h, h_1, h_2 = None, None, None
+    _stats = None
     for i in range(len(sigmas) - 1):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * s_in)
@@ -1611,6 +1718,7 @@ def sample_cogent3(
             h_eta = h * (eta + 1)
             alpha_t = sigma_next * lambda_t.exp()
             x = sigma_next / sigma * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
+            _stats = None
             if h_2 is not None:
                 r0 = h_1 / h
                 r1 = h_2 / h
@@ -1623,19 +1731,30 @@ def sample_cogent3(
                 # ψ₁ reads the raw first differences (same operands as cogent);
                 # ψ₂ reads the second differences. First occurrence bootstraps
                 # ψ₂ from ψ₁ (no curvature history yet).
+                _stats = {} if gate_stats is not None else None
                 psi_1 = _coherence_gate(denoised - denoised_1,
-                                        denoised_1 - denoised_2, h)
+                                        denoised_1 - denoised_2, h,
+                                        reduce=gate_reduce, stats_out=_stats)
                 e_cur = denoised - 2.0 * denoised_1 + denoised_2
                 psi_2 = (_cogent3_curvature_gate(
-                    e_cur, denoised_1 - 2.0 * denoised_2 + denoised_3)
+                    e_cur, denoised_1 - 2.0 * denoised_2 + denoised_3,
+                    reduce=gate_reduce)
                     if denoised_3 is not None else psi_1)
                 x = x + psi_1 * (alpha_t * phi_2) * d1 - psi_2 * (alpha_t * phi_3) * d2
             elif h_1 is not None:
                 rr = h_1 / h
                 d = (denoised - denoised_1) / rr
                 phi_2 = h_eta.neg().expm1() / h_eta + 1
-                psi_1 = _coherence_gate(denoised - denoised_1, None, h)
+                _stats = {} if gate_stats is not None else None
+                psi_1 = _coherence_gate(denoised - denoised_1, None, h,
+                                        reduce=gate_reduce, stats_out=_stats)
                 x = x + psi_1 * (alpha_t * phi_2) * d
+            if _stats is not None:
+                _stats["step"] = i
+                _stats["sigma"] = float(sigma)
+                _stats["sigma_next"] = float(sigma_next)
+                _stats["h"] = float(h)
+                gate_stats.append(_stats)
             if eta > 0 and s_noise > 0:
                 x = x + _noise_like(x, generator) * sigma_next * (-2 * h * eta).expm1().neg().sqrt() * s_noise
             # Coherence pump. Ramp is on the family-invariant sigma_frac, amplitude
