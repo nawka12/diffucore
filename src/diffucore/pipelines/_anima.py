@@ -131,6 +131,7 @@ def anima_text_to_image(
     scheduler: str = "flow",
     curvature: float = 0.25,
     eta_max: float = 1.0,
+    gate_reduce: str = "all",
     beta_alpha: float = 0.6,
     beta_beta: float = 0.6,
     lq_threshold: float = 0.025,
@@ -321,6 +322,8 @@ def anima_text_to_image(
                     kwargs["generator"] = gen
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
                     kwargs["eta_max"] = eta_max
+                if sampler in ("cogent", "cogent3", "cogent3_pump"):
+                    kwargs["gate_reduce"] = gate_reduce
                 # uni_pc_anneal intentionally omitted: even with its order-ramp the
                 # shared 1.0 panel default over-softens it (deterministic stays
                 # cleanest), so it ships a low baked-in eta_max (0.2).
@@ -362,6 +365,7 @@ def anima_img2img(
     seed: int | None = None,
     curvature: float = 0.25,
     eta_max: float = 1.0,
+    gate_reduce: str = "all",
     beta_alpha: float = 0.6,
     beta_beta: float = 0.6,
     lq_threshold: float = 0.025,
@@ -522,6 +526,8 @@ def anima_img2img(
                 kwargs["generator"] = gen
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
                 kwargs["eta_max"] = eta_max
+            if sampler in ("cogent", "cogent3", "cogent3_pump"):
+                kwargs["gate_reduce"] = gate_reduce
             # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
             # low baked-in eta_max (0.2) instead of the shared 1.0 panel default.
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
