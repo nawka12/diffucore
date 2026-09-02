@@ -376,6 +376,22 @@ def test_make_teacache_rule_and_coeffs():
     assert (cond.rule, cond.coefficients) == ("drift", coeffs)
 
 
+def test_make_teacache_uncond_scale():
+    """The scale loosens the uncond stream's threshold only, under both rules,
+    and 1.0 (the default) leaves the streams identical."""
+    import pytest
+    from diffucore.pipelines._anima import _make_teacache
+
+    for rule in ("drift", "easy"):
+        cond, uncond = _make_teacache(0.2, None, 4.0, "hermite", rule)
+        assert cond.rel_l1_thresh == uncond.rel_l1_thresh == 0.2
+        cond, uncond = _make_teacache(0.2, None, 4.0, "hermite", rule, 2.5)
+        assert cond.rel_l1_thresh == 0.2
+        assert uncond.rel_l1_thresh == pytest.approx(0.5)
+    # CFG off -> no uncond stream to scale.
+    assert _make_teacache(0.2, None, 1.0, "hermite", "drift", 2.5)[1] is None
+
+
 def test_drift_rule_unchanged():
     """Guard: naming the default rule explicitly changes nothing — same skips,
     same accumulator, bit-identical outputs."""

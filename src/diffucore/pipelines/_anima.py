@@ -99,7 +99,8 @@ _EASY_WARMUP = 3
 
 
 def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float,
-                   forecast: str = "hermite", rule: str = "drift"):
+                   forecast: str = "hermite", rule: str = "drift",
+                   uncond_scale: float = 1.0):
     """Build the per-CFG-branch TeaCache streams (or ``(None, None)`` when off).
     The uncond stream is omitted when CFG is disabled (single forward per step).
 
@@ -111,7 +112,15 @@ def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: f
     accumulator, optionally calibrated through ``coeffs``) or ``"easy"``
     (EasyCache, arXiv:2507.02860 — accumulated predicted *output* change, with
     ``thresh`` read as its τ). ``coeffs`` are meaningless under ``"easy"`` and
-    are dropped here, so the engine can keep passing them unconditionally."""
+    are dropped here, so the engine can keep passing them unconditionally.
+
+    ``uncond_scale`` > 1 loosens the *uncond* stream's threshold. Note the
+    uncond pass is not the less important one: with
+    ``v = v_uncond + s·(v_cond − v_uncond)`` at s = 4.5 an error in
+    ``v_uncond`` enters the guided velocity with weight |1 − s| = 3.5 against
+    the cond branch's 4.5. It is only empirically *smoother*, so it already
+    skips more at an equal threshold — hence this is a knob to measure, not a
+    free win. Applies under both rules."""
     if thresh <= 0:
         return None, None
     if rule not in ("drift", "easy"):
@@ -124,7 +133,7 @@ def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: f
     elif forecast != "taylor":
         raise ValueError(f"teacache_forecast must be 'taylor' or 'hermite'; got {forecast!r}")
     cond = TeaCache(thresh, **kwargs)
-    uncond = TeaCache(thresh, **kwargs) if cfg_scale != 1.0 else None
+    uncond = TeaCache(thresh * uncond_scale, **kwargs) if cfg_scale != 1.0 else None
     return cond, uncond
 
 
@@ -176,6 +185,7 @@ def anima_text_to_image(
     teacache_coefficients: "Sequence[float] | None" = None,
     teacache_forecast: str = "hermite",
     teacache_rule: str = "drift",
+    teacache_uncond_scale: float = 1.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -206,7 +216,8 @@ def anima_text_to_image(
     ``teacache_forecast`` picks the skip-step extrapolation basis and
     ``teacache_rule`` the skip *decision* rule (``"drift"`` or EasyCache's
     ``"easy"``, which reads ``teacache_thresh`` as its τ and ignores the
-    coefficients) — see :func:`_make_teacache`.
+    coefficients). ``teacache_uncond_scale`` > 1 loosens the uncond stream's
+    threshold relative to the cond one — see :func:`_make_teacache`.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -283,7 +294,8 @@ def anima_text_to_image(
         # forwards whose modulated inputs coincide, so they can't share one).
         # ``teacache_coefficients`` rescales the raw drift (identity if None).
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
-                                            teacache_forecast, teacache_rule)
+                                            teacache_forecast, teacache_rule,
+                                            teacache_uncond_scale)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
@@ -414,6 +426,7 @@ def anima_img2img(
     teacache_coefficients: "Sequence[float] | None" = None,
     teacache_forecast: str = "hermite",
     teacache_rule: str = "drift",
+    teacache_uncond_scale: float = 1.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -517,7 +530,8 @@ def anima_img2img(
         backbone = model.backbone
         # TeaCache: one cache stream per CFG branch (see anima_text_to_image).
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
-                                            teacache_forecast, teacache_rule)
+                                            teacache_forecast, teacache_rule,
+                                            teacache_uncond_scale)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
