@@ -93,18 +93,32 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(img[0].permute(1, 2, 0).cpu().numpy())
 
 
+# EasyCache warm-up: calls of a stream that always compute before the rule may
+# skip. The paper uses R = 5-10 of 50 steps; 3 is ~10 % of a 28-32 step run.
+_EASY_WARMUP = 3
+
+
 def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float,
-                   forecast: str = "hermite"):
+                   forecast: str = "hermite", rule: str = "drift"):
     """Build the per-CFG-branch TeaCache streams (or ``(None, None)`` when off).
     The uncond stream is omitted when CFG is disabled (single forward per step).
 
     ``forecast`` picks how skipped steps extrapolate the cached residual:
     ``"hermite"`` (HiCache, arXiv:2508.16984 — order-2 scaled-Hermite with the
-    paper's σ=0.5) or ``"taylor"`` (TaylorSeer — order-1 linear). The skip
-    *decision* (threshold/calibration) is identical under both."""
+    paper's σ=0.5) or ``"taylor"`` (TaylorSeer — order-1 linear).
+
+    ``rule`` picks *when* to skip: ``"drift"`` (TeaCache's input-drift
+    accumulator, optionally calibrated through ``coeffs``) or ``"easy"``
+    (EasyCache, arXiv:2507.02860 — accumulated predicted *output* change, with
+    ``thresh`` read as its τ). ``coeffs`` are meaningless under ``"easy"`` and
+    are dropped here, so the engine can keep passing them unconditionally."""
     if thresh <= 0:
         return None, None
-    kwargs: dict = {} if coeffs is None else {"coefficients": coeffs}
+    if rule not in ("drift", "easy"):
+        raise ValueError(f"teacache_rule must be 'drift' or 'easy'; got {rule!r}")
+    kwargs: dict = {} if coeffs is None or rule == "easy" else {"coefficients": coeffs}
+    if rule == "easy":
+        kwargs.update(rule="easy", warmup=_EASY_WARMUP)
     if forecast == "hermite":
         kwargs.update(basis="hermite", max_order=2, sigma=0.5)
     elif forecast != "taylor":
@@ -112,6 +126,25 @@ def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: f
     cond = TeaCache(thresh, **kwargs)
     uncond = TeaCache(thresh, **kwargs) if cfg_scale != 1.0 else None
     return cond, uncond
+
+
+def _note_follow_miss(tc_cond, tc_uncond) -> None:
+    """Count a step where the cond stream skipped but the uncond one computed —
+    the forwards a leader/follower link between the streams could save.
+    Instrumentation only; call right after each uncond forward."""
+    if tc_cond is not None and tc_uncond is not None \
+            and not tc_cond.last_computed and tc_uncond.last_computed:
+        tc_uncond.follow_misses += 1
+
+
+def _report_teacache(tc_cond, tc_uncond) -> None:
+    if tc_cond is None:
+        return
+    msg = f"[teacache] cached {tc_cond.skips}/{tc_cond.calls} steps"
+    if tc_uncond is not None:
+        msg += (f" (cond), {tc_uncond.skips}/{tc_uncond.calls} (uncond); "
+                f"{tc_uncond.follow_misses} follow misses")
+    print(msg, flush=True)
 
 
 def anima_text_to_image(
@@ -142,6 +175,7 @@ def anima_text_to_image(
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
     teacache_forecast: str = "hermite",
+    teacache_rule: str = "drift",
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -169,8 +203,10 @@ def anima_text_to_image(
     cached transformer-block residual instead of recomputing it. Larger = more
     skipping = faster but lower fidelity; 0 disables. Uncalibrated on Anima
     (identity rescale), so tune the threshold empirically.
-    ``teacache_forecast`` picks the skip-step extrapolation basis — see
-    :func:`_make_teacache`.
+    ``teacache_forecast`` picks the skip-step extrapolation basis and
+    ``teacache_rule`` the skip *decision* rule (``"drift"`` or EasyCache's
+    ``"easy"``, which reads ``teacache_thresh`` as its τ and ignores the
+    coefficients) — see :func:`_make_teacache`.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -247,7 +283,7 @@ def anima_text_to_image(
         # forwards whose modulated inputs coincide, so they can't share one).
         # ``teacache_coefficients`` rescales the raw drift (identity if None).
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
-                                            teacache_forecast)
+                                            teacache_forecast, teacache_rule)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
@@ -284,6 +320,7 @@ def anima_text_to_image(
                             if policy.cuda_graphs:
                                 v_cond = v_cond.clone()
                             v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
+                            _note_follow_miss(tc_cond, tc_uncond)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
                         # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
@@ -304,6 +341,7 @@ def anima_text_to_image(
                         if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see euler path)
                             v_cond = v_cond.clone()
                         v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
+                        _note_follow_miss(tc_cond, tc_uncond)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
                     return x_in.float() - sig * v.float()
@@ -330,8 +368,7 @@ def anima_text_to_image(
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
-        if tc_cond is not None:
-            print(f"[teacache] cached {tc_cond.skips}/{tc_cond.calls} steps", flush=True)
+        _report_teacache(tc_cond, tc_uncond)
 
         # ---- 5. process_out then decode (tiled when explicitly requested, or
         # auto-tiled when free VRAM can't host an untiled decode — Qwen-Image
@@ -376,6 +413,7 @@ def anima_img2img(
     teacache_thresh: float = 0.0,
     teacache_coefficients: "Sequence[float] | None" = None,
     teacache_forecast: str = "hermite",
+    teacache_rule: str = "drift",
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -479,7 +517,7 @@ def anima_img2img(
         backbone = model.backbone
         # TeaCache: one cache stream per CFG branch (see anima_text_to_image).
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
-                                            teacache_forecast)
+                                            teacache_forecast, teacache_rule)
         # staged() OUTSIDE inference_mode: offloaded weights moved under inference
         # mode become inference tensors that break later in-place LoRA (add_/copy_).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
@@ -505,6 +543,7 @@ def anima_img2img(
                     if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
                         v_cond = v_cond.clone()
                     v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
+                    _note_follow_miss(tc_cond, tc_uncond)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 x0 = x_in.float() - sig * v.float()
@@ -533,8 +572,7 @@ def anima_img2img(
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
-        if tc_cond is not None:
-            print(f"[teacache] cached {tc_cond.skips}/{tc_cond.calls} steps", flush=True)
+        _report_teacache(tc_cond, tc_uncond)
 
         # ---- 5. decode
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):

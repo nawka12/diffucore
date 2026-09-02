@@ -229,9 +229,22 @@ def test_unknown_basis_and_forecast_mode_are_rejected():
 
     with pytest.raises(ValueError):
         TeaCache(rel_l1_thresh=1.0, basis="chebyshev")
+    with pytest.raises(ValueError):
+        TeaCache(rel_l1_thresh=1.0, rule="chebyshev")
     from diffucore.pipelines._anima import _make_teacache
     with pytest.raises(ValueError):
         _make_teacache(0.15, None, 4.0, "cubic")
+    with pytest.raises(ValueError):
+        _make_teacache(0.15, None, 4.0, "hermite", "bogus")
+
+
+def test_easy_rejects_record_mode():
+    """Calibration fits the drift rule's (input-drift -> output-drift) curve;
+    EasyCache has no such curve, so the combination is a programming error."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        TeaCache(rel_l1_thresh=0.0, record=True, rule="easy")
 
 
 def test_make_teacache_forecast_modes():
@@ -261,3 +274,123 @@ def test_threshold_forces_recompute_and_resets():
     assert 0.0 < tc.accumulated < 0.5
     assert tc.should_compute(a + 5.0) is True     # big jump -> over threshold
     assert tc.accumulated == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# EasyCache decision rule (arXiv:2507.02860)
+# --------------------------------------------------------------------------- #
+
+def test_easy_rule_warmup_always_computes():
+    """The first ``warmup`` calls run the blocks whatever the threshold says —
+    the transformation rate isn't measurable yet — so they stay bit-exact."""
+    dit, cfg = _tiny()
+    torch.manual_seed(10)
+    t = torch.tensor([5.0])
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels)
+    tc = TeaCache(rel_l1_thresh=0.05, rule="easy", warmup=3)
+    with torch.no_grad():
+        for _ in range(3):
+            x = torch.randn(1, cfg.in_channels, 1, 8, 8)
+            assert torch.equal(dit(x, t, ctx), dit(x, t, ctx, teacache=tc))
+    assert (tc.calls, tc.skips) == (3, 0)
+
+
+def test_easy_rule_identical_input_skips_after_warmup():
+    """Once the rate is known, a step whose latent didn't move predicts zero
+    output change and skips — reusing the cached residual exactly (order 0)."""
+    dit, cfg = _tiny()
+    torch.manual_seed(11)
+    t = torch.tensor([5.0])
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels)
+    a = torch.randn(1, cfg.in_channels, 1, 8, 8)
+    b = torch.randn(1, cfg.in_channels, 1, 8, 8)
+    # max_order=0 so the skip reuses the residual rather than extrapolating it;
+    # this test is about the decision, not the forecast.
+    tc = TeaCache(rel_l1_thresh=1e9, rule="easy", warmup=1, max_order=0)
+    with torch.no_grad():
+        dit(a, t, ctx, teacache=tc)          # call 1: no history
+        out2 = dit(b, t, ctx, teacache=tc)   # call 2: k not yet known -> computes
+        assert tc.skips == 0 and tc.k is not None
+        out3 = dit(b, t, ctx, teacache=tc)   # call 3: dx == 0 -> skip
+    assert tc.skips == 1
+    assert torch.allclose(out2, out3, atol=1e-5, rtol=1e-4)
+
+
+def test_easy_rate_updates_only_on_computed_steps():
+    """Drive the rule directly: ``k`` is refreshed only after a step that ran
+    the blocks, and the predicted-error accumulator carries across skips and
+    resets on a recompute."""
+    import pytest
+
+    tc = TeaCache(rel_l1_thresh=0.5, rule="easy", warmup=1)
+    x = torch.zeros(4)
+    assert tc.should_compute_easy(x) is True      # first call -> no history
+    tc.record_output(torch.zeros(4))
+    assert tc.k is None                            # no previous output to difference
+
+    x = x + 1.0                                    # dx = 1.0
+    assert tc.should_compute_easy(x) is True       # k still unknown -> compute
+    tc.record_output(torch.full((4,), 2.0))        # k = |2 - 0| / 1.0
+    assert tc.k == pytest.approx(2.0)
+
+    x = x + 0.1                                    # eps = 2.0 * 0.1 / 2.0 = 0.1 < 0.5
+    assert tc.should_compute_easy(x) is False
+    assert tc.accumulated == pytest.approx(0.1)
+    tc.record_output(torch.full((4,), 2.5))        # skipped: rate must not move
+    assert tc.k == pytest.approx(2.0)
+
+    x = x + 1.0                                    # eps = 2.0 * 1.0 / 2.5 = 0.8 -> 0.9 >= 0.5
+    assert tc.should_compute_easy(x) is True
+    assert tc.accumulated == 0.0
+    tc.record_output(torch.full((4,), 5.5))        # computed: k = |5.5 - 2.5| / 1.0
+    assert tc.k == pytest.approx(3.0)
+    assert (tc.calls, tc.skips) == (4, 1)
+
+
+def test_easy_zero_threshold_never_skips():
+    """τ = 0 makes every accumulated prediction cross the bar, so the rule
+    degrades to a plain forward however far the latent moves."""
+    dit, cfg = _tiny()
+    torch.manual_seed(12)
+    t = torch.tensor([5.0])
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels)
+    tc = TeaCache(rel_l1_thresh=0.0, rule="easy", warmup=1)
+    with torch.no_grad():
+        for _ in range(4):
+            x = torch.randn(1, cfg.in_channels, 1, 8, 8)
+            assert torch.equal(dit(x, t, ctx), dit(x, t, ctx, teacache=tc))
+    assert tc.skips == 0
+
+
+def test_make_teacache_rule_and_coeffs():
+    """``rule="easy"`` reaches both streams and drops the calibration
+    coefficients (it has no rescale); ``"drift"`` keeps them."""
+    from diffucore.pipelines._anima import _EASY_WARMUP, _make_teacache
+
+    coeffs = (2.0, 0.5)
+    cond, uncond = _make_teacache(0.15, coeffs, 4.0, "hermite", "easy")
+    assert (cond.rule, cond.warmup, cond.coefficients) == ("easy", _EASY_WARMUP, (1.0, 0.0))
+    assert (uncond.rule, uncond.coefficients) == ("easy", (1.0, 0.0))
+    assert cond.basis == "hermite"          # the forecast is orthogonal to the rule
+    cond, _ = _make_teacache(0.15, coeffs, 4.0, "hermite", "drift")
+    assert (cond.rule, cond.coefficients) == ("drift", coeffs)
+
+
+def test_drift_rule_unchanged():
+    """Guard: naming the default rule explicitly changes nothing — same skips,
+    same accumulator, bit-identical outputs."""
+    dit, cfg = _tiny()
+    torch.manual_seed(13)
+    t = torch.tensor([5.0])
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels)
+    base = torch.randn(1, cfg.in_channels, 1, 8, 8)
+    step = torch.randn(1, cfg.in_channels, 1, 8, 8) * 0.01   # small drift -> some skips
+    xs = [base + i * step for i in range(5)]
+    old = TeaCache(rel_l1_thresh=0.5)
+    new = TeaCache(rel_l1_thresh=0.5, rule="drift")
+    with torch.no_grad():
+        for x in xs:
+            assert torch.equal(dit(x, t, ctx, teacache=old), dit(x, t, ctx, teacache=new))
+    assert old.skips == new.skips > 0        # the scenario must actually skip
+    assert old.accumulated == new.accumulated
+    assert new.prev_x is None and new.k is None   # the easy state stays untouched

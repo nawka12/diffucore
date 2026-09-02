@@ -535,6 +535,23 @@ class TeaCache:
     is *exactly* the order-1 taylor one (``σ·H_1(σk) = 2σ²k = k``); the
     HiCache paper recommends order 2 with ``sigma = 0.5``.
 
+    **Decision rule (EasyCache, arXiv:2507.02860).** ``rule`` picks *when* to
+    skip; the forecast above (*what* a skip returns) is shared by both.
+    ``"drift"`` is the input-side rule described above. ``"easy"`` instead
+    tracks the model's own output sensitivity: on each computed step it
+    measures the transformation rate ``k = ‖v_t − v_{t−1}‖ / ‖x_t − x_{t−1}‖``
+    and, on every step, accumulates the *predicted* relative output change
+    ``k · ‖x_t − x_{t−1}‖ / ‖v_{t−1}‖`` since the last computed step, forcing a
+    recompute once it reaches ``rel_l1_thresh`` (τ; 0.05 is the paper default).
+    All norms are mean-absolute, as in the reference implementation. Because it
+    reads actual velocity change, an ancestral noise injection shows up as a
+    large input change and forces a recompute exactly where structure is being
+    decided — so the threshold is meant to transfer across samplers and step
+    counts, which the drift rule's does not. ``warmup`` calls always compute
+    (the rate is not measurable before then); ``coefficients`` are **ignored**
+    under ``"easy"`` (the rule has no rescale) and ``record`` mode is
+    drift-only.
+
     One instance tracks one stream. Classifier-free guidance needs two (the
     conditioned and unconditioned passes are separate Anima forwards whose
     modulated inputs coincide, so a shared accumulator would read zero drift
@@ -548,9 +565,14 @@ class TeaCache:
 
     def __init__(self, rel_l1_thresh: float, coefficients: Sequence[float] = (1.0, 0.0),
                  *, record: bool = False, max_order: int = 1,
-                 basis: str = "taylor", sigma: float = 0.5):
+                 basis: str = "taylor", sigma: float = 0.5,
+                 rule: str = "drift", warmup: int = 3):
         if basis not in ("taylor", "hermite"):
             raise ValueError(f"basis must be 'taylor' or 'hermite'; got {basis!r}")
+        if rule not in ("drift", "easy"):
+            raise ValueError(f"rule must be 'drift' or 'easy'; got {rule!r}")
+        if record and rule != "drift":
+            raise ValueError("record mode calibrates the drift rule only; got rule='easy'")
         self.rel_l1_thresh = float(rel_l1_thresh)
         self.coefficients = tuple(float(c) for c in coefficients)
         self.record = record
@@ -569,6 +591,18 @@ class TeaCache:
         # steps forward. Empty until the first computed step.
         self.taylor: dict[int, torch.Tensor] = {}
         self.last_activated = -1
+        # EasyCache state (rule == "easy"; all unused under "drift"). Latents are
+        # kept in fp32 so the differences below don't lose their leading digits to
+        # fp16 cancellation. ``pending_dx`` is the input change that produced the
+        # output ``record_output`` is about to see, i.e. the denominator of ``k``.
+        self.rule = rule
+        self.warmup = int(warmup)
+        self.prev_x: Optional[torch.Tensor] = None
+        self.prev_out: Optional[torch.Tensor] = None
+        self.k: Optional[float] = None
+        self.pending_dx = 0.0
+        self.last_computed = True   # decision of the most recent call (both rules)
+        self.follow_misses = 0      # instrumentation, filled in by the pipeline
 
     def _rescale(self, x: float) -> float:
         out = 0.0
@@ -588,19 +622,71 @@ class TeaCache:
         if self.prev_modulated is None:
             self.accumulated = 0.0
             self.prev_modulated = modulated
+            self.last_computed = True
             return True
         denom = self.prev_modulated.abs().mean().clamp_min(1e-8)
         rel = ((modulated - self.prev_modulated).abs().mean() / denom).item()
         self.prev_modulated = modulated
         if self.record:
             self.rel_history.append(rel)
+            self.last_computed = True
             return True
         self.accumulated += self._rescale(rel)
         if self.accumulated < self.rel_l1_thresh:
             self.skips += 1
+            self.last_computed = False
             return False
         self.accumulated = 0.0
+        self.last_computed = True
         return True
+
+    def should_compute_easy(self, x: torch.Tensor) -> bool:
+        """EasyCache decision (``rule == "easy"``): fold this step's latent
+        change into the accumulated *predicted output change* and skip while it
+        stays under ``rel_l1_thresh``.
+
+        ``x`` is the DiT's padded ``(B, C, T, H, W)`` latent — the model input,
+        not the timestep-modulated block probe the drift rule reads. The first
+        ``warmup`` calls always compute: the transformation rate ``k`` is
+        undefined until :meth:`record_output` has seen two consecutive outputs.
+        """
+        self.calls += 1
+        x = x.detach().to(torch.float32, copy=True)
+        if self.prev_x is None:                      # first call: no history
+            self.prev_x = x
+            self.pending_dx = 0.0
+            self.accumulated = 0.0
+            self.last_computed = True
+            return True
+        dx = (x - self.prev_x).abs().mean().item()   # mean-abs, as in the reference impl
+        self.prev_x = x
+        self.pending_dx = dx
+        if self.calls <= self.warmup or self.k is None or self.prev_out is None:
+            decision = True                          # warm-up / rate not yet measurable
+        else:
+            v_norm = self.prev_out.abs().mean().item()
+            self.accumulated += self.k * dx / max(v_norm, 1e-8)
+            decision = self.accumulated >= self.rel_l1_thresh
+        if decision:
+            self.accumulated = 0.0
+        else:
+            self.skips += 1
+        self.last_computed = decision
+        return decision
+
+    def record_output(self, out: torch.Tensor) -> None:
+        """Feed the step's model output back to the EasyCache rule.
+
+        Called on *every* call under ``rule == "easy"`` (a skipped step's output
+        is the forecast one, which is what the next step will actually be
+        compared against). The transformation rate is refreshed only after a
+        step that really ran the blocks, so ``k`` always has a true model output
+        as the endpoint of its numerator.
+        """
+        out = out.detach().to(torch.float32, copy=True)
+        if self.last_computed and self.prev_out is not None and self.pending_dx > 0:
+            self.k = (out - self.prev_out).abs().mean().item() / self.pending_dx
+        self.prev_out = out
 
     def update(self, residual: torch.Tensor) -> None:
         """Record a freshly computed block residual and refresh the Taylor
@@ -734,9 +820,16 @@ class CosmosDiT(nn.Module):
         # TeaCache: on a low-drift step, reuse the cached block residual instead
         # of running the 28-block stack. The timestep embedding (above) and the
         # final layer (below) are cheap and always run; only the blocks skip.
-        compute = teacache.should_compute(
-            self.blocks[0].modulated_self_attn_input(x_B_T_H_W_D, emb_B_T_D, adaln_lora_B_T_3D)
-        ) if teacache is not None else True
+        # The "easy" rule reads the raw latent, so its probe costs nothing; only
+        # the "drift" rule pays for the block-0 LayerNorm + adaLN modulation.
+        if teacache is None:
+            compute = True
+        elif teacache.rule == "easy":
+            compute = teacache.should_compute_easy(x)
+        else:
+            compute = teacache.should_compute(
+                self.blocks[0].modulated_self_attn_input(x_B_T_H_W_D, emb_B_T_D, adaln_lora_B_T_3D)
+            )
 
         if not compute:
             x_B_T_H_W_D = x_B_T_H_W_D + teacache.forecast()
@@ -749,6 +842,8 @@ class CosmosDiT(nn.Module):
 
         out = self.final_layer(x_B_T_H_W_D.to(context.dtype), emb_B_T_D, adaln_lora_B_T_3D)
         out = self._unpatchify(out)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]
+        if teacache is not None and teacache.rule == "easy":
+            teacache.record_output(out)
         return out
 
 
