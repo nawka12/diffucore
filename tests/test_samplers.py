@@ -270,8 +270,8 @@ def test_secant_registered_in_sampler_table():
 
 
 @pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
-                                  "gradient_estimation", "stork2", "infinity", "lms",
-                                  "exp_heun_2_x0", "uni_pc", "uni_pc_bh2"])
+                                  "lumen", "gradient_estimation", "stork2", "infinity",
+                                  "lms", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2"])
 @pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
 def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
     target = torch.full((1, 4, 4, 4), 0.2)
@@ -2441,3 +2441,71 @@ def test_cogent3_gate_stats_collection_does_not_perturb_output():
                     "bootstrap", "step", "sigma", "sigma_next", "h"):
             assert key in entry
         assert entry["bootstrap"] is False
+
+
+# ── LUMEN ─────────────────────────────────────────────────────────────
+# galpt/infinity-diffusion's geometric solver (branch sampler/lumen-geometric-
+# solver): the closed-form integral of an x0 estimate taken linear in log σ,
+# which is res_multistep's φ-weighted correction reached by another route, plus
+# three no-cost guards (damping, a plain-Euler tail, a magnitude fallback).
+
+
+def _lumen_curved_model():
+    # σ- and x-dependent x0, so the divided difference is nonzero and both the
+    # correction and the damping ratio are actually exercised.
+    def model(x, sigma):
+        s = sigma.reshape(-1, *([1] * (x.ndim - 1)))
+        return torch.tanh(0.7 * x) / (1.0 + s) + 0.1 * torch.sin(x + s)
+    return model
+
+
+def test_lumen_core_equals_res_multistep():
+    # The claim the docstring makes: with the three guards disabled, LUMEN's
+    # closed-form log-σ correction *is* the RES multistep step. float64 so the
+    # comparison is round-off and not tolerance.
+    sigmas = S.karras_schedule(12, 0.0292, 14.6146, dtype=torch.float64)
+    x_init = torch.randn(1, 4, 8, 8, dtype=torch.float64) * sigmas[0]
+    model = _lumen_curved_model()
+    got = K.sample_lumen(model, x_init.clone(), sigmas,
+                         tau=float("inf"), tail_euler=0, guard_ratio=float("inf"))
+    want = K.sample_res_multistep(model, x_init.clone(), sigmas)
+    assert torch.allclose(got, want, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("guard_off", [
+    {"tau": 0.0},                       # kappa == 0, the correction is scaled away
+    {"tail_euler": 12},                 # every non-terminal step is in the tail
+    {"guard_ratio": 0.0},               # no correction ever passes the magnitude test
+])
+def test_lumen_each_guard_falls_back_to_euler(guard_off):
+    sigmas = S.karras_schedule(12, 0.0292, 14.6146, dtype=torch.float64)
+    x_init = torch.randn(1, 4, 8, 8, dtype=torch.float64) * sigmas[0]
+    model = _lumen_curved_model()
+    got = K.sample_lumen(model, x_init.clone(), sigmas, **guard_off)
+    want = K.sample_euler(model, x_init.clone(), sigmas)
+    assert torch.allclose(got, want, rtol=0, atol=1e-12)
+
+
+def test_lumen_damping_shrinks_on_a_jumping_x0():
+    d = torch.randn(2, 4, 8, 8)
+    smooth = K._lumen_damping(d, d + 1e-3 * torch.randn_like(d), K.LUMEN_TAU)
+    jumpy = K._lumen_damping(d, d + 4.0 * torch.randn_like(d), K.LUMEN_TAU)
+    assert torch.allclose(smooth, torch.ones(2))         # saturates at 1 when D barely moves
+    assert (jumpy < 0.5).all()
+    # Scale-invariant: both mean|·| terms scale with the latent.
+    assert torch.allclose(jumpy, K._lumen_damping(7.0 * d, 7.0 * (d + 4.0 * torch.randn_like(d)),
+                                                  K.LUMEN_TAU), atol=0.1)
+
+
+def test_lumen_guards_are_active_at_the_shipped_defaults():
+    # Sanity that the defaults are not a no-op wrapper around res_multistep.
+    sigmas = S.karras_schedule(12, 0.0292, 14.6146, dtype=torch.float64)
+    x_init = torch.randn(1, 4, 8, 8, dtype=torch.float64) * sigmas[0]
+    model = _lumen_curved_model()
+    got = K.sample_lumen(model, x_init.clone(), sigmas)
+    assert not torch.allclose(got, K.sample_res_multistep(model, x_init.clone(), sigmas))
+    assert not torch.allclose(got, K.sample_euler(model, x_init.clone(), sigmas))
+
+
+def test_lumen_registered_in_sampler_table():
+    assert K.get_sampler("lumen") is K.sample_lumen

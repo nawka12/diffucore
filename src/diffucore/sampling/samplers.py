@@ -48,6 +48,7 @@ __all__ = [
     "sample_ipndm_v",
     "sample_res_multistep",
     "sample_res_multistep_ancestral",
+    "sample_lumen",
     "sample_gradient_estimation",
     "sample_stork2",
     "sample_infinity",
@@ -2058,6 +2059,124 @@ def sample_res_multistep_ancestral(
                           callback=callback, model_type=model_type)
 
 
+# LUMEN's three guards, frozen upstream: the damping scale, how many
+# non-terminal steps before the terminal one stay Euler, and the ratio of
+# correction to Euler displacement above which a step falls back to Euler.
+# Upstream tuned them once on synthetic probes and exposes no knobs; they are
+# keyword arguments on :func:`sample_lumen` only so each reduction can be
+# pinned by a test, and the registry entry uses these defaults.
+LUMEN_TAU = 0.8
+LUMEN_TAIL_EULER = 2
+LUMEN_GUARD_RATIO = 0.4
+_LUMEN_EPS = 1e-8
+
+
+def _lumen_damping(denoised: torch.Tensor, old_denoised: torch.Tensor,
+                   tau: float) -> torch.Tensor:
+    """LUMEN's damping scale ``kappa = min(1, tau·mean|D| / mean|D - D_prev|)``,
+    clamped to ``[0, 1]`` and reduced per batch sample.
+
+    It sits at 1 while the x0 estimate moves smoothly from step to step and
+    falls where it jumps, so the second-order term is attenuated exactly on the
+    steps whose divided difference is least trustworthy. Unlike
+    :func:`_coherence_gate` it reads only the *magnitude* of the change, not its
+    direction, and it is step-size-blind — at high step counts ``mean|ΔD|``
+    shrinks on its own and the damping stops doing anything.
+
+    Upstream reduces over the whole tensor, batch axis included. Per-sample is
+    the same number at the batch size of 1 the pipelines run, and it keeps one
+    sample's spike from damping another's correction.
+    """
+    dims = tuple(range(1, denoised.ndim))
+    num = denoised.float().abs().mean(dim=dims) + _LUMEN_EPS
+    den = (denoised - old_denoised).float().abs().mean(dim=dims) + _LUMEN_EPS
+    return (tau * num / den).clamp(0.0, 1.0).to(denoised.dtype)
+
+
+def sample_lumen(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+    tau: float = LUMEN_TAU,
+    tail_euler: int = LUMEN_TAIL_EULER,
+    guard_ratio: float = LUMEN_GUARD_RATIO,
+) -> torch.Tensor:
+    """LUMEN geometric solver (galpt/infinity-diffusion, MIT; branch
+    ``sampler/lumen-geometric-solver`` @5e545eb) — a second-order multistep
+    exponential integrator in ``log σ`` plus three stability guards. One model
+    evaluation per step, deterministic, model-agnostic.
+
+    Writing ``y = x/σ`` turns the ODE at the top of this module into
+    ``dy/dσ = -x0/σ²``, and ``u = log σ`` turns that into
+    ``y(u_next) - y(u) = -∫ x0(u)·e^(-u) du``. Upstream takes ``x0`` linear in
+    ``u`` from one step of history and integrates the result in closed form,
+    which is an Euler step plus a single correction::
+
+        rho   = σ_next / σ                    h = log rho
+        slope = (D - D_prev) / h_prev
+        x     = rho·x + (1 - rho)·D  -  kappa · slope · (rho - h - 1)
+
+    **That correction is the one** :func:`sample_res_multistep` **takes.**
+    Substituting ``h_res = -h`` into RES's ``phi``-weighted ``b1·D + b2·D_prev``
+    collapses it to the same ``(D - D_prev)·(e^(-h_res) + h_res - 1) / h_last``:
+    a closed-form integral in ``log σ`` and the exponential integrator's ``phi``
+    functions are two derivations of one second-order multistep method, and with
+    the guards disabled the two samplers agree here to float64 round-off (pinned
+    by ``test_lumen_core_equals_res_multistep``). What LUMEN adds is the guards,
+    and none of them costs an evaluation:
+
+    * **Damping** (:func:`_lumen_damping`) scales the correction by
+      ``kappa = min(1, tau·mean|D| / mean|ΔD|)``.
+    * **Euler tail** — the ``tail_euler`` non-terminal steps before the terminal
+      one take the plain Euler step, keeping the extrapolation off the schedule's
+      steepest ``log σ`` jumps as σ → 0.
+    * **Magnitude guard** — a step whose damped correction averages more than
+      ``guard_ratio`` of its own Euler displacement takes the Euler step instead.
+
+    Upstream rejects flow and velocity checkpoints outright, on the grounds that
+    the derivation needs a denoised prediction in x-space. This port is only ever
+    handed an x0 denoiser closure, and for rectified flow (``x = (1-σ)·x0 + σ·ε``)
+    the derivative is ``ε - x0 = (x - x0)/σ`` — the ODE the derivation starts
+    from — so it serves every family, as :func:`sample_res_multistep` already
+    does. The update is elementwise, so token-sequence latents (FLUX) are fine.
+
+    ``tau``/``tail_euler``/``guard_ratio`` are frozen upstream and nothing in the
+    app varies them; they are arguments so the reductions can be tested.
+    """
+    s_in = x.new_ones([x.shape[0]])
+    steps = len(sigmas) - 1
+    old_denoised = None
+    for i in range(steps):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            rho = sigma_next / sigma
+            x_euler = rho * x + (1.0 - rho) * denoised
+            h_prev = (sigma / sigmas[i - 1]).log() if i > 0 else sigma.new_zeros(())
+            in_tail = steps - 1 - tail_euler <= i < steps - 1
+            # No history on the first step; the Euler tail and a repeated sigma
+            # (h_prev == 0, no slope to take) fall back the same way.
+            if old_denoised is None or in_tail or bool(h_prev == 0):
+                x = x_euler
+            else:
+                kappa = _lumen_damping(denoised, old_denoised, tau)
+                corr = (denoised - old_denoised) * ((rho - rho.log() - 1.0) / h_prev)
+                corr = corr * append_dims(kappa, x.ndim)
+                dims = tuple(range(1, x.ndim))
+                ratio = (corr.float().abs().mean(dim=dims)
+                         / ((x_euler - x).float().abs().mean(dim=dims) + _LUMEN_EPS))
+                keep = append_dims((ratio <= guard_ratio).to(x.dtype), x.ndim)
+                x = x_euler - keep * corr
+        old_denoised = denoised
+    return x
+
+
 def sample_gradient_estimation(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
                                callback: Callback = None, ge_gamma: float = 2.0) -> torch.Tensor:
     """Gradient-estimation sampler (Liu et al., openreview o2ND9v0CeK): an Euler
@@ -3381,6 +3500,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "ipndm_v": sample_ipndm_v,
     "res_multistep": sample_res_multistep,
     "res_multistep_ancestral": sample_res_multistep_ancestral,
+    "lumen": sample_lumen,
     "gradient_estimation": sample_gradient_estimation,
     "stork2": sample_stork2,
     "infinity": sample_infinity,

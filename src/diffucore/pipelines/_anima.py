@@ -46,7 +46,7 @@ _ANIMA_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "euler_ancestral_anneal", "er_sde",
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
-    "res_multistep_ancestral", "gradient_estimation", "stork2", "infinity",
+    "res_multistep_ancestral", "lumen", "gradient_estimation", "stork2", "infinity",
     "infinity_realism", "infinity_nano", "infinity_omega", "infinity_aether",
     "lms", "lcm",
     "sa_solver", "sa_solver_pece",
