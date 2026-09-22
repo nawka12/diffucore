@@ -65,6 +65,8 @@ __all__ = [
     "sample_secant_anneal",
     "sample_dpmpp_2m_anneal",
     "sample_uni_pc_anneal",
+    "sample_reprise",
+    "reprise_nfe",
     "sample_cogent",
     "sample_cogent3",
     "get_sampler",
@@ -954,6 +956,211 @@ def sample_uni_pc_anneal(
         if callback is not None:
             callback(step, sigma_t, x, model_t)
         push(sigma_t, model_t)
+    return x
+
+
+# ── REPRISE: Restart sampling over the cogent3_pump core ───────────────
+# Defaults are the measured optimum of the offline sweep (docs/reprise.md §5.4),
+# run on the UniPC-cored first version and not re-swept for this core:
+# the band edges are the coherence pump's measured high-σ window, K=3 is the knee
+# where CFG contraction, exact-model accuracy and sample spread all still hold,
+# and stride 2 is what makes three restarts affordable. One source of truth for
+# the sampler, the NFE helper and the pipelines' progress-bar totals.
+REPRISE_DEFAULTS = dict(restart_lo=0.45, restart_hi=0.85, restarts=3, draft_stride=2)
+
+
+def _reprise_sigma_frac(sigma, model_type: str) -> float:
+    """Family-invariant noise fraction: ``σ`` on flow, ``σ/(1+σ)`` on VE (both are
+    ``sigmoid(-lambda)``), as the ``*_anneal`` family and the pump gate use."""
+    s = float(sigma)
+    return s if model_type == "flow" else s / (1.0 + s)
+
+
+def _reprise_indices(sigmas: torch.Tensor, restart_lo: float, restart_hi: float,
+                     model_type: str = "flow") -> Optional[tuple[int, int]]:
+    """First grid indices at or below the band edges, or ``None`` when the given
+    schedule cannot host a restart: the band sits above σ_max, the grid steps over
+    it, or its lower edge is already the schedule's last point (so there is
+    nothing left to re-integrate) — the img2img/low-strength case."""
+    n = len(sigmas) - 1
+    i_hi = next((i for i in range(n + 1)
+                 if _reprise_sigma_frac(sigmas[i], model_type) <= restart_hi), None)
+    i_lo = next((i for i in range(n + 1)
+                 if _reprise_sigma_frac(sigmas[i], model_type) <= restart_lo), None)
+    if i_hi is None or i_lo is None or i_hi >= i_lo or i_lo >= n:
+        return None
+    return i_hi, i_lo
+
+
+def _reprise_strided(band: torch.Tensor, stride: int) -> torch.Tensor:
+    """Sub-grid of a σ run keeping both endpoints."""
+    if stride <= 1 or len(band) <= 2:
+        return band
+    idx = list(range(0, len(band) - 1, stride)) + [len(band) - 1]
+    return band[idx]
+
+
+def _reprise_segments(sigmas: torch.Tensor, *, restart_lo: float, restart_hi: float,
+                      restarts: int, draft_stride: int,
+                      model_type: str = "flow") -> Optional[list[torch.Tensor]]:
+    """The σ runs :func:`sample_reprise` integrates, in order, or ``None`` when no
+    restart is possible (caller falls back to plain cogent3_pump over the whole schedule).
+
+    ``[seg_0] + (restarts − 1) × [drafted band] + [sigmas[i_hi:]]``: the first pass
+    drafts the band at ``draft_stride``, the intermediate re-integrations are that
+    same drafted band, and the final pass runs the band at full density and
+    continues to σ=0 without a history reset."""
+    if restarts <= 0:
+        return None
+    idx = _reprise_indices(sigmas, restart_lo, restart_hi, model_type)
+    if idx is None:
+        return None
+    i_hi, i_lo = idx
+    band = sigmas[i_hi: i_lo + 1]
+    draft = _reprise_strided(band, draft_stride)
+    seg_0 = torch.cat([sigmas[:i_hi], draft])
+    return [seg_0] + [draft] * (restarts - 1) + [sigmas[i_hi:]]
+
+
+def reprise_nfe(sigmas: torch.Tensor, *, restart_lo: float = REPRISE_DEFAULTS["restart_lo"],
+                restart_hi: float = REPRISE_DEFAULTS["restart_hi"],
+                restarts: int = REPRISE_DEFAULTS["restarts"],
+                draft_stride: int = REPRISE_DEFAULTS["draft_stride"],
+                model_type: str = "flow") -> int:
+    """Model evaluations :func:`sample_reprise` will make on ``sigmas`` — what the
+    progress bar must be sized with, since restarts cost extra calls (like
+    ``heun``'s 2×).
+
+    ``sample_cogent3`` evaluates once per σ *interval*, so every segment costs
+    ``len(seg) − 1`` whether or not it ends at 0. Closed form:
+    ``n + K·⌈band/s⌉`` with ``n = len(sigmas) − 1``, ``band = i_lo − i_hi`` grid
+    intervals, ``s = draft_stride``, ``K = restarts``. Returns ``len(sigmas) − 1``
+    (plain cogent3_pump) when no restart is possible."""
+    segs = _reprise_segments(sigmas, restart_lo=restart_lo, restart_hi=restart_hi,
+                             restarts=restarts, draft_stride=draft_stride,
+                             model_type=model_type)
+    if segs is None:
+        return len(sigmas) - 1
+    return sum(len(s) - 1 for s in segs)
+
+
+def _reprise_jump(x: torch.Tensor, sigma_lo: torch.Tensor, sigma_hi: torch.Tensor,
+                  model_type: str, generator: Optional[torch.Generator]) -> torch.Tensor:
+    """Exact forward-process transition σ_lo → σ_hi (σ_hi > σ_lo).
+
+    ``x ← a·x + b·ε`` with ``a = alpha_hi/alpha_lo`` and
+    ``b = sqrt(σ_hi² − a²·σ_lo²)``: for a latent sitting on the forward marginal at
+    σ_lo given some x0, the result sits on the forward marginal at σ_hi given the
+    same x0 (``a·(alpha_lo·x0) = alpha_hi·x0`` and the noise variances add to
+    σ_hi²). This is :func:`_rf_ancestral_step`'s ``renoise_coeff`` algebra run
+    *backwards* (``sigma_down = σ_lo``, ``sigma_next = σ_hi``). ``flow``:
+    ``alpha = 1 − σ``; ``ve``: ``alpha = 1``, so ``a = 1``."""
+    a = ((1.0 - sigma_hi) / (1.0 - sigma_lo)) if model_type == "flow" else torch.ones_like(sigma_hi)
+    b = (sigma_hi ** 2 - (a * sigma_lo) ** 2).clamp(min=0).sqrt()
+    return a * x + b * _noise_like(x, generator)
+
+
+def sample_reprise(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    restart_lo: float = REPRISE_DEFAULTS["restart_lo"],
+    restart_hi: float = REPRISE_DEFAULTS["restart_hi"],
+    restarts: int = REPRISE_DEFAULTS["restarts"],
+    draft_stride: int = REPRISE_DEFAULTS["draft_stride"],
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    pump_strength: float = 0.08,
+    gate_reduce: str = "all",
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "flow",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """REPRISE: Restart sampling over the ``cogent3_pump`` core — cogent3_pump
+    segments separated by exact forward-process re-noise jumps back up a high-σ
+    *structure band*.
+
+    An adaptation of Restart sampling (Xu, Liu, Tong, Vahdat, Kautz, Jaakkola,
+    "Restart Sampling for Improving Generative Processes", NeurIPS 2023,
+    arXiv:2306.14878) to rectified flow. Clean-room from the paper; no code taken
+    from the reference repository.
+
+    Why restarts: the one real-image coherency win this family has —
+    ``cogent3_pump`` — came from *many CFG re-decisions at high σ*, and each jump
+    is a full re-decision of the layout under CFG. Restart theory adds that a
+    forward jump is exact (zero discretization error), so it contracts
+    accumulated error — including the off-manifold drift CFG causes — without
+    paying an SDE step's error of its own.
+
+    Why this core: the first version ran deterministic UniPC bh2 between the
+    jumps, so no injection ever landed inside the solver's history. On
+    AnimaFranken-v1.2 at CFG 4.5 it rendered visibly more saturated than cogent3
+    ("burnt" hair colour), and no restart knob closed the gap (K8 at 50 NFE still
+    landed above plain cogent3), so the core was swapped and the UniPC version
+    removed. The price is that three mechanisms now stack — cogent3's per-step
+    ancestral noise (``eta_max``), the pump's high-σ grain (``pump_strength``,
+    gated to σ_frac ≥ 0.45, which covers the restart band) and the jumps — so a
+    good result vindicates the combination, not any one of them.
+
+    Structure, with the band snapped to the caller's σ grid
+    (``i_hi`` / ``i_lo`` = first indices at or below ``restart_hi`` / ``restart_lo``
+    in the family-invariant ``sigma_frac`` coordinate — ``σ`` on flow, ``σ/(1+σ)``
+    on VE)::
+
+        σ_max ─draft─► σ_lo ═jump═► σ_hi ─draft─► σ_lo ═jump═► σ_hi ─full─► σ_lo ─full─► 0
+
+    Every segment is a fresh :func:`sample_cogent3` solve (history reset — the
+    pre-jump x0 history is stale by construction); the *final* pass runs the band
+    at full density and continues to σ=0 in one continuous solve. The first pass
+    and the intermediate re-integrations are re-noised anyway, so they are
+    *drafts* at ``draft_stride``, which is what makes three restarts affordable.
+
+    Knobs. ``restarts`` (K), ``restart_lo`` / ``restart_hi`` and ``draft_stride``
+    are the restart schedule; their defaults (``REPRISE_DEFAULTS``) were swept
+    offline on the UniPC-cored version (docs/reprise.md §5.4) and have not been
+    re-swept for this core. ``eta_max``, ``s_noise``, ``pump_strength`` and
+    ``gate_reduce`` are :func:`sample_cogent3`'s, passed to every segment.
+
+    Cost. ``reprise_nfe(sigmas, …)`` model calls: ``n + K·⌈band/s⌉``, ~1.4–1.5×
+    the nominal step count on the production schedulers (``beta_mix`` 20 steps →
+    29 calls, 28 → 43). Callers that size a progress bar by ``len(sigmas) − 1``
+    must use that helper instead.
+
+    Degradations. ``restarts=0``, or any schedule with no grid point inside the
+    band (an img2img/inpaint run whose sliced schedule starts at or below
+    ``restart_lo``), is bit-for-bit ``cogent3_pump`` with the same knobs. 4-D
+    latents only, like the pump."""
+    if restarts < 0:
+        raise ValueError("restarts must be >= 0")
+    if draft_stride < 1:
+        raise ValueError("draft_stride must be >= 1")
+    if not (0.0 < restart_lo < restart_hi < 1.0):
+        raise ValueError("need 0 < restart_lo < restart_hi < 1")
+    common = dict(eta_max=eta_max, s_noise=s_noise, pump_strength=pump_strength,
+                  gate_reduce=gate_reduce, generator=generator,
+                  model_type=model_type, shift=shift)
+    segs = _reprise_segments(sigmas, restart_lo=restart_lo, restart_hi=restart_hi,
+                             restarts=restarts, draft_stride=draft_stride,
+                             model_type=model_type)
+    if segs is None:                       # plain cogent3_pump, bit-for-bit
+        return sample_cogent3(model, x, sigmas, callback=callback, **common)
+
+    step = [0]
+
+    def cb(_i, sigma, x_cur, denoised):
+        # Re-index the inner solves' callbacks onto one running counter, so the
+        # caller's progress bar advances once per model evaluation across segments.
+        if callback is not None:
+            callback(step[0], sigma, x_cur, denoised)
+        step[0] += 1
+
+    sigma_lo = segs[0][-1]                 # sigmas[i_lo] — where every jump starts
+    x = sample_cogent3(model, x, segs[0], callback=cb, **common)
+    for seg in segs[1:]:
+        x = _reprise_jump(x, sigma_lo, seg[0], model_type, generator)
+        x = sample_cogent3(model, x, seg, callback=cb, **common)
     return x
 
 
@@ -3520,6 +3727,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "uni_pc": partial(sample_uni_pc, variant="bh1"),
     "uni_pc_bh2": partial(sample_uni_pc, variant="bh2"),
     "uni_pc_anneal": sample_uni_pc_anneal,
+    "reprise": sample_reprise,
     "cogent": sample_cogent,
     "cogent3": sample_cogent3,
     "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),

@@ -38,6 +38,7 @@ from ..sampling import (
     flow_table_schedule,
     get_sampler,
     guidance_interval_bounds,
+    reprise_nfe,
 )
 
 # Samplers Anima can drive (all routed through a CONST x0 denoiser closure).
@@ -52,15 +53,28 @@ _ANIMA_SAMPLERS = {
     "sa_solver", "sa_solver_pece",
     "secant", "secant_anneal",
     "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
+    "reprise",
     "cogent", "cogent3", "cogent3_pump",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "dpmpp_2m_anneal",
-    "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump",
+    "uni_pc_anneal", "reprise", "cogent", "cogent3", "cogent3_pump",
     "sa_solver", "sa_solver_pece",
 }
+# Samplers whose model-call count is not len(sigmas) - 1.
+_NFE_OVERRIDES = {
+    "reprise": reprise_nfe,
+}
+
+
+def _sampler_total(sampler: str, sigmas) -> int:
+    """Steps to size the progress bar with — model calls, not schedule steps."""
+    fn = _NFE_OVERRIDES.get(sampler)
+    return fn(sigmas) if fn is not None else len(sigmas) - 1
+
+
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
 # with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
 _ANIMA_SCHEDULERS = (
@@ -370,14 +384,19 @@ def anima_text_to_image(
                 # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
-                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
+                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
+                               "reprise"):
                     kwargs["eta_max"] = eta_max
-                if sampler in ("cogent", "cogent3", "cogent3_pump"):
+                if sampler in ("cogent", "cogent3", "cogent3_pump", "reprise"):
                     kwargs["gate_reduce"] = gate_reduce
                 # uni_pc_anneal intentionally omitted: even with its order-ramp the
                 # shared 1.0 panel default over-softens it (deterministic stays
                 # cleanest), so it ships a low baked-in eta_max (0.2).
-                with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
+
+                # reprise re-integrates a high-σ band K times, so it makes more
+                # model calls than the schedule has steps (see reprise_nfe).
+                total = _sampler_total(sampler, sigmas)
+                with _step_progress(total, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
@@ -577,13 +596,17 @@ def anima_img2img(
             # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
-            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
+            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
+                           "reprise"):
                 kwargs["eta_max"] = eta_max
-            if sampler in ("cogent", "cogent3", "cogent3_pump"):
+            if sampler in ("cogent", "cogent3", "cogent3_pump", "reprise"):
                 kwargs["gate_reduce"] = gate_reduce
             # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
             # low baked-in eta_max (0.2) instead of the shared 1.0 panel default.
-            with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
+
+            # reprise's restarts cost extra model calls (see the t2i path).
+            total = _sampler_total(sampler, sigmas)
+            with _step_progress(total, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
