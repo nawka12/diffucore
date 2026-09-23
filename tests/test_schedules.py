@@ -95,12 +95,8 @@ def test_kl_optimal_endpoints_and_descent():
 
 
 # ── Align Your Steps (AYS) ───────────────────────────────────────────
-# Sabour, Fidler & Kreis, "Align Your Steps", ICML 2024 (arXiv:2404.14507),
-# Table 3: the paper's per-family optimized 10-step noise levels, extended to
-# arbitrary step counts by the authors' recommended log-linear interpolation.
-# The reference values below are the output of A1111's
-# `get_align_your_steps_sigmas` (numpy loglinear_interp + trailing 0), which
-# this implementation matches bit-for-bit.
+# Reference values are A1111's `get_align_your_steps_sigmas` output (log-linear
+# interpolation of the paper's Table 3), matched bit-for-bit.
 
 
 def test_align_your_steps_endpoints_and_descent():
@@ -155,10 +151,8 @@ def test_normal_schedule_descends_to_zero():
 
 
 def test_infinity_schedule_endpoints_descent_and_sine_shift():
-    # Infinity Diffusion's sine-perturbed timestep ramp (verified equivalent
-    # to upstream @4f72d8f): same σ_max→σ_min span as `normal`, but the first
-    # timestep gap shrinks to (1−s)× linear and the last grows to (1+s)×,
-    # with s = min(0.6, steps/50) — saturated at 30 steps.
+    # Same span as `normal`, first gap (1−s)× and last (1+s)× linear, with
+    # s = min(0.6, steps/50).
     view = _flow_view()
     steps = 30
     sig = S.infinity_schedule(view, steps)
@@ -187,12 +181,8 @@ def test_infinity_schedule_strength_adapts_to_steps():
 
 
 def test_infinity_htds_endpoints_and_high_sigma_density():
-    # HTDS bends `normal`'s linear timestep ramp by tanh(δ(1−u))/tanh(δ) over
-    # the same σ_max→σ_min span. That bend is CONVEX, so despite the branch's
-    # "tail density" name the schedule holds sigma high and plunges at the end
-    # — it is high-σ-dense, strictly less tail-dense than `normal`. Pinned in
-    # this direction on purpose: upstream's README claims the opposite, and a
-    # future "fix" that flips the curve would be a silent behavior change.
+    # The tanh bend is convex, so HTDS is high-σ-dense despite its name. Pinned
+    # this way on purpose: upstream's README claims the opposite.
     view = _flow_view()
     steps = 30
     sig = S.infinity_htds_schedule(view, steps)
@@ -241,9 +231,7 @@ def test_smoothstep_endpoints_descent_and_u_shape():
     assert sig[-1].item() == 0.0
     assert torch.all(sig[:-1] > sig[1:])
     assert abs(sig[0].item() - 1.0) < 1e-6             # starts at σ_max (==1 for flow)
-    # U-shaped density: steps cluster at BOTH ends — the first and last σ gaps
-    # are smaller than the largest mid-schedule gap (the low-σ end less so,
-    # since the shift=3 map trades some low-σ density for the high end).
+    # U-shaped: the first and last σ gaps are smaller than the largest mid gap.
     gaps = sig[:-2] - sig[1:-1]                        # exclude the final →0 jump
     assert gaps[0] < gaps.max() / 10
     assert gaps[-1] < gaps.max() / 2
@@ -260,9 +248,7 @@ def test_beta_endpoints_descent_and_u_shape():
     # last nonzero sigma is the table floor σ(1/1000), like the table walks
     view = _flow_view()
     assert abs(sig[-2].item() - float(view.sigma_min)) < 1e-4
-    # U-shaped in t: quantiles cluster at both t ends, so the first σ gaps and
-    # the last nonzero gaps are small relative to the mid-schedule maximum (the
-    # low-σ end less so — the shift=3 map expands σ near t=0 by ~shift×).
+    # U-shaped in t: the end gaps are small relative to the mid maximum.
     gaps = sig[:-2] - sig[1:-1]                        # exclude the final →0 jump
     assert gaps[0] < gaps.max() / 4
     assert gaps[-1] < gaps.max() / 2
@@ -289,13 +275,8 @@ def test_beta_invalid_args_raise():
 
 
 def test_beta_mix_endpoints_descent_and_u_shape():
-    """beta_mix generalizes beta to a two-Beta mixture; with the tuned defaults
-    (w=0.5, Beta(0.8,2.0)+Beta(3.0,0.7)) it stays descending with the same
-    endpoints as beta (σ(1)=1, σ(1/1000)=table floor, trailing 0), and the
-    density is U-shaped — denser at both ends, sparser in the middle — like
-    beta but *asymmetric toward the detail end*: per Lee et al. Fig. 2(d)'s
-    LDM importance curve, the high-freq (low-σ) peak is more concentrated than
-    the high-noise peak."""
+    """beta_mix with its tuned defaults stays descending with beta's endpoints
+    and is U-shaped but asymmetric toward the detail (low-σ) end."""
     view = _flow_view()
     sig = S.beta_mix_schedule(view, 28)
     assert sig.shape[0] == 29
@@ -309,10 +290,8 @@ def test_beta_mix_endpoints_descent_and_u_shape():
     assert gaps[0] < gaps.max() / 4
     assert gaps[-1] < gaps.max() / 2
 
-    # Asymmetric toward the detail end — the reason beta_mix exists over the
-    # symmetric `beta`. Judged in *timestep* space: the flow shift map alone
-    # already makes σ-gaps finer at the noise end (dσ/dt is ~9× smaller there),
-    # so the asymmetry the mixture controls is only visible pre-shift.
+    # Asymmetry toward the detail end, judged in timestep space (the shift map
+    # alone already makes σ-gaps finer at the noise end).
     t = view.sigma_to_t(sig[:-1]) / view.multiplier             # drop the →0 sigma
     tgaps = t[:-1] - t[1:]
     assert tgaps[-1] < tgaps[0]                                  # clean end denser in t
@@ -343,10 +322,8 @@ def test_beta_mix_invalid_args_raise():
 
 
 def test_beta_mix_default_strictly_descending_at_high_step_counts():
-    """The tuned defaults stay strictly descending across the step counts users
-    actually pick. The original SD-literal defaults (β₂=0.5) over-concentrated
-    the detail end so hard that several steps collided at the table floor for
-    step counts ≳ 40 (equal σ = a wasted NFE); the tuned β₂=0.7 stays clear."""
+    """The tuned defaults stay strictly descending at common step counts (the
+    SD-literal β₂=0.5 collided steps at the table floor beyond ~40)."""
     view = _flow_view()
     for steps in (40, 50, 64, 100):
         sig = S.beta_mix_schedule(view, steps)
@@ -355,7 +332,7 @@ def test_beta_mix_default_strictly_descending_at_high_step_counts():
 
 def test_flow_table_schedule_dispatches_all_names():
     # ddim_uniform is intentionally SD-only (starts below σ_max), so it is not a
-    # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
+    # flow table scheduler (see schedules._FLOW_TABLE_SCHEDULERS).
     for name in ("sgm_uniform", "simple", "normal", "infinity", "infinity_htds",
                  "linear_quadratic", "smoothstep", "beta", "beta_mix",
                  "pump_dual", "pump_taper", "kl_optimal"):
@@ -367,10 +344,8 @@ def test_flow_table_schedule_dispatches_all_names():
 
 
 def test_flow_table_schedule_forwards_knobs():
-    # beta α/β, beta_mix w/α₁/β₁/α₂/β₂, and linear_quadratic threshold_noise
-    # must reach their schedulers; the defaults reproduce the no-knob call (so
-    # generation is unchanged when the settings panel is untouched), and a
-    # knob-agnostic scheduler ignores them.
+    # The panel knobs must reach their schedulers, the defaults must reproduce
+    # the no-knob call, and other schedulers ignore them.
     base_beta = S.flow_table_schedule("beta", shift=3.0, steps=12)
     assert torch.allclose(base_beta, S.flow_table_schedule("beta", shift=3.0, steps=12, alpha=0.6, beta=0.6))
     assert not torch.allclose(base_beta, S.flow_table_schedule("beta", shift=3.0, steps=12, alpha=0.3, beta=0.9))
@@ -439,9 +414,7 @@ def _lam(sigmas):
 
 
 def _pumped_steps(sigmas, pump_end=0.45):
-    """Number of steps whose *starting* σ ≥ pump_end — the count of pump
-    injections the sampler performs (the pump fires after every step it
-    completes in the band)."""
+    """Steps whose starting σ ≥ pump_end, i.e. the pump injections."""
     sig = sigmas[:-1]
     return sum(1 for i in range(len(sig) - 1) if sig[i] >= pump_end)
 
@@ -454,19 +427,15 @@ def test_pump_dual_endpoints_descent_and_terminus():
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] > sig[1:])                 # strictly descending
         assert abs(sig[0].item() - 1.0) < 1e-6               # pure-noise init
-        # terminates where `flow` does — σ(t = 1/steps), not the table floor
+        # terminates where `flow` does, σ(t = 1/steps), not the table floor
         ref = S.flow_matching_schedule(steps, shift=3.0)
         assert abs(sig[-2].item() - ref[-2].item()) < 2e-6
 
 
 def test_pump_dual_terminus_is_flows_not_the_table_floor():
-    """The load-bearing correction. Running to the σ table floor (0.003 —
-    what beta / beta_mix / kl_optimal / normal / infinity all do) is what the
-    3M exponential core measurably hates: on the ab_cogent3 toy, holding
-    everything else fixed and moving only the terminus gives 0.145 / 0.210 /
-    0.287 / 0.365 rough energy distance at σ_end 0.088 / 0.03 / 0.01 / 0.003
-    (flow: 0.141), and 16× flow's error at 8 steps. So the schedule must
-    spend *no* steps below flow's own terminus."""
+    """The schedule must spend no steps below flow's terminus: deeper termini
+    were monotonically worse on the cogent3 toy (16× flow's error at 8 steps
+    at the 0.003 table floor)."""
     view = _flow_view()
     for steps in (16, 24, 32):
         sig = S.pump_dual_schedule(view, steps)
@@ -477,9 +446,8 @@ def test_pump_dual_terminus_is_flows_not_the_table_floor():
 
 
 def test_pump_dual_terminus_tracks_shift():
-    """Unlike the pumped band — which is defined in σ, and so is untouched by
-    a shift that is a pure translation in λ — the terminus follows `shift`,
-    because it is σ(t = 1/steps) through the shift map."""
+    """The terminus follows `shift` (σ(t = 1/steps) through the shift map),
+    unlike the pumped band, which is defined in σ."""
     ends = [float(S.pump_dual_schedule(S.FlowSamplingView(sh), 32)[-2])
             for sh in (1.0, 3.0, 6.0)]
     assert ends == sorted(ends) and ends[0] < ends[-1], ends
@@ -488,11 +456,9 @@ def test_pump_dual_terminus_tracks_shift():
 
 
 def test_pump_dual_uniform_lambda_share_is_one_band():
-    """At pump_share = S_hi/(S_hi + S_lo) — the point where both bands have
-    equal λ-step — the schedule is one uniform-in-λ grid (the exponential
-    core's ideal: every finite λ-step equal). With the flow terminus that
-    point drifts with the budget (≈ 0.77 at 16 steps, 0.69 at 32), and the
-    0.85 default sits above it, so the pumped band is the finer of the two."""
+    """At pump_share = S_hi/(S_hi + S_lo) both bands have equal λ-steps (one
+    uniform grid). That point drifts with the budget (≈ 0.77 at 16 steps,
+    0.69 at 32); the 0.85 default makes the pumped band the finer one."""
     view = _flow_view()
     for steps in (16, 24, 32):
         s_hi = math.log(1 / 0.45 - 1) - math.log(1 / 0.99 - 1)
@@ -505,9 +471,8 @@ def test_pump_dual_uniform_lambda_share_is_one_band():
 
 
 def test_pump_dual_share_trades_injections_for_tail():
-    """Raising pump_share moves steps from the refinement band into the pumped
-    band: more pump injections (re-deciding rounds), at the cost of a coarser
-    final step — the whole trade the knob exists for."""
+    """Raising pump_share moves steps from the tail into the pumped band: more
+    injections, coarser final step."""
     view = _flow_view()
     for steps in (24, 32, 50):
         counts, lasts = [], []
@@ -520,11 +485,9 @@ def test_pump_dual_share_trades_injections_for_tail():
 
 
 def test_pump_dual_injects_at_least_as_often_as_flow():
-    """The pumped band is the schedule's only lever on the pump: every step in
-    it is one CFG re-deciding round. At the 0.85 default the count clears the
-    densest scheduler that was in the real-image A/B's neighbourhood (`flow`,
-    26 at 32 steps) and well clears `beta_mix` (21) — the first version of this
-    schedule starved the band to 13 and lost coherency."""
+    """At 0.85 the pumped-step count beats `flow` (26 at 32 steps) and
+    `beta_mix` (21); an early version starved the band to 13 and lost
+    coherency."""
     view = _flow_view()
     for steps in (24, 28, 30, 32):
         mine = _pumped_steps(S.pump_dual_schedule(view, steps))
@@ -533,12 +496,9 @@ def test_pump_dual_injects_at_least_as_often_as_flow():
 
 
 def test_pump_dual_degrades_to_one_band_without_room():
-    """When σ(t = 1/steps) is at or above the pump cutoff — few steps, or a
-    high shift — there is no refinement band to place, and the run is one
-    uniform-λ grid pumped end to end (as `flow` is at that budget). The
-    boundary case is exact equality: shift 9 at 12 steps puts σ(t=1/12) on
-    0.45 itself, which a naive two-band split turns into a zero-width tail of
-    duplicate sigmas."""
+    """When σ(t = 1/steps) is at or above the cutoff (few steps, high shift) the
+    run is one pumped uniform-λ grid. Shift 9 at 12 steps puts the terminus on
+    0.45 exactly, which a naive split turns into duplicate sigmas."""
     for shift, steps in ((9.0, 12), (9.0, 8), (3.0, 4)):
         sig = S.pump_dual_schedule(S.FlowSamplingView(shift), steps)
         assert torch.all(sig[:-1] > sig[1:]), (shift, steps)
@@ -547,9 +507,8 @@ def test_pump_dual_degrades_to_one_band_without_room():
 
 
 def test_pump_dual_join_lands_at_pump_end():
-    """The band knee sits on the sampler's pump cutoff: above it the λ-steps
-    are the pump band's (fine, ~0.18 λ at the default — many re-deciding
-    rounds), below it the refinement band's (coarser, ~0.46 λ)."""
+    """The band knee sits on the pump cutoff: fine λ-steps above (~0.18 λ),
+    coarser below (~0.46 λ)."""
     view = _flow_view()
     sig = S.pump_dual_schedule(view, 32)
     run = sig[:-1]
@@ -584,20 +543,15 @@ def test_pump_dual_pump_end_moves_the_knee():
 
 
 def test_pump_dual_top_sigma_caps_the_wasteful_top():
-    """The model is σ-invariant at σ ≈ 1, so a λ-uniform grid run all the way
-    to σ_max would spend several near-identical calls there (the naive version
-    of this schedule put 9 of 32 σ at ≥ 0.995; flow puts 1). top_sigma caps the
-    grid so the run's first step is a real burn-in jump to ~0.99, in-family
-    with flow (0.989) and beta_mix (0.995)."""
+    """top_sigma caps the λ grid so the first step is a real burn-in jump to
+    ~0.99 (a naive uniform-λ grid put 9 of 32 σ at ≥ 0.995; flow puts 1)."""
     view = _flow_view()
     for ps in (0.5, 0.65, 0.8):
         sig = S.pump_dual_schedule(view, 32, pump_share=ps)
         run = sig[:-1]
         assert int((run >= 0.995).sum()) <= 2, ps       # no near-identical calls
         assert 0.98 < float(run[1]) < 0.995            # first step lands in-family
-    # the knob moves the cap: a higher top_sigma lands the first post-burn-in
-    # point higher (closer to σ_max), so the pumped grid's top is where the
-    # model actually starts responding
+    # A higher top_sigma lands the first post-burn-in point higher.
     low = float(S.pump_dual_schedule(view, 32, top_sigma=0.98)[1])
     high = float(S.pump_dual_schedule(view, 32, top_sigma=0.995)[1])
     assert 0.96 < low < high < 0.995
@@ -639,9 +593,8 @@ def test_pump_taper_endpoints_descent_and_terminus():
 
 
 def test_pump_taper_30_step_layout():
-    # The measured design point: burn-in, 25 band points ending exactly on the
-    # 0.45 cutoff, a 4-step tail. The band opens at the 50-step pump_dual density
-    # (~0.115 λ) and widens toward the knee; the tail is λ-uniform.
+    # Design point: burn-in, 25 band points ending on 0.45, a 4-step tail; the
+    # band opens at pump_dual@50's density (~0.115 λ) and widens.
     view = _flow_view()
     sig = S.pump_taper_schedule(view, 30)
     band, tail = sig[1:26], sig[26:30]

@@ -1,32 +1,12 @@
-"""Anima DiT — Cosmos-Predict2-family adaLN transformer (image-only path).
+"""Anima DiT: Cosmos-Predict2-family adaLN transformer (image-only path).
 
-The Anima backbone is a 28-block adaLN-modulated transformer adapted from
-NVIDIA's Cosmos-Predict2-2B (Apache-2.0). Each block carries three
-independent adaLN-LoRA modulators — one each for self-attention,
-cross-attention, and the MLP — so a single time embedding controls three
-distinct (shift, scale, gate) triples per block. Positions on
-self-attention come from a 3D RoPE; cross-attention has no positional
-encoding on the source side.
+A 28-block transformer adapted from NVIDIA's Cosmos-Predict2-2B (Apache-2.0).
+Each block has three adaLN-LoRA modulators (self-attention, cross-attention,
+MLP); self-attention uses a 3D RoPE. Anima: 16+1 input channels (latent +
+padding mask), patch 2, 2048 channels, 16 heads of 128, 1024-d cross-attention
+context from the LLM-Adapter, adaLN-LoRA dim 256, RoPE split 42/42/44.
 
-Anima specifically:
-
-    - in_channels = 16 (Qwen-Image VAE latent) + 1 (concat padding-mask)
-    - patch_spatial = 2,  patch_temporal = 1
-    - model_channels = 2048,  num_blocks = 28,  num_heads = 16, head_dim = 128
-    - crossattn_emb_channels = 1024 (the LLM-Adapter output)
-    - use_adaln_lora = True,  adaln_lora_dim = 256
-    - rope3d head split:  dim_h = head_dim//6*2 = 42,
-                          dim_w = 42, dim_t = head_dim - 84 = 44
-    - extra_per_block_abs_pos_emb = False
-
-The forward path treats T=1 single-frame video tensors throughout (the
-``(B, C, H, W)`` latent is reshaped on entry / exit) so the same module
-covers future video extensions without an early architectural lock-in.
-
-Verification (DT5): key-set + strict-load against ``anima-base-v1.0.safetensors``
-+ behavioural shape/determinism/conditioning-sensitivity tests. Numerical
-bit-match is deferred to DT7 (end-to-end image vs ComfyUI reference) for
-the same reason as DT4 — ComfyUI is not importable in this venv.
+Latents are treated as T=1 video (``(B, C, H, W)`` reshaped on entry/exit).
 """
 
 from __future__ import annotations
@@ -81,13 +61,9 @@ class CosmosDiTConfig:
 # --------------------------------------------------------------------------- #
 
 def _pad_to_patch_size(x: torch.Tensor, patch: Tuple[int, int, int]) -> torch.Tensor:
-    """Reflect-pad the last 3 dims (T, H, W) so each is a multiple of its patch.
-
-    The original code uses ``"circular"`` for non-trace builds; reflect is the
-    safer fallback (a circular pad on a slightly off-divisible image leaks
-    pixels from the opposite edge into the seam). For images the difference is
-    only at the last row/column, and Anima latents at 1024² are already
-    cleanly divisible by patch 2 — this branch only fires on odd sizes.
+    """Reflect-pad the last 3 dims (T, H, W) to multiples of the patch size.
+    Upstream uses circular padding, which leaks the opposite edge into the seam;
+    this only fires on sizes not divisible by 2.
     """
     pads = []
     for i in range(x.ndim - 2):
@@ -102,7 +78,7 @@ def _pad_to_patch_size(x: torch.Tensor, patch: Tuple[int, int, int]) -> torch.Te
 # --------------------------------------------------------------------------- #
 
 class _Timesteps(nn.Module):
-    """Sinusoidal timestep embedding — no parameters."""
+    """Sinusoidal timestep embedding, no parameters."""
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
@@ -118,10 +94,8 @@ class _Timesteps(nn.Module):
 
 
 class _TimestepEmbedding(nn.Module):
-    """``Linear(D→D) · SiLU · Linear(D→3·D)``. The second Linear's output is
-    the per-block adaLN-LoRA "delta" added to each ``adaln_modulation_*``
-    output before chunking; the carried ``emb`` (the SiLU input/sample) is
-    what the per-stage SiLU + Linear pair operates on."""
+    """``Linear(D→D) · SiLU · Linear(D→3·D)``. The second output is the per-block
+    adaLN-LoRA delta added to each ``adaln_modulation_*`` output."""
     def __init__(self, dim: int):
         super().__init__()
         # adaln_lora mode: linear_1 has no bias, linear_2 produces 3·dim
@@ -141,9 +115,8 @@ class _TimestepEmbedding(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class _PatchEmbed(nn.Module):
-    """Rearrange ``(B, C, T, H, W) → (B, T/r, H/m, W/n, C·r·m·n)`` then Linear
-    to ``model_channels``. Stored under ``proj.1`` (the Rearrange is index 0;
-    Linear is index 1) so it matches the checkpoint's ``x_embedder.proj.1.weight``.
+    """Rearrange ``(B, C, T, H, W) → (B, T/r, H/m, W/n, C·r·m·n)``, then Linear to
+    ``model_channels`` (stored as ``proj.1`` to match the checkpoint).
     """
     def __init__(self, patch_t: int, patch_s: int, in_channels: int, model_channels: int):
         super().__init__()
@@ -162,17 +135,14 @@ class _PatchEmbed(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# 3D RoPE — Apache-2.0 algorithm from NVIDIA Cosmos
+# 3D RoPE (Apache-2.0 algorithm from NVIDIA Cosmos)
 # --------------------------------------------------------------------------- #
 
 class _VideoRoPE3D(nn.Module):
-    """Three-axis (T, H, W) RoPE that returns a ``(L, head_dim/2, 2, 2)``
-    rotation-matrix tensor consumed by :func:`_apply_rope`.
-
-    The head_dim is split into (dim_h, dim_w, dim_t) with the spatial axes
-    getting ``head_dim//6·2`` each and the temporal axis getting the
-    remainder. For Anima head_dim=128 → 42/42/44. NTK extrapolation factors
-    scale the base θ per axis.
+    """Three-axis (T, H, W) RoPE returning a ``(L, head_dim/2, 2, 2)`` rotation
+    tensor for :func:`_apply_rope`. head_dim splits ``head_dim//6·2`` per
+    spatial axis, the rest temporal (42/42/44 for Anima); NTK factors scale θ
+    per axis.
     """
     def __init__(self, cfg: CosmosDiTConfig):
         super().__init__()
@@ -201,14 +171,9 @@ class _VideoRoPE3D(nn.Module):
         B, T, H, W, _ = x_B_T_H_W_D.shape
         device = x_B_T_H_W_D.device
         fps_key = fps.item() if fps is not None else None
-        # Device is part of the key because the cache is a plain attribute —
-        # module.to() won't move it — and the tensor is cached *on device* so a
-        # hit is free (a CPU-side cache would re-pay a 4 MB H2D copy per forward).
-        # Under torch.compile the cache is bypassed entirely: a tensor produced
-        # inside a reduce-overhead (CUDA Graphs) run lives in the graph's static
-        # buffer pool, so caching it would hand later calls storage that the next
-        # replay overwrites. Recomputing inside the compiled graph is fused trig
-        # over ~L·D/2 elements — cheaper than any cross-call bookkeeping.
+        # Cached on device (keyed by device, since .to() won't move a plain
+        # attribute). Bypassed under torch.compile: a tensor made inside a CUDA
+        # Graphs run lives in the static pool the next replay overwrites.
         compiling = torch.compiler.is_compiling()
         cache_key = (H, W, T, fps_key, device)
         if not compiling:
@@ -230,7 +195,7 @@ class _VideoRoPE3D(nn.Module):
         else:
             t_e = torch.outer(seq[:T] / fps * self.base_fps, t_freqs)
 
-        # [cos, -sin, sin, cos] per (pos, freq) → encodes a 2x2 rotation matrix.
+        # [cos, -sin, sin, cos] per (pos, freq): a 2x2 rotation matrix.
         def _rot(e):
             return torch.stack([torch.cos(e), -torch.sin(e), torch.sin(e), torch.cos(e)], dim=-1)
         h_r = _rot(h_e)
@@ -260,27 +225,16 @@ def _apply_rope_eager(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return out
 
 
-_apply_rope_cuda = None  # torch.compile'd lazily on first CUDA call; False = compile unusable here
+_apply_rope_cuda = None  # compiled lazily on first CUDA call; False = compile unusable
 
 
 def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """RoPE apply: eager everywhere except CUDA, where the chain is
-    ``torch.compile``'d once and reused.
-
-    The eager reshape/movedim/broadcast-rotate runs as ~a dozen unfused
-    elementwise kernels over fp32 temporaries — 1.37 ms at 4096 tokens on an
-    RTX 2060, and ×56 per forward (q and k, 28 blocks) that is ~7 % of a DiT
-    step. The compiled kernel runs the same math in 0.29 ms.
-    ``emulate_precision_casts`` keeps Inductor's intermediate rounding
-    identical to eager (no fma contraction, no dropped casts) — verified
-    bit-equal across shapes/batches — so this changes speed, not images.
-    ``dynamic=True`` compiles once for all resolutions (no per-shape stall).
-
-    Under an outer ``torch.compile`` (policy.compile / cuda_graphs) the
-    ``is_compiling`` gate hands Dynamo the eager body to inline and fuse into
-    the surrounding graph — same pattern as the RoPE table cache above. Any
-    compile failure (no Triton / no host toolchain) permanently falls back to
-    eager for the process.
+    """RoPE apply: eager, except on CUDA where the chain is ``torch.compile``'d
+    once (0.29 ms vs 1.37 ms at 4096 tokens, ~7% of a step).
+    ``emulate_precision_casts`` keeps rounding identical to eager, so images are
+    bit-equal; ``dynamic=True`` compiles once for all resolutions. Under an
+    outer compile, ``is_compiling`` hands Dynamo the eager body to fuse. Any
+    compile failure falls back to eager for the process.
     """
     global _apply_rope_cuda
     if torch.compiler.is_compiling() or not t.is_cuda:
@@ -292,7 +246,7 @@ def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
             out = compiled(t, freqs)  # compile here so a broken backend is caught once
             _apply_rope_cuda = compiled
             return out
-        except Exception as e:  # noqa: BLE001 — any backend failure means "no compile on this box"
+        except Exception as e:  # noqa: BLE001  any backend failure: no compile here
             print(f"[rope] torch.compile unavailable ({type(e).__name__}); keeping eager apply", flush=True)
             _apply_rope_cuda = False
     if _apply_rope_cuda is False:
@@ -305,10 +259,8 @@ def _apply_rope(t: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 
 class _Attention(nn.Module):
-    """Cosmos-style attention with per-head q/k RMSNorm.
-
-    Cross-attn passes ``context_dim < query_dim``; self-attn has
-    ``context_dim is None`` and applies 3D RoPE to q and k.
+    """Cosmos-style attention with per-head q/k RMSNorm. Self-attention
+    (``context_dim is None``) applies 3D RoPE to q and k.
     """
     def __init__(self, query_dim: int, context_dim: Optional[int], n_heads: int, head_dim: int, eps: float):
         super().__init__()
@@ -324,8 +276,7 @@ class _Attention(nn.Module):
         self.output_proj = nn.Linear(inner, query_dim, bias=False)
         self.q_norm = RMSNorm(head_dim, eps=eps)
         self.k_norm = RMSNorm(head_dim, eps=eps)
-        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in
-        # (see models/_attention.py). Plain attribute — no state-dict impact.
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in.
         self.attn_backend = "sdpa"
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor], rope_emb: Optional[torch.Tensor]) -> torch.Tensor:
@@ -338,18 +289,13 @@ class _Attention(nn.Module):
         if self.is_selfattn and rope_emb is not None:
             q = _apply_rope(q, rope_emb)
             k = _apply_rope(k, rope_emb)
-        # SDPA: this attention is not validated against an oracle in DT5;
-        # using SDPA here is a perf win that DT7 will check end-to-end. For
-        # MLP-free (large head_dim, image-style) attention the math/flash
-        # paths land at the same answer within fp16 tolerance. The dispatch
-        # runs that same SDPA by default; "fa2_turing" swaps in the sm75
-        # FlashAttention-2 port when the loader stamped it.
+        # SDPA by default; "fa2_turing" swaps in the sm75 FlashAttention-2 port.
         out = attention_blhd(q, k, v, self.attn_backend)
         return self.output_proj(out)
 
 
 class _GPT2FeedForward(nn.Module):
-    """Linear → GELU → Linear, no bias. Stored under ``layer1`` / ``layer2``."""
+    """Linear → GELU → Linear, no bias (``layer1`` / ``layer2``)."""
     def __init__(self, dim: int, hidden: int):
         super().__init__()
         self.layer1 = nn.Linear(dim, hidden, bias=False)
@@ -364,9 +310,8 @@ class _GPT2FeedForward(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class _AdaLNLoRA(nn.Sequential):
-    """``SiLU → Linear(D→r) → Linear(r→3D)`` — keyed ``.1.weight``, ``.2.weight``
-    to match the checkpoint's ``adaln_modulation_X.{1,2}.weight`` (index 0 is
-    the SiLU and carries no parameters)."""
+    """``SiLU → Linear(D→r) → Linear(r→3D)``, keyed ``.1`` / ``.2`` like the
+    checkpoint's ``adaln_modulation_X``."""
     def __init__(self, dim: int, r: int):
         super().__init__(
             nn.SiLU(),
@@ -376,9 +321,8 @@ class _AdaLNLoRA(nn.Sequential):
 
 
 class _Block(nn.Module):
-    """One adaLN-LoRA block. ``layer_norm_*`` carry no learnable params
-    (``elementwise_affine=False``); the adaLN modulators provide all
-    per-token affine shaping."""
+    """One adaLN-LoRA block. The layer norms have no affine params; the adaLN
+    modulators provide all per-token affine shaping."""
     def __init__(self, cfg: CosmosDiTConfig):
         super().__init__()
         d = cfg.model_channels
@@ -398,14 +342,14 @@ class _Block(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                # (B, T, H, W, D) — residual_dtype (fp32 in fp16-inference mode)
-        emb: torch.Tensor,              # (B, T, D)        — compute_dtype (fp16 in fp16-inference mode)
+        x: torch.Tensor,                # (B, T, H, W, D), residual dtype (fp32 for fp16 inference)
+        emb: torch.Tensor,              # (B, T, D), compute dtype
         ctx: torch.Tensor,              # (B, L, ctx_dim)
         rope_emb: torch.Tensor,         # ((T·H·W), head_dim/2, 2, 2)
         adaln_lora: torch.Tensor,       # (B, T, 3·D)
     ) -> torch.Tensor:
         residual_dtype = x.dtype
-        compute_dtype = emb.dtype       # whatever the model was loaded in (fp16 on CUDA)
+        compute_dtype = emb.dtype
         sa = self.adaln_modulation_self_attn(emb) + adaln_lora
         ca = self.adaln_modulation_cross_attn(emb) + adaln_lora
         ml = self.adaln_modulation_mlp(emb) + adaln_lora
@@ -420,23 +364,20 @@ class _Block(nn.Module):
         ml_s, ml_sc, ml_g = map(_expand, (ml_s, ml_sc, ml_g))
 
         B, T, H, W, D = x.shape
-        # Self-attn: normalize in residual_dtype (so the modulation stays
-        # numerically gentle), cast to compute_dtype for attention, cast back
-        # before the gated residual add so accumulation stays in fp32.
+        # Normalize in the residual dtype, attend in compute dtype, and cast back
+        # before the gated residual add so accumulation stays fp32.
         h = self.layer_norm_self_attn(x) * (1 + sa_sc) + sa_s
         h_seq = rearrange(h, "b t h w d -> b (t h w) d").to(compute_dtype)
         h_seq = self.self_attn(h_seq, None, rope_emb)
         h = rearrange(h_seq, "b (t h w) d -> b t h w d", t=T, h=H, w=W).to(residual_dtype)
         x = x + sa_g.to(residual_dtype) * h
 
-        # Cross-attn: same pattern.
         h = self.layer_norm_cross_attn(x) * (1 + ca_sc) + ca_s
         h_seq = rearrange(h, "b t h w d -> b (t h w) d").to(compute_dtype)
         h_seq = self.cross_attn(h_seq, ctx, None)
         h = rearrange(h_seq, "b (t h w) d -> b t h w d", t=T, h=H, w=W).to(residual_dtype)
         x = x + ca_g.to(residual_dtype) * h
 
-        # MLP: same pattern.
         h = self.layer_norm_mlp(x) * (1 + ml_sc) + ml_s
         h = self.mlp(h.to(compute_dtype)).to(residual_dtype)
         x = x + ml_g.to(residual_dtype) * h
@@ -445,10 +386,9 @@ class _Block(nn.Module):
     def modulated_self_attn_input(
         self, x: torch.Tensor, emb: torch.Tensor, adaln_lora: torch.Tensor
     ) -> torch.Tensor:
-        """The timestep-modulated tokens entering self-attention — TeaCache's
-        cheap proxy for "has the model's input changed". Reproduces exactly the
-        self-attn modulation from :meth:`forward` (adaLN affine over the
-        normalized tokens) without the attention/MLP that follow."""
+        """The timestep-modulated tokens entering self-attention, TeaCache's
+        cheap probe. Same modulation as :meth:`forward`, without the
+        attention/MLP."""
         sa = self.adaln_modulation_self_attn(emb) + adaln_lora
         sa_s, sa_sc, _ = sa.chunk(3, dim=-1)
         sa_s = rearrange(sa_s, "b t d -> b t 1 1 d")
@@ -461,17 +401,14 @@ class _Block(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class _FinalLayer(nn.Module):
-    """Two-chunk adaLN (shift, scale — no gate), then Linear to
-    ``patch_t · patch_s² · out_channels``. The output is the pre-unpatchify
-    tensor that the DiT's :meth:`unpatchify` reshapes into a (B, C, T, H, W)
-    latent."""
+    """Two-chunk adaLN (shift, scale; no gate), then Linear to
+    ``patch_t · patch_s² · out_channels`` for :meth:`unpatchify`."""
     def __init__(self, cfg: CosmosDiTConfig):
         super().__init__()
         d = cfg.model_channels
         r = cfg.adaln_lora_dim
         patch_out = cfg.patch_temporal * cfg.patch_spatial**2 * cfg.out_channels
         self.layer_norm = nn.LayerNorm(d, elementwise_affine=False, eps=cfg.rms_norm_eps)
-        # n_adaln_chunks = 2 (shift+scale only); .1 and .2 = Linear pair.
         self.adaln_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(d, r, bias=False),
@@ -480,7 +417,7 @@ class _FinalLayer(nn.Module):
         self.linear = nn.Linear(d, patch_out, bias=False)
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor, adaln_lora: torch.Tensor) -> torch.Tensor:
-        # The 4096-d adaLN output gets the first 2·D slice of adaln_lora added.
+        # The adaLN output gets the first 2·D slice of adaln_lora added.
         D = x.shape[-1]
         delta = (self.adaln_modulation(emb) + adaln_lora[:, :, : 2 * D])
         shift, scale = delta.chunk(2, dim=-1)
@@ -495,72 +432,29 @@ class _FinalLayer(nn.Module):
 # --------------------------------------------------------------------------- #
 
 class TeaCache:
-    """Timestep-Embedding-Aware Cache for one DiT denoising stream
-    (Liu et al., 2024, arXiv:2411.19108).
+    """Timestep-Embedding-Aware Cache for one DiT denoising stream (Liu et al.,
+    2024, arXiv:2411.19108).
 
-    The transformer blocks are the bulk of a DiT forward, yet their output
-    changes slowly between adjacent timesteps. TeaCache caches the blocks'
-    *residual* (``stack(x) - x``) and, on a step where the timestep-modulated
-    input has drifted little from the last computed step, *forecasts* that
-    residual instead of running the blocks — a ~28×-cheaper step.
+    Caches the blocks' residual (``stack(x) - x``) and, on a step where the
+    input has drifted little, forecasts it instead of running the blocks.
 
-    "Little" is measured as the accumulated rescaled relative-L1 change of the
-    block-0 modulated input; once it crosses ``rel_l1_thresh`` a real recompute
-    is forced and the accumulator resets. Larger threshold = more skipped steps
-    = faster but lower fidelity.
+    * **Decision** (``rule``). ``"drift"``: the accumulated rescaled rel-L1
+      change of the block-0 modulated input, recomputing once it crosses
+      ``rel_l1_thresh``. ``"easy"`` (EasyCache, arXiv:2507.02860): the
+      accumulated predicted output change ``k · ‖Δx‖ / ‖v_{t−1}‖`` with the
+      measured transformation rate ``k = ‖Δv‖ / ‖Δx‖`` (mean-abs norms);
+      ``warmup`` calls always compute, and ``coefficients``/``record`` don't
+      apply.
+    * **Forecast.** A skip extrapolates the residual from finite differences
+      over activation steps, up to ``max_order`` (0 = reuse, the original
+      TeaCache). ``basis="taylor"`` (TaylorSeer, arXiv:2503.06923) uses
+      ``k^i``; ``"hermite"`` (HiCache, arXiv:2508.16984) uses damped Hermite
+      ``σ^i · H_i(σk)``, which at ``sigma = 2**-0.5`` and order 1 equals taylor.
 
-    **Forecast (TaylorSeer, arXiv:2503.06923).** The residual is not frozen on a
-    skipped step: it is Taylor-extrapolated from its own recent history. Each
-    computed step refreshes finite-difference derivatives of the residual over
-    the *activation* steps (the steps that actually ran the blocks); a skipped
-    step ``k`` steps past the last activation returns
-    ``Σ_i residual^(i) · k^i / i!``. ``max_order`` caps the derivative order:
-    ``0`` reproduces the original cache-then-reuse (a held constant), ``1`` a
-    linear extrapolation, higher a polynomial one. Order ``1`` is the default —
-    it tracks the residual's drift between activations, so the same skip
-    *decision* yields a markedly better skip *output* than freezing, with no
-    change to calibration or thresholds (those govern only *when* to skip).
-    Forecasting only engages once ≥2 activations exist; before that (and at
-    order 0) a skip reuses the last residual exactly, as before.
-
-    **Basis (HiCache, arXiv:2508.16984).** ``basis`` picks the extrapolation
-    basis the finite-difference factors are weighted with: ``"taylor"`` uses
-    the monomials ``k^i`` above; ``"hermite"`` uses scaled physicists' Hermite
-    polynomials ``σ^i · H_i(σk)`` — the Karhunen-Loève-optimal basis when the
-    derivative estimates behave like a Gaussian process, which residual
-    trajectories empirically do. The two ``σ`` factors damp high-order terms
-    (``σ^i``) and keep the evaluation in the stable oscillatory regime
-    (``σk``), fixing Taylor's overshoot at trajectory turning points and
-    making order 2 usable. At ``sigma = 2**-0.5`` an order-1 hermite forecast
-    is *exactly* the order-1 taylor one (``σ·H_1(σk) = 2σ²k = k``); the
-    HiCache paper recommends order 2 with ``sigma = 0.5``.
-
-    **Decision rule (EasyCache, arXiv:2507.02860).** ``rule`` picks *when* to
-    skip; the forecast above (*what* a skip returns) is shared by both.
-    ``"drift"`` is the input-side rule described above. ``"easy"`` instead
-    tracks the model's own output sensitivity: on each computed step it
-    measures the transformation rate ``k = ‖v_t − v_{t−1}‖ / ‖x_t − x_{t−1}‖``
-    and, on every step, accumulates the *predicted* relative output change
-    ``k · ‖x_t − x_{t−1}‖ / ‖v_{t−1}‖`` since the last computed step, forcing a
-    recompute once it reaches ``rel_l1_thresh`` (τ; 0.05 is the paper default).
-    All norms are mean-absolute, as in the reference implementation. Because it
-    reads actual velocity change, an ancestral noise injection shows up as a
-    large input change and forces a recompute exactly where structure is being
-    decided — so the threshold is meant to transfer across samplers and step
-    counts, which the drift rule's does not. ``warmup`` calls always compute
-    (the rate is not measurable before then); ``coefficients`` are **ignored**
-    under ``"easy"`` (the rule has no rescale) and ``record`` mode is
-    drift-only.
-
-    One instance tracks one stream. Classifier-free guidance needs two (the
-    conditioned and unconditioned passes are separate Anima forwards whose
-    modulated inputs coincide, so a shared accumulator would read zero drift
-    between them).
-
-    ``coefficients`` are a polynomial (highest-degree first, ``numpy.poly1d``
-    convention) that rescales the raw relative-L1 into an output-change
-    estimate. They are model-specific and require offline calibration; Anima
-    has none published, so the default is the identity ``f(x) = x``.
+    One instance per stream: CFG's cond and uncond passes have near-identical
+    modulated inputs, so a shared accumulator would read zero drift.
+    ``coefficients`` rescale the raw rel-L1 (``numpy.poly1d`` order; identity by
+    default) and come from offline calibration.
     """
 
     def __init__(self, rel_l1_thresh: float, coefficients: Sequence[float] = (1.0, 0.0),
@@ -582,41 +476,34 @@ class TeaCache:
         self.prev_modulated: Optional[torch.Tensor] = None
         self.accumulated = 0.0
         self.calls = 0   # forwards seen
-        self.skips = 0   # forwards whose blocks were reused from cache
+        self.skips = 0   # forwards whose blocks were reused
         self.rel_history: list[float] = []   # raw per-step rel-L1 (record mode)
-        # Taylor forecast state: ``taylor[i]`` is the i-th finite difference of
-        # the block residual over activation steps (``taylor[0]`` the residual
-        # itself). ``last_activated`` is the ``calls`` index of the last computed
-        # step, so a skip at ``calls`` extrapolates ``calls - last_activated``
-        # steps forward. Empty until the first computed step.
+        # ``taylor[i]``: i-th finite difference of the residual over activation
+        # steps. ``last_activated``: the ``calls`` index of the last computed step.
         self.taylor: dict[int, torch.Tensor] = {}
         self.last_activated = -1
-        # EasyCache state (rule == "easy"; all unused under "drift"). Latents are
-        # kept in fp32 so the differences below don't lose their leading digits to
-        # fp16 cancellation. ``pending_dx`` is the input change that produced the
-        # output ``record_output`` is about to see, i.e. the denominator of ``k``.
+        # EasyCache state (rule == "easy"), kept in fp32 against fp16
+        # cancellation. ``pending_dx`` is the denominator of ``k`` for the output
+        # ``record_output`` sees next.
         self.rule = rule
         self.warmup = int(warmup)
         self.prev_x: Optional[torch.Tensor] = None
         self.prev_out: Optional[torch.Tensor] = None
         self.k: Optional[float] = None
         self.pending_dx = 0.0
-        self.last_computed = True   # decision of the most recent call (both rules)
+        self.last_computed = True   # decision of the most recent call
         self.follow_misses = 0      # instrumentation, filled in by the pipeline
 
     def _rescale(self, x: float) -> float:
         out = 0.0
-        for c in self.coefficients:  # Horner, poly1d order (highest degree first)
+        for c in self.coefficients:  # Horner, highest degree first
             out = out * x + c
         return out
 
     def should_compute(self, modulated: torch.Tensor) -> bool:
-        """Decide whether this step must run the blocks, and fold ``modulated``
-        into the accumulator. The first call (no history) always computes.
-
-        In ``record`` mode the accumulator/threshold are bypassed: every step
-        computes and the raw relative-L1 is logged to ``rel_history`` — that's
-        the ``x`` of the (input-drift -> output-drift) fit done by calibration.
+        """Decide whether this step runs the blocks, folding ``modulated`` into
+        the accumulator; the first call always computes. ``record`` mode computes
+        every step and logs the raw rel-L1 for calibration.
         """
         self.calls += 1
         if self.prev_modulated is None:
@@ -641,28 +528,22 @@ class TeaCache:
         return True
 
     def should_compute_easy(self, x: torch.Tensor) -> bool:
-        """EasyCache decision (``rule == "easy"``): fold this step's latent
-        change into the accumulated *predicted output change* and skip while it
-        stays under ``rel_l1_thresh``.
-
-        ``x`` is the DiT's padded ``(B, C, T, H, W)`` latent — the model input,
-        not the timestep-modulated block probe the drift rule reads. The first
-        ``warmup`` calls always compute: the transformation rate ``k`` is
-        undefined until :meth:`record_output` has seen two consecutive outputs.
+        """EasyCache decision on the padded ``(B, C, T, H, W)`` model input. The
+        first ``warmup`` calls always compute (``k`` needs two outputs).
         """
         self.calls += 1
         x = x.detach().to(torch.float32, copy=True)
-        if self.prev_x is None:                      # first call: no history
+        if self.prev_x is None:
             self.prev_x = x
             self.pending_dx = 0.0
             self.accumulated = 0.0
             self.last_computed = True
             return True
-        dx = (x - self.prev_x).abs().mean().item()   # mean-abs, as in the reference impl
+        dx = (x - self.prev_x).abs().mean().item()   # mean-abs, as in the reference
         self.prev_x = x
         self.pending_dx = dx
         if self.calls <= self.warmup or self.k is None or self.prev_out is None:
-            decision = True                          # warm-up / rate not yet measurable
+            decision = True                          # warm-up / rate not measurable
         else:
             v_norm = self.prev_out.abs().mean().item()
             self.accumulated += self.k * dx / max(v_norm, 1e-8)
@@ -675,13 +556,8 @@ class TeaCache:
         return decision
 
     def record_output(self, out: torch.Tensor) -> None:
-        """Feed the step's model output back to the EasyCache rule.
-
-        Called on *every* call under ``rule == "easy"`` (a skipped step's output
-        is the forecast one, which is what the next step will actually be
-        compared against). The transformation rate is refreshed only after a
-        step that really ran the blocks, so ``k`` always has a true model output
-        as the endpoint of its numerator.
+        """Feed the step's output (forecast or real) to the EasyCache rule. The
+        rate ``k`` refreshes only after a step that ran the blocks.
         """
         out = out.detach().to(torch.float32, copy=True)
         if self.last_computed and self.prev_out is not None and self.pending_dx > 0:
@@ -689,14 +565,10 @@ class TeaCache:
         self.prev_out = out
 
     def update(self, residual: torch.Tensor) -> None:
-        """Record a freshly computed block residual and refresh the Taylor
-        finite-difference factors used to forecast skipped steps.
-
-        The i-th factor is the i-th finite difference of the residual over
-        activation steps, divided by the (possibly uneven) step gap between the
-        last two activations — so ``forecast`` reads a per-step derivative. At
-        ``max_order == 0``, or on the first activation, only the 0-th factor (the
-        residual itself) is kept, which makes a subsequent skip reuse it exactly.
+        """Record a computed residual and refresh the finite-difference factors,
+        each divided by the (possibly uneven) gap between the last two
+        activations. At ``max_order == 0`` or on the first activation only the
+        residual itself is kept.
         """
         dist = self.calls - self.last_activated if self.last_activated >= 0 else 1
         prev, new = self.taylor, {0: residual}
@@ -709,10 +581,8 @@ class TeaCache:
         self.last_activated = self.calls
 
     def _basis_weight(self, i: int, k: int) -> float:
-        """Weight of the i-th finite-difference factor at horizon ``k`` (i ≥ 1):
-        the monomial ``k^i`` (taylor) or the scaled Hermite ``σ^i · H_i(σk)``
-        (hermite), with ``H_i`` built by the physicists' recurrence
-        ``H_{n+1}(x) = 2x·H_n(x) - 2n·H_{n-1}(x)``."""
+        """Weight of factor ``i`` (≥ 1) at horizon ``k``: ``k^i`` (taylor) or
+        ``σ^i · H_i(σk)`` (hermite, physicists' recurrence)."""
         if self.basis == "taylor":
             return float(k ** i)
         x = self.sigma * k
@@ -722,11 +592,8 @@ class TeaCache:
         return self.sigma ** i * h
 
     def forecast(self) -> torch.Tensor:
-        """Extrapolate the block residual to the current (skipped) step from the
-        factors :meth:`update` last recorded, weighting them with the configured
-        ``basis``. With only the 0-th factor (order 0, or fewer than two
-        activations) this returns the last residual unchanged — the original
-        cache-then-reuse behavior — under either basis."""
+        """Extrapolate the residual to the current skipped step. With only the
+        0-th factor this returns the last residual unchanged."""
         k = self.calls - self.last_activated
         out = None
         for i, factor in self.taylor.items():
@@ -749,8 +616,7 @@ class CosmosDiT(nn.Module):
 
         in_ch = cfg.in_channels + (1 if cfg.concat_padding_mask else 0)
         self.x_embedder = _PatchEmbed(cfg.patch_temporal, cfg.patch_spatial, in_ch, cfg.model_channels)
-        # Sequential([Timesteps, TimestepEmbedding]) so the checkpoint's
-        # ``t_embedder.1.linear_*.weight`` keys land on the right submodule.
+        # Sequential so the checkpoint's ``t_embedder.1.*`` keys match.
         self.t_embedder = nn.Sequential(
             _Timesteps(cfg.model_channels),
             _TimestepEmbedding(cfg.model_channels),
@@ -798,9 +664,7 @@ class CosmosDiT(nn.Module):
         x = _pad_to_patch_size(x, (self.cfg.patch_temporal, self.cfg.patch_spatial, self.cfg.patch_spatial))
 
         x_B_T_H_W_D = self._embed(x, padding_mask)
-        # pos_embedder returns (L, D/2, 2, 2); insert singleton dims so the
-        # L axis broadcasts over (B, head) when applied to a (B, L, H, D)
-        # query in _apply_rope. Shape becomes (1, L, 1, D/2, 2, 2).
+        # (L, D/2, 2, 2) → (1, L, 1, D/2, 2, 2) to broadcast over (B, head).
         rope_emb = self.pos_embedder(x_B_T_H_W_D, fps=fps).unsqueeze(1).unsqueeze(0)
 
         if timesteps.ndim == 1:
@@ -809,19 +673,14 @@ class CosmosDiT(nn.Module):
         emb_B_T_D, adaln_lora_B_T_3D = self.t_embedder[1](sample_emb)
         emb_B_T_D = self.t_embedding_norm(emb_B_T_D)
 
-        # The Cosmos residual stream has large magnitude — over 28 blocks the
-        # accumulated norm can overshoot fp16's ±65504 ceiling and saturate
-        # to inf/NaN. Promote x to fp32 here so additions across the block
-        # chain stay representable; each block re-casts to compute_dtype on
-        # the way into attention/MLP and back out before the residual add.
+        # The residual stream can exceed fp16's range over 28 blocks, so keep it
+        # in fp32; blocks cast to the compute dtype around attention/MLP.
         if x_B_T_H_W_D.dtype == torch.float16:
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
-        # TeaCache: on a low-drift step, reuse the cached block residual instead
-        # of running the 28-block stack. The timestep embedding (above) and the
-        # final layer (below) are cheap and always run; only the blocks skip.
-        # The "easy" rule reads the raw latent, so its probe costs nothing; only
-        # the "drift" rule pays for the block-0 LayerNorm + adaLN modulation.
+        # TeaCache: on a low-drift step reuse the cached block residual. The
+        # timestep embedding and final layer always run. Only "drift" pays for
+        # the block-0 modulation probe.
         if teacache is None:
             compute = True
         elif teacache.rule == "easy":
@@ -848,20 +707,14 @@ class CosmosDiT(nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# AnimaDiT — base + LLMAdapter
+# AnimaDiT: base + LLMAdapter
 # --------------------------------------------------------------------------- #
 
 class AnimaDiT(CosmosDiT):
-    """Cosmos-Predict2 base + a 6-block LLM-Adapter that bridges Qwen3 hidden
-    states (DT3) into the 1024-d cross-attention context the DiT consumes.
-
-    ``forward`` accepts both the already-prepared ``context`` (1024-d) and the
-    optional ``t5xxl_ids`` path used by the actual generation pipeline: when
-    ``t5xxl_ids`` is given, the supplied ``context`` is treated as Qwen3 source
-    hidden states and is routed through the adapter (with optional
-    ``t5xxl_weights`` per-token scaling and padding to ≥512 tokens) before
-    the DiT cross-attends to it. When ``t5xxl_ids`` is None the ``context``
-    is used directly (useful for unit tests and ablations).
+    """Cosmos-Predict2 base plus a 6-block LLM-Adapter mapping Qwen3 hidden
+    states to the 1024-d cross-attention context. With ``t5xxl_ids``,
+    ``context`` is Qwen3 hidden states routed through the adapter (optional
+    ``t5xxl_weights``, padded to ≥512 tokens); without, it is used directly.
     """
 
     def __init__(self, cfg: CosmosDiTConfig | None = None, adapter_cfg: LLMAdapterConfig | None = None):

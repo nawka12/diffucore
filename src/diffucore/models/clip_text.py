@@ -1,4 +1,4 @@
-"""CLIP ViT-L/14 text transformer — the SD1.5 conditioner.
+"""CLIP ViT-L/14 text transformer, the SD1.5 conditioner.
 
 Implements the CLIP text encoder (Radford et al., 2021) as used by Stable
 Diffusion. Submodule and parameter names mirror the on-disk HF CLIP keys (under
@@ -39,9 +39,7 @@ class CLIPEmbeddings(nn.Module):
         super().__init__()
         self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
         self.position_embedding = nn.Embedding(cfg.max_position_embeddings, cfg.hidden_size)
-        # Non-persistent: position_ids is the constant arange(0..max), not a learned
-        # weight. Many SDXL finetunes drop it from their state dict, so requiring it
-        # would reject otherwise-valid checkpoints; it is regenerated here identically.
+        # Non-persistent: many SDXL finetunes drop this constant arange.
         self.register_buffer(
             "position_ids",
             torch.arange(cfg.max_position_embeddings).unsqueeze(0),
@@ -136,9 +134,8 @@ class CLIPTextEncoder(nn.Module):
             x = tm.final_layer_norm(x)
 
         if return_pooled:
-            # CLIP pooler_output: the EOS token's hidden state from the final-
-            # normed sequence (FLUX's pooled CLIP vector). argmax finds the EOS
-            # id (the largest token id) — its first occurrence is the true end.
+            # CLIP pooler_output (FLUX's pooled vector): the final-normed hidden
+            # state at the first EOS, found by argmax (EOS is the largest id).
             normed = x if clip_skip == 1 else tm.final_layer_norm(x)
             eos = token_ids.to(torch.int).argmax(dim=-1)
             pooled = normed[torch.arange(normed.shape[0], device=normed.device), eos]

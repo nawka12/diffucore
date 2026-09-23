@@ -1,13 +1,7 @@
-"""Inpainting pipeline (masked image-to-image).
-
-Same shape as img2img — encode the init image, noise it, denoise — but a
-:class:`~diffucore.sampling.MaskedDenoiser` pins the keep region to the original
-latent so only the masked region is repainted (no sampler changes; see that
-class). After decoding, the original pixels are composited back into the keep
-region so untouched areas are byte-exact (the VAE round-trip never touches them).
-
-Mask convention: **white (255) = repaint, black (0) = keep** — the common A1111 /
-diffusers convention.
+"""Inpainting pipeline: img2img with a :class:`~diffucore.sampling.MaskedDenoiser`
+pinning the keep region, then the original pixels composited back so untouched
+areas are byte-exact. Mask: white (255) = repaint, black (0) = keep (A1111 /
+diffusers).
 """
 
 from __future__ import annotations

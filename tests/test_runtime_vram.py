@@ -1,9 +1,6 @@
-"""Verification for the runtime VRAM techniques (see docs/RUNTIME_SPEC.md).
-
-Tiled-VAE correctness runs anywhere (no checkpoint, no GPU) on a random-weight
-autoencoder — the blend math is what matters, not the weights. The offload
-byte-identity and peak-VRAM checks need a real SDXL checkpoint on CUDA and skip
-otherwise.
+"""Runtime VRAM techniques. Tiled-VAE correctness runs anywhere on a
+random-weight autoencoder; the offload byte-identity and peak-VRAM checks need
+a real SDXL checkpoint on CUDA and skip otherwise.
 """
 
 import os
@@ -73,8 +70,7 @@ def test_tiled_decode_is_deterministic(vae):
 # --- Smart tile-vs-untiled decision -----------------------------------------
 
 def test_can_decode_untiled_cpu_always_true(vae):
-    """CPU has no VRAM constraint — system RAM is plentiful, so the smart
-    check must always allow untiled regardless of resolution."""
+    """CPU always allows untiled."""
     cpu = torch.device("cpu")
     # Use an absurd latent size that would never fit on a GPU.
     assert can_decode_untiled(vae, (1, 4, 512, 512), cpu) is True
@@ -90,19 +86,15 @@ def test_can_decode_untiled_tiles_when_short_on_vram(vae):
 
 
 def test_can_decode_untiled_untiled_when_vram_is_ample(vae):
-    """With plenty of free VRAM the check must allow untiled — 24 GB free at
-    1024² leaves > 6 GB / 0.85 headroom."""
+    """With 24 GB free at 1024², untiled is allowed."""
     cuda = torch.device("cuda")
     twenty_four_gb = 24 * 1024**3
     assert can_decode_untiled(vae, (1, 4, 128, 128), cuda, free_bytes=twenty_four_gb) is True
 
 
 def test_can_decode_untiled_qwen_uses_lower_per_pixel_cost():
-    """The Qwen-Image VAE family has lower per-pixel decode cost than SDXL's
-    AutoencoderKL (3D-conv path but smaller activation peak — see f10771f).
-    At a free budget where SDXL would tile, Qwen must still go untiled. A stub
-    class with the right ``__name__`` is enough — the helper only reads
-    ``type(vae).__name__``."""
+    """QwenImageVAE's lower per-pixel cost goes untiled where SDXL's would tile
+    (a stub with the right ``__name__`` is enough)."""
     cuda = torch.device("cuda")
     qwen_stub = type("QwenImageVAE", (torch.nn.Module,), {})()
     sdxl_stub = type("AutoencoderKL", (torch.nn.Module,), {})()
@@ -135,9 +127,8 @@ def test_can_decode_untiled_fp16_halves_estimate():
 # --- fp16 VAE non-finite fallback (vae_decode_safe) -- CPU-runnable ----------
 
 class _FlakyFP16VAE(torch.nn.Module):
-    """Decodes to NaN in fp16 and to a clean image in fp32 — the fp16-overflow
-    failure mode ``vae_decode_safe`` must recover from. ``fail_fp16=False``
-    makes fp16 succeed (the no-fallback happy path)."""
+    """NaN in fp16, clean in fp32: the failure ``vae_decode_safe`` must recover
+    from. ``fail_fp16=False`` is the happy path."""
 
     def __init__(self, fail_fp16: bool = True):
         super().__init__()
@@ -166,8 +157,7 @@ def test_vae_decode_safe_fp16_nan_falls_back_to_fp32():
 
 
 def test_vae_decode_safe_fp16_clean_path_keeps_fp16():
-    """A finite fp16 decode must NOT trigger the fallback — one decode, policy
-    and module untouched."""
+    """A finite fp16 decode must not trigger the fallback."""
     vae = _FlakyFP16VAE(fail_fp16=False)
     policy = DevicePolicy(device=torch.device("cpu"), vae_dtype=torch.float16)
     image, mode = vae_decode_safe(vae, torch.randn(1, 4, 8, 8, dtype=torch.float16), policy)
@@ -238,8 +228,8 @@ def test_perf_context_is_no_op_when_off():
 
 
 def test_perf_context_sets_and_restores_when_on():
-    """With flags on, perf_context flips the global flags inside and restores
-    the previous values on exit — even if they were True or False to start."""
+    """With flags on, perf_context flips the global flags and restores the
+    previous values on exit."""
     p = DevicePolicy(device=torch.device("cpu"), cudnn_benchmark=True, tf32=True)
     # Force a known-baseline OFF state so we can observe the flip and restore.
     prev_bench = torch.backends.cudnn.benchmark
@@ -297,12 +287,11 @@ def test_compile_with_full_offload_raises():
 
 
 def test_compile_with_encoders_offload_is_allowed():
-    """offload='encoders' keeps the backbone resident — compile is fine."""
+    """offload='encoders' keeps the backbone resident, so compile is allowed."""
     cpu = torch.device("cpu")
     backbone = torch.nn.Linear(4, 4)
     p = DevicePolicy(device=cpu, compile=True, offload="encoders")
-    # Should not raise — return value is either the eager module or an
-    # OptimizedModule depending on the platform; both are callable.
+    # Should not raise (eager module or OptimizedModule, both callable).
     out = maybe_compile_backbone(backbone, p)
     assert callable(out)
 
@@ -321,8 +310,7 @@ def test_cuda_graphs_default_off():
 
 
 def test_cuda_graphs_requires_compile():
-    """cuda_graphs=True without compile=True is a config error — CUDA Graphs are
-    captured by torch.compile's reduce-overhead mode, not by us directly."""
+    """cuda_graphs=True without compile=True is a config error."""
     p = DevicePolicy(device=torch.device("cpu"), cuda_graphs=True)
     with pytest.raises(ValueError, match="requires policy.compile=True"):
         maybe_compile_backbone(torch.nn.Linear(4, 4), p)
@@ -338,10 +326,7 @@ def test_cuda_graphs_with_compile_is_allowed():
 
 
 def test_to_channels_last_preserves_conv_output_cpu():
-    """``to_channels_last`` is a layout change, not a math change: a Conv2d
-    forward must give the same output (within tight tolerance) whether the
-    module + input are channels-last or contiguous. CPU-runnable; CUDA cuDNN
-    correctness is well-tested upstream."""
+    """``to_channels_last`` is a layout change: a Conv2d gives the same output."""
     torch.manual_seed(0)
     conv = torch.nn.Conv2d(8, 16, 3, padding=1).eval()
     x = torch.randn(1, 8, 32, 32)
@@ -366,8 +351,8 @@ def _require_sdxl_cuda():
 
 
 def _free():
-    """Drop any freed pipeline's weights from host RAM and the GPU caching
-    allocator before the next load — a 6.6 GB SDXL checkpoint won't fit twice."""
+    """Free the previous pipeline before the next load (a 6.6 GB SDXL checkpoint
+    won't fit twice)."""
     import gc
 
     gc.collect()
@@ -376,10 +361,8 @@ def _free():
 
 
 def _gen_fresh(offload, **kw):
-    """Load one SDXL pipeline in ``offload`` mode, generate, then free it. Loading
-    one mode at a time is the whole point: holding the resident copy (6.6 GB on the
-    GPU) alongside an encoders-mode copy (5 GB UNet also resident) overflows the
-    12 GB card before a single step runs."""
+    """Load one SDXL pipeline in ``offload`` mode, generate, free it. Two modes
+    resident at once overflow the 12 GB card."""
     from diffucore import TextToImage, load_checkpoint
 
     policy = DevicePolicy(device=torch.device("cuda"), compute_dtype=torch.float16, offload=offload)
@@ -403,16 +386,14 @@ def sdxl_reference():
 
 @pytest.mark.parametrize("mode", [True, "encoders"])
 def test_offload_is_byte_identical(sdxl_reference, mode):
-    """Offload only moves weights between devices — it must not change a pixel, in
-    either full (``True``) or encoders-only mode."""
+    """Offload must not change a pixel, in full or encoders-only mode."""
     out = _gen_fresh(mode, width=1024, height=1024)
     assert np.array_equal(sdxl_reference, out), f"offload={mode!r} diverged from resident"
 
 
 def test_offload_peak_vram_under_budget():
-    """offload + tiled VAE at 1024 should keep the peak well under the ~10 GB
-    all-resident untiled figure — measured ~6.6 GB on the RTX 2060 (the floor is
-    the UNet stage; see docs/RUNTIME_SPEC.md)."""
+    """offload + tiled VAE at 1024 keeps the peak well under the ~10 GB
+    all-resident figure (~6.6 GB measured on the RTX 2060)."""
     _require_sdxl_cuda()
     from diffucore import TextToImage, load_checkpoint
 

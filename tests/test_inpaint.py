@@ -1,10 +1,6 @@
-"""Tests for the inpainting pipeline.
-
-The mask preprocessing, the masked-denoiser mechanism, and the pixel composite
-all run on CPU with no checkpoint — the sampler-level test exercises the core
-claim (keep region pinned to z0 through the whole loop) directly. The end-to-end
-test needs a real checkpoint and is skipped when absent, mirroring the other
-pipeline tests.
+"""Inpainting: mask preprocessing, the masked denoiser (keep region pinned to
+z0 through the loop) and the composite on CPU; the end-to-end test needs a real
+checkpoint.
 """
 
 import os
@@ -40,7 +36,7 @@ def test_preprocess_mask_shape_and_convention():
 
 class _ConstantDenoiser:
     """A stub denoiser: always reports ``target`` as the x0 estimate, regardless of
-    input — stands in for 'the model wants this in the repaint region'."""
+    input."""
 
     def __init__(self, target):
         self.target = target

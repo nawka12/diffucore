@@ -1,42 +1,18 @@
-"""LLM-Adapter — Anima's 6-block bridge between Qwen3 hidden states and the DiT.
+"""LLM-Adapter: Anima's 6-block bridge from Qwen3 hidden states to the DiT.
 
-Anima conditions on its prompt twice. The Qwen3 0.6B encoder (DT3) consumes
-the Qwen-tokenized prompt and produces *source hidden states* (semantics).
-Separately, the same prompt is tokenized with the T5 tokenizer to produce
-*target token IDs* (positional/word-aware tokens). The LLM-Adapter is a small
-transformer that uses the T5 tokens as a "query stream" (embedded via its own
-32128-row table) and cross-attends to the Qwen3 hidden states; its output is
-the 1024-dim context the DiT cross-attends to.
+The prompt is also tokenized with T5; those ids, embedded by the adapter's own
+32128-row table, are the query stream that cross-attends to the Qwen3 hidden
+states, producing the 1024-d context the DiT cross-attends to::
 
-Architecture::
-
-    embed(target_input_ids)               -> x (B, L_t5, 1024)
-    in_proj = Identity  (model_dim == target_dim for Anima)
+    x = embed(t5_ids)
     for 6 blocks:
-        x += self_attn (RMSNorm(x), q_rope=target_pos, mask=target_mask)
-        x += cross_attn(RMSNorm(x), context=src_hidden,
-                        q_rope=target_pos, k_rope=source_pos,
-                        mask=source_mask)
-        x += mlp       (RMSNorm(x))            # Linear(bias) -> GELU -> Linear(bias)
-    return final_norm(out_proj(x))             # both at target_dim
+        x += self_attn(RMSNorm(x), rope=target_pos)
+        x += cross_attn(RMSNorm(x), context=qwen_hidden, q_rope=target_pos, k_rope=source_pos)
+        x += mlp(RMSNorm(x))
+    return final_norm(out_proj(x))
 
-Attention details:
-    n_heads = 16, head_dim = 64 → inner_dim = 1024 (= model_dim).
-    per-head q_norm / k_norm (RMSNorm over head_dim) applied **before** RoPE.
-    o_proj inside each Attention has no bias; the outer ``out_proj`` does.
-    RoPE θ = 10_000 (Anima's adapter uses the standard θ, not Qwen3's 1e6).
-    Eager attention (matmul → softmax → matmul) to leave room for bit-identity
-    once an in-process oracle is available.
-
-Submodule and parameter names mirror the on-disk ``net.llm_adapter.*`` keys
-so the standard ``_load_sub(module, sd, "net.llm_adapter.")`` strict-load
-works without remapping.
-
-Verification status (DT4): key-set match + strict load + forward-shape +
-determinism. Numerical bit-match against the ComfyUI reference is deferred
-to DT7 (end-to-end pipeline) because ComfyUI's local install has native deps
-that can't be imported in this venv; the end-to-end image comparison is a
-stronger correctness signal anyway.
+16 heads of 64, per-head q/k RMSNorm before RoPE (θ = 10000), eager attention.
+Names mirror the on-disk ``net.llm_adapter.*`` keys.
 """
 
 from __future__ import annotations
@@ -52,7 +28,7 @@ from ._norm import RMSNorm, _rotate_half
 
 @dataclass
 class LLMAdapterConfig:
-    target_vocab: int = 32128       # T5 vocab — Anima embeds T5 token IDs here
+    target_vocab: int = 32128       # T5 vocab: Anima embeds T5 token ids here
     target_dim: int = 1024          # adapter output dim (= DiT cross-attn ctx)
     source_dim: int = 1024          # Qwen3 hidden dim consumed by cross-attn
     model_dim: int = 1024           # internal hidden dim
@@ -86,12 +62,8 @@ class _RotaryEmbedding(nn.Module):
 
 
 class _Attention(nn.Module):
-    """Multi-head attention with per-head q/k RMSNorm + RoPE.
-
-    Self-attn when ``context is None`` (k=v=x, both q and k get the same
-    positional embedding). Cross-attn when context is given (k=v from
-    context; q uses ``q_pe`` and k uses ``k_pe`` — the adapter applies RoPE
-    to cross-attn keys based on the *source* positions, not the target).
+    """Multi-head attention with per-head q/k RMSNorm and RoPE. For
+    cross-attention, keys take RoPE from the source positions (``k_pe``).
     """
 
     def __init__(self, query_dim: int, context_dim: int, n_heads: int, head_dim: int, eps: float):
@@ -121,7 +93,7 @@ class _Attention(nn.Module):
         scale = self.head_dim**-0.5
         attn = torch.matmul(q, k.transpose(-1, -2)) * scale
         if key_mask is not None:
-            # key_mask: (B, 1, 1, Tk) bool — True = keep, False = mask out.
+            # key_mask: (B, 1, 1, Tk) bool, True = keep.
             attn = attn.masked_fill(~key_mask, float("-inf"))
         attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
         out = torch.matmul(attn, v)
@@ -130,9 +102,8 @@ class _Attention(nn.Module):
 
 
 class _Block(nn.Module):
-    """One LLM-Adapter layer: self-attn, cross-attn, MLP — all pre-norm with
-    RMSNorm; MLP is ``Linear(bias) → GELU → Linear(bias)`` (default ``nn.Linear``
-    bias matches the checkpoint's ``mlp.0.bias`` / ``mlp.2.bias``)."""
+    """One pre-norm (RMSNorm) layer: self-attn, cross-attn, then
+    ``Linear → GELU → Linear`` with biases."""
 
     def __init__(self, cfg: LLMAdapterConfig):
         super().__init__()

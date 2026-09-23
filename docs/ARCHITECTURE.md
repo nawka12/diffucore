@@ -5,7 +5,7 @@ This document is the design spec for Diffucore's inference engine. It describes
 model. The first concrete target is Stable Diffusion 1.5 text-to-image; the
 abstractions are chosen so that later architectures (SDXL, and DiT-style models)
 slot in without reshaping the core. **Anima** (Cosmos-Predict2-family DiT) was
-the first DiT integration and is now end-to-end working at 1024² — see
+the first DiT integration and is now end-to-end working at 1024²; see
 [`ROADMAP.md`](ROADMAP.md) for the per-component status.
 
 ## 1. Scope and non-goals
@@ -57,7 +57,7 @@ src/diffucore/
                          distill an optimal-stepsize schedule (offline calibration).
     parameterization.py  betas -> σ table; σ<->t; eps / v prediction scalings.
     samplers.py          Euler/Heun/ancestral, DPM2(+ancestral), DPM++ (2M, SDE,
-                         2M-SDE, 3M-SDE), ER-SDE, SECANT — pure σ-space steppers;
+                         2M-SDE, 3M-SDE), ER-SDE, SECANT: pure σ-space steppers;
                          the DPM++/ER-SDE family flow-aware in half-logSNR, SECANT
                          native σ-space (x0-secant multistep).
     denoiser.py          wraps a backbone: applies scalings + CFG.
@@ -69,29 +69,29 @@ src/diffucore/
   conditioning/          tokenizer(s) + text-encoder orchestration (incl. SDXL dual).
   loading/               safetensors IO, arch detection.
   runtime/               device/dtype policy + CPU offload + tiled VAE decode.
-  pipelines/             TextToImage — user-facing glue.
+  pipelines/             TextToImage: user-facing glue.
   lora.py                apply_lora / remove_lora / clear_loras: fuse and unfuse LoRA/LoKr deltas.
 ```
 
 The full SD1.5 (512²) and SDXL (1024²) text-to-image paths are implemented, as
 are `runtime/` sequential CPU offload and tiled VAE decode (opt-in; they let
-SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
+SDXL run on smaller cards; see §7 and `RUNTIME_SPEC.md`).
 
 ## 4. Core abstractions
 
-- **ModelBundle** — the result of loading a checkpoint: the diffusion backbone,
+- **ModelBundle**: the result of loading a checkpoint: the diffusion backbone,
   the VAE, the text encoder(s), and a small `ModelSpec` (architecture id,
   prediction type, latent channels/scale, training schedule). Detection fills
-  the spec from the checkpoint's tensor keys and shapes — including the
+  the spec from the checkpoint's tensor keys and shapes, including the
   `prediction` type, which is `"v"` when the checkpoint carries the bare `v_pred`
   marker tensor (the eps/v weights are otherwise identical) and `"eps"` otherwise.
 
-- **DiscreteSchedule** (`parameterization.py`) — derives the per-timestep σ table
+- **DiscreteSchedule** (`parameterization.py`): derives the per-timestep σ table
   from the model's training betas and converts between σ and the continuous
   timestep the backbone expects. This is the bridge between "model time" and
   "sampler time."
 
-- **Scaling** (`parameterization.py`) — the prediction parameterization. Given σ
+- **Scaling** (`parameterization.py`): the prediction parameterization. Given σ
   it yields `(c_skip, c_out, c_in)` so that
   `denoised = c_skip·x + c_out·model(c_in·x, t(σ))`. `EpsScaling` covers SD1.5;
   `VScaling` covers v-prediction models; `FlowMatchingConstScaling` covers
@@ -102,18 +102,18 @@ SDXL run on smaller cards — see §7 and `RUNTIME_SPEC.md`).
   exact for the rectified-flow ODE; the DPM++ / ER-SDE samplers switch to the
   flow half-logSNR mapping (`model_type="flow"`) so they apply too.
 
-- **Schedule** (`schedules.py`) — a sampling-time function
+- **Schedule** (`schedules.py`): a sampling-time function
   `(steps, σ_min, σ_max) -> σ[0..steps]` (descending, trailing 0).
 
-- **Denoiser** — composes a backbone + `Scaling` + `DiscreteSchedule`
+- **Denoiser**: composes a backbone + `Scaling` + `DiscreteSchedule`
   into the single callable the loop wants: `x, σ -> denoised`. The pipeline picks
   the `Scaling` (`EpsScaling`/`VScaling`) from `spec.prediction`. CFG is applied
-  here (`CFGDenoiser`) by evaluating cond/uncond — batched into a single backbone
+  here (`CFGDenoiser`) by evaluating cond/uncond, batched into a single backbone
   forward when the cond/uncond kwargs are equal-length tensors, else two forwards;
   inpainting wraps it with a `MaskedDenoiser` that pins the keep region to the
   original latent.
 
-- **Sampler** — a pure function of σ-space: consumes `Denoiser`, an
+- **Sampler**: a pure function of σ-space: consumes `Denoiser`, an
   initial latent, and a σ schedule; returns the final latent. Knows nothing
   about text, models, or VAEs.
 
@@ -158,10 +158,10 @@ image = TextToImage(model)("a watercolor fox", steps=20, cfg_scale=4.0,
 `TextToImage` dispatches by `model.spec.architecture`; the SD/SDXL, Anima, and
 FLUX (`flux1`/`flux2`) paths share the bundle/conditioning/decode contract but
 diverge in the sampling-loop internals (different parameterization, schedule,
-and per-backbone kwargs — Anima's `t5xxl_ids` through its built-in LLM-Adapter,
+and per-backbone kwargs: Anima's `t5xxl_ids` through its built-in LLM-Adapter,
 FLUX's patchified image tokens + axial position ids + distilled guidance).
 FLUX loads via `load_flux_checkpoint` (`flux2` leads with the Qwen3 "Klein"
-encoder) and is build-to-spec — see [`ROADMAP.md`](ROADMAP.md).
+encoder) and is build-to-spec; see [`ROADMAP.md`](ROADMAP.md).
 
 Lower layers stay usable on their own (e.g. build a `Denoiser` and call a
 `Sampler` directly) so the engine is composable, not just a single black box.
@@ -218,10 +218,10 @@ New work plugs in at the seams, without touching the loop:
   checkpoint. Supporting a new adapter family means adding a delta
   reconstruction (`_compose_*`) and/or a key→module mapping, nothing more.
 
-These seams have now been exercised by Anima — a Cosmos-Predict2-family DiT
+These seams have now been exercised by Anima, a Cosmos-Predict2-family DiT
 with a different VAE family (Wan 3D-causal-conv), a different text encoder
 (Qwen3 decoder LM), an internal cross-encoder LLM-Adapter, and a different
-prediction parameterization (CONST flow) — all integrated by adding modules
+prediction parameterization (CONST flow), all integrated by adding modules
 and one detector branch, without touching the σ-space samplers, the sigma
 schedules (other than adding `flow_matching_schedule`), or the
 denoising-loop scaffolding.
@@ -231,7 +231,7 @@ than a drop-in: enough of SD's `_Pipeline` (Karras schedule, `EpsScaling`,
 fixed 4-channel latents, scalar `latent_scale`) doesn't apply to flow-matching
 DiTs that the Anima path lives in its own self-contained driver
 (`pipelines/_anima.py`) that `TextToImage` dispatches into. This is by
-design — see §9 in [`ROADMAP.md`](ROADMAP.md) for the DT0–DT7 build sheet.
+design; see §9 in [`ROADMAP.md`](ROADMAP.md) for the DT0–DT7 build sheet.
 
 The **FLUX** family (FLUX.1 + FLUX.2) exercised the same seams again: one
 config-driven MMDiT (`models/flux_dit.py`) covers both via a `FluxConfig`
@@ -242,7 +242,7 @@ only structural additions being `VAEConfig.shift_factor` + `use_quant_conv`,
 both defaulting to the SD behaviour); the text encoders reuse T5/CLIP (FLUX.1)
 and the existing Qwen3 encoder (FLUX.2 "Klein"). Like Anima, FLUX gets its own
 driver (`pipelines/_flux.py`) and a detector branch, with no changes to the
-σ-space samplers or the loop. FLUX is **build-to-spec** — implemented from the
+σ-space samplers or the loop. FLUX is **build-to-spec**: implemented from the
 published architecture and cross-checked against the reference, but not yet
 GPU-verified; the strict checkpoint load is the correctness gate.
 

@@ -2,9 +2,9 @@
 
 Verifies the cache is a transparent accelerator with a clean correctness anchor:
 when it doesn't reuse, the forward is bit-identical to a plain forward; when it
-*does* reuse, the splice is geometrically exact — recomputing the shallow level-0
+*does* reuse, the splice is geometrically exact: recomputing the shallow level-0
 blocks on an unchanged input and pasting back the cached deep feature reproduces
-the full forward exactly. Uses tiny UNet configs — no SD weights needed.
+the full forward exactly. Uses tiny UNet configs, no SD weights.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ def test_interval_one_never_reuses():
 
 def test_first_eval_always_computes():
     """The first eval has no cached feature, so it computes the full UNet and
-    matches the plain forward exactly — never a cache hit."""
+    matches the plain forward exactly."""
     unet, cfg = _sd_tiny()
     x, t, ctx, _ = _inputs(cfg, seed=1)
     cache = DeepCache(interval=2)

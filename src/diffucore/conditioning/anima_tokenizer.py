@@ -1,18 +1,6 @@
-"""Anima's dual tokenizer: Qwen2.5 (semantic) + T5 (positional).
-
-Anima conditions on its prompt twice. The Qwen3 0.6B encoder consumes a
-Qwen2.5-tokenized stream and produces source hidden states; the LLM-Adapter
-separately consumes a T5-tokenized stream as its target IDs (which it embeds
-through its own 32128-row table) and cross-attends to the Qwen3 hidden states
-to produce the DiT's conditioning context.
-
-Both tokenizers are vendored as ``tokenizer.json`` and driven through the
-``tokenizers`` library, exactly like the CLIP tokenizer under
-``conditioning/clip_tokenizer.json``. The Qwen vocab is Qwen3-0.6B's (Apache-2.0,
-the Qwen2 BPE shared across Qwen2.5/Qwen3); the T5 vocab is ``google-t5/t5-11b``'s
-(Apache-2.0), the same T5 Anima inherits from Cosmos-Predict2. Both vendored files
-are bit-identical to the ComfyUI ``qwen25_tokenizer/`` + ``t5_tokenizer/`` they
-replace (see ``tests/test_anima_pipeline.py``).
+"""Anima's dual tokenizer: Qwen2.5 BPE for the Qwen3 encoder, T5 for the
+LLM-Adapter's target ids. Both vocabs are vendored (Apache-2.0) and
+bit-identical to ComfyUI's ``qwen25_tokenizer/`` + ``t5_tokenizer/``.
 """
 
 from __future__ import annotations
@@ -28,8 +16,8 @@ from tokenizers import Tokenizer
 QWEN_PAD_ID = 151643
 
 _QWEN_VOCAB = Path(__file__).with_name("qwen3_tokenizer.json")
-# Qwen3.5's BPE (vocab 248320) for the experimental Qwen3.5-4B encoder — a
-# different vocab from Qwen3 (151936), so the IDs are not interchangeable.
+# Qwen3.5's BPE (vocab 248320) for the experimental Qwen3.5 encoders; not
+# interchangeable with Qwen3's (151936).
 _QWEN35_VOCAB = Path(__file__).with_name("qwen35_tokenizer.json")
 _T5_VOCAB = Path(__file__).with_name("t5_tokenizer.json")
 
@@ -41,9 +29,9 @@ class AnimaTokenized:
     Shapes (single-prompt forward; the pipeline batches by replication when
     needed)::
 
-        qwen_ids:   LongTensor (1, L_q)  — Qwen2.5 BPE
-        qwen_mask:  LongTensor (1, L_q)  — 1 = real token, 0 = pad
-        t5_ids:     LongTensor (1, L_t)  — T5 BPE
+        qwen_ids:   LongTensor (1, L_q)  Qwen2.5 BPE
+        qwen_mask:  LongTensor (1, L_q)  1 = real token, 0 = pad
+        t5_ids:     LongTensor (1, L_t)  T5 BPE
     """
     qwen_ids: torch.Tensor
     qwen_mask: torch.Tensor
@@ -51,11 +39,8 @@ class AnimaTokenized:
 
 
 class AnimaTokenizer:
-    """Lazy dual tokenizer for Anima.
-
-    Loads the two vendored ``tokenizer.json`` files on first call — keeps
-    construction cheap. ``qwen_path`` / ``t5_path`` override the vendored
-    defaults (mirrors :class:`CLIPTokenizer`'s ``vocab_path``).
+    """Lazy dual tokenizer for Anima (vocabs load on first call).
+    ``qwen_path`` / ``t5_path`` override the vendored files.
     """
 
     def __init__(self, qwen_path: Optional[str] = None, t5_path: Optional[str] = None):

@@ -1,27 +1,12 @@
-"""Qwen-Image VAE — 3D causal autoencoder; image-only path.
+"""Qwen-Image VAE: 16-channel, 8× 3D causal autoencoder (Wan2.1 family), image
+path only.
 
-The Qwen-Image VAE is a 16-channel, 8× spatial autoencoder shared with Wan2.1's
-video VAE family (Alibaba). It is built around 3D causal convolutions and an
-RMS-norm + single-head attention "middle" block. Anima ships this VAE under a
-``qwen_image_vae.safetensors`` file with no key prefix.
-
-Diffucore targets *still images* (T=1). The video-style temporal feature-cache
-machinery in the upstream Wan implementation is unused at T=1 and is omitted
-here; the temporal convolutions inside ``Resample`` blocks still carry their
-weights so a strict load works, but they are not invoked on the image path.
-
-Submodule and parameter names mirror the on-disk keys so a ``strict=True`` load
-is the correctness check. The channel hierarchy is::
-
-    encoder:  3 → 96 → 192 → 384 → 384 → 32   (32 = z_dim·2, mean+logvar)
-    conv1:    32 → 32                          (quant_conv, kernel 1)
-    chunk into μ (16) and logσ² (16); μ is the latent
-    conv2:    16 → 16                          (post_quant_conv, kernel 1)
-    decoder: 16 → 384 → 192 → 96 → 3
-
-Latent normalization is *per-channel* (Wan2.1 statistics), not a scalar
-``latent_scale`` — :meth:`process_in` shifts and scales before the DiT,
-:meth:`process_out` undoes it after.
+At T=1 the temporal feature cache is omitted; the ``Resample`` temporal convs
+keep their weights for a strict load but never run. Names mirror the on-disk
+keys (no prefix). Channels: encoder 3 → 96 → 192 → 384 → 384 → 32 (μ + logσ²),
+quant_conv 32 → 32, post_quant_conv 16 → 16, decoder 16 → 384 → 192 → 96 → 3.
+Latent normalization is per-channel (Wan2.1 stats) via :meth:`process_in` /
+:meth:`process_out`, not a scalar scale.
 """
 
 from __future__ import annotations
@@ -44,13 +29,8 @@ _WAN21_LATENTS_STD = (
 
 
 class CausalConv3d(nn.Conv3d):
-    """Conv3d with *causal* temporal padding (zero-padded only on the past).
-
-    The original 3D-conv would pad symmetrically on the time axis; we strip
-    that padding and apply ``2·padding_t`` zeros on the past side instead, so a
-    kernel-3 conv with ``padding=1`` still preserves the temporal length but
-    cannot leak future frames into the present. At T=1 this is equivalent to
-    a Conv3d seeing a zero-padded clip of length kernel-size.
+    """Conv3d with causal temporal padding: ``2·padding_t`` zeros on the past side
+    only, so no future frame leaks in.
     """
 
     def __init__(self, *args, **kwargs):
@@ -66,16 +46,9 @@ class CausalConv3d(nn.Conv3d):
 
 
 class RMSNorm(nn.Module):
-    """Wan-style RMS-ish norm: L2-normalize then rescale by ``√dim·γ``.
-
-    Differs from standard :class:`nn.RMSNorm` in two ways: it normalizes via
-    :func:`torch.nn.functional.normalize` (true L2, not RMS), and the learnable
-    gain ``γ`` is broadcast across spatial (and time) dimensions so it can be
-    applied to feature maps without rearranging.
-
-    ``has_time_dim=True`` matches the residual blocks (5D input, γ shape
-    ``[C, 1, 1, 1]``); ``False`` matches the attention norm (operates after a
-    rearrange to 4D, γ shape ``[C, 1, 1]``).
+    """Wan-style norm: L2-normalize, then scale by ``√dim·γ`` with ``γ`` broadcast
+    over the spatial (and time) dims. ``has_time_dim`` picks the 5-D residual
+    shape ``[C, 1, 1, 1]`` or the 4-D attention shape ``[C, 1, 1]``.
     """
 
     def __init__(self, dim: int, has_time_dim: bool = True):
@@ -89,22 +62,9 @@ class RMSNorm(nn.Module):
 
 
 class Resample(nn.Module):
-    """2D/3D up- or down-sample block.
-
-    Mode semantics:
-
-    - ``upsample2d``: nearest-neighbor ×2 spatial, followed by a 3×3 Conv2d
-      that halves channels (``dim → dim/2``).
-    - ``upsample3d``: same spatial path; additionally carries a temporal
-      ``time_conv`` (kernel 3) that doubles channels for frame interleaving.
-      Skipped on the image path (T=1, no feature cache).
-    - ``downsample2d``: zero-pad on the right/bottom, then 3×3 stride-2 Conv2d
-      keeping channels.
-    - ``downsample3d``: same spatial path plus a temporal ``time_conv``
-      (kernel 3, stride 2). Skipped on the image path.
-
-    ``time_conv`` weights are still constructed so a strict checkpoint load
-    succeeds, even though they're unused at T=1.
+    """2D/3D up- or down-sample block: nearest ×2 + 3×3 conv halving channels, or
+    right/bottom zero-pad + 3×3 stride-2 conv. The ``*3d`` modes also carry a
+    temporal ``time_conv``, built for the strict load but unused at T=1.
     """
 
     def __init__(self, dim: int, mode: str):
@@ -165,10 +125,8 @@ class ResidualBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    """Single-head spatial self-attention in the autoencoder bottleneck.
-
-    The norm carries a 2D ``γ`` shape (``[C, 1, 1]``) because we collapse T
-    into the batch before applying it.
+    """Single-head spatial self-attention in the bottleneck (T folded into batch,
+    hence the 2-D ``γ``).
     """
 
     def __init__(self, dim: int):
@@ -267,9 +225,7 @@ class Decoder3d(nn.Module):
 
         upsamples: list[nn.Module] = []
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
-            # Each non-initial stage starts after a Resample that halved
-            # channels (Conv2d(dim, dim/2)); reflect that in the first block's
-            # in-width so a strict load matches.
+            # Every stage after the first follows a Resample that halved channels.
             if i in (1, 2, 3):
                 in_dim = in_dim // 2
             for _ in range(num_res_blocks + 1):
@@ -295,14 +251,9 @@ class Decoder3d(nn.Module):
 
 
 class QwenImageVAE(nn.Module):
-    """Image-only Qwen-Image VAE.
-
-    ``encode(pixels)`` returns the latent ``μ`` (the encoder's logσ² head is
-    discarded at inference). ``decode(latents)`` returns RGB pixels.
-
-    Both APIs accept and return *4D* tensors ``(B, C, H, W)`` — the underlying
-    3D modules see T=1 internally. ``process_in`` / ``process_out`` apply the
-    per-channel Wan2.1 latent normalization the DiT expects.
+    """Image-only Qwen-Image VAE on 4-D ``(B, C, H, W)`` tensors (T=1 inside).
+    ``encode`` returns ``μ``; ``process_in`` / ``process_out`` apply the Wan2.1
+    per-channel latent normalization.
     """
 
     def __init__(self, dim: int = 96, z_dim: int = 16):

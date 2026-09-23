@@ -1,9 +1,5 @@
-"""TeaCache (arXiv:2411.19108) on the Cosmos/Anima DiT.
-
-Verifies the cache is a transparent accelerator: when it doesn't skip it must
-be bit-identical to a plain forward, and when it does skip it must reuse an
-*exact* residual (so a repeated input reproduces its own earlier output). Uses
-the cheap small-config CosmosDiT — no Anima weights needed.
+"""TeaCache on a small-config CosmosDiT: without a skip it is bit-identical to
+a plain forward, and a skip reuses the exact residual.
 """
 
 from __future__ import annotations
@@ -35,7 +31,7 @@ def test_disabled_matches_plain_forward():
 
 def test_first_step_always_computes_and_is_exact():
     """The first forward has no history, so it must compute the blocks and
-    match the plain forward exactly — never a cache hit."""
+    match the plain forward exactly."""
     dit, cfg = _tiny()
     torch.manual_seed(1)
     x = torch.randn(1, cfg.in_channels, 1, 8, 8)
@@ -51,7 +47,7 @@ def test_first_step_always_computes_and_is_exact():
 
 def test_skip_reuses_exact_residual():
     """A second forward with an *identical* input drifts zero, so (with a
-    permissive threshold) the blocks are skipped — the reused residual then
+    permissive threshold) the blocks are skipped; the reused residual then
     reproduces the first step (to fp rounding of the residual add-back)."""
     dit, cfg = _tiny()
     torch.manual_seed(2)
@@ -97,7 +93,7 @@ def test_record_mode_never_skips_and_logs_rel():
 
 def test_fitted_coefficients_round_trip_through_rescale():
     """A polynomial fit on synthetic (x, y) reproduces y via ``_rescale`` (the
-    Horner eval must match ``numpy.poly1d`` order — highest degree first)."""
+    Horner eval uses ``numpy.poly1d`` order, highest degree first)."""
     np = __import__("numpy")
     xs = np.linspace(0.0, 1.0, 25)
     ys = 0.3 * xs**2 + 0.1 * xs + 0.05
@@ -138,7 +134,7 @@ def test_single_activation_forecast_reuses_last_residual():
 
 def test_order1_linear_extrapolation_over_uneven_gap():
     """Two activations set a per-step slope ``(r1-r0)/gap``; later skips are the
-    linear extrapolation ``r1 + slope·(step - last_activation)`` — and the gap is
+    linear extrapolation ``r1 + slope·(step - last_activation)``, where the gap is
     the actual (uneven) activation spacing, not a fixed 1."""
     tc = TeaCache(rel_l1_thresh=1.0, max_order=1)
     r0 = torch.tensor([0.0, 0.0])
@@ -156,7 +152,7 @@ def test_order1_linear_extrapolation_over_uneven_gap():
 def test_higher_order_reduces_error_on_a_curved_residual():
     """On a residual that curves in the step index, each extra Taylor order
     tracks it better: order 0 (freeze) is worst, order 2 best. (The Taylor form
-    ``Σ rⁱ·kⁱ/i!`` is an approximation, not an exact polynomial fit — hence a
+    ``Σ rⁱ·kⁱ/i!`` is an approximation, not an exact polynomial fit, hence a
     shrinking error rather than zero.)"""
     f = lambda s: torch.tensor([float(s * s)])   # residual curves as step²
     def error_at_order(order):
@@ -281,8 +277,8 @@ def test_threshold_forces_recompute_and_resets():
 # --------------------------------------------------------------------------- #
 
 def test_easy_rule_warmup_always_computes():
-    """The first ``warmup`` calls run the blocks whatever the threshold says —
-    the transformation rate isn't measurable yet — so they stay bit-exact."""
+    """The first ``warmup`` calls run the blocks whatever the threshold (the rate
+    isn't measurable yet), so they stay bit-exact."""
     dit, cfg = _tiny()
     torch.manual_seed(10)
     t = torch.tensor([5.0])
@@ -297,7 +293,7 @@ def test_easy_rule_warmup_always_computes():
 
 def test_easy_rule_identical_input_skips_after_warmup():
     """Once the rate is known, a step whose latent didn't move predicts zero
-    output change and skips — reusing the cached residual exactly (order 0)."""
+    output change and skips, reusing the cached residual exactly (order 0)."""
     dit, cfg = _tiny()
     torch.manual_seed(11)
     t = torch.tensor([5.0])
@@ -393,7 +389,7 @@ def test_make_teacache_uncond_scale():
 
 
 def test_drift_rule_unchanged():
-    """Guard: naming the default rule explicitly changes nothing — same skips,
+    """Guard: naming the default rule explicitly changes nothing: same skips,
     same accumulator, bit-identical outputs."""
     dit, cfg = _tiny()
     torch.manual_seed(13)

@@ -18,15 +18,10 @@ from .parameterization import DiscreteSchedule, Scaling
 
 
 def guidance_interval_bounds(sigmas, start: float, end: float) -> tuple[float, float]:
-    """Map a step-fraction guidance interval onto absolute sigma bounds.
-
-    Applying CFG only in a middle band of the schedule (Kynkäänniemi et al.,
-    2024) keeps its quality benefit while skipping the uncond forward outside
-    the band. ``start``/``end`` are fractions of the sampling run: CFG is active
-    for steps ``start*n <= i < end*n`` of the ``n``-step descending ``sigmas``
-    schedule. Returns ``(lo, hi)`` such that CFG applies while ``lo < sigma <=
-    hi`` — a sigma-space test, so mid-step evaluations by higher-order samplers
-    land in the right band too. ``(0, 1)`` returns ``(-inf, inf)`` (always on).
+    """Map a step-fraction guidance interval (Kynkäänniemi et al., 2024) onto
+    sigma bounds: CFG is active for steps ``start*n <= i < end*n``, returned as
+    ``(lo, hi)`` with CFG on while ``lo < sigma <= hi`` (so mid-step evaluations
+    land in the right band). ``(0, 1)`` gives ``(-inf, inf)``.
     """
     if not 0.0 <= start < end <= 1.0:
         raise ValueError(f"need 0 <= start < end <= 1; got {start}, {end}")
@@ -56,26 +51,13 @@ class ModelDenoiser:
 
 
 class CFGDenoiser:
-    """Classifier-free guidance around a conditioning-aware denoiser.
+    """Classifier-free guidance: ``x0 = x0_uncond + scale * (x0_cond -
+    x0_uncond)``, with cond/uncond batched into one backbone forward.
 
-        x0 = x0_uncond + scale * (x0_cond - x0_uncond)
-
-    ``scale == 1`` is the conditioned estimate; ``scale == 0`` is unconditioned.
-    ``cond`` / ``uncond`` are kwarg dicts forwarded to the underlying denoiser
-    (e.g. ``{"context": embeddings}``).
-
-    ``rescale`` in ``(0, 1]`` enables CFG rescale (Lin et al., 2024): the guided
-    estimate is renormalized toward the conditioned estimate's per-sample std and
-    blended back by ``rescale``, which counteracts the over-exposure high guidance
-    causes (especially on zero-terminal-SNR models). ``0`` is plain CFG.
-
-    Cond and uncond are batched into a single backbone forward (tensors stacked
-    along the batch axis) so the model sees half as many invocations per step.
-
-    ``sigma_lo``/``sigma_hi`` restrict guidance to sigmas in ``(lo, hi]`` (see
-    :func:`guidance_interval_bounds`); outside the band only the conditioned
-    forward runs — half the backbone work for those steps. Defaults are
-    unbounded (guidance at every step, the previous behavior).
+    ``rescale`` in ``(0, 1]`` enables CFG rescale (Lin et al., 2024) against
+    over-exposure, mostly on zero-terminal-SNR models. ``sigma_lo``/``sigma_hi``
+    restrict guidance to ``(lo, hi]`` (:func:`guidance_interval_bounds`); outside
+    it only the conditioned forward runs.
     """
 
     def __init__(self, denoiser: ModelDenoiser, cond: dict, uncond: dict, scale: float, rescale: float = 0.0,
@@ -113,18 +95,10 @@ class CFGDenoiser:
 
 
 class MaskedDenoiser:
-    """Pin the keep region of the x0 estimate to the original latent (inpainting).
-
-    Wraps any ``(x, sigma) -> x0`` denoiser. Where ``mask == 0`` (the keep region)
-    it overrides the model's estimate with the original latent ``z0``; where
-    ``mask == 1`` (the region to repaint) it passes the estimate through. With a
-    constant target ``z0``, the sampler's ODE ``dx/dsigma = (x - z0) / sigma`` has
-    the exact solution ``x = z0 + noise * sigma`` — which Euler/Heun integrate
-    exactly — so the keep region tracks the noised original and lands on ``z0`` at
-    ``sigma -> 0``. No sampler changes are needed; the masking lives here.
-
-    ``mask`` is broadcastable to ``x`` (e.g. ``[1, 1, h, w]``) and matches ``x``'s
-    dtype/device; soft values in ``[0, 1]`` blend linearly at the boundary.
+    """Pin the keep region (``mask == 0``) of the x0 estimate to the original
+    latent ``z0`` for inpainting. With a constant target the ODE solution is
+    ``x = z0 + noise * sigma``, so the keep region lands on ``z0`` without any
+    sampler changes. ``mask`` broadcasts to ``x``; soft values blend linearly.
     """
 
     def __init__(self, denoiser, z0: torch.Tensor, mask: torch.Tensor):

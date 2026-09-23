@@ -1,29 +1,10 @@
-"""Qwen3 0.6B base text encoder.
+"""Qwen3-0.6B-base text encoder (Anima's semantic encoder): token ids in,
+final-norm hidden states out, no LM head.
 
-Anima uses Qwen3-0.6B-base as its semantic encoder: token IDs go in, hidden
-states come out (no LM head; the final RMS-norm is kept). The hidden states
-are then handed to the LLM-Adapter (DT4) which produces the cross-attention
-context the DiT consumes.
-
-Architectural facts (Qwen3-0.6B-Base, fixed)::
-
-    vocab_size = 151936     hidden_size = 1024     num_hidden_layers = 28
-    num_attention_heads = 16  num_key_value_heads = 8 (GQA, ratio 2)
-    head_dim = 128            intermediate_size = 3072
-    max_position_embeddings = 32768
-    rms_norm_eps = 1e-6       rope_theta = 1_000_000.0
-    mlp = SwiGLU (silu(gate)·up → down)
-    qkv has no bias; q_norm / k_norm are RMSNorms over head_dim,
-        applied to the per-head q/k *before* RoPE.
-
-Submodule and parameter names mirror the HuggingFace ``transformers``
-checkpoint layout (``model.embed_tokens.*``, ``model.layers.{i}.*``,
-``model.norm.*``) so a strict load against either an HF dump or ComfyUI's
-``qwen_3_06b_base.safetensors`` succeeds without remapping.
-
-Verification: this module's forward is bit-identical (max|Δ| = 0 in fp32)
-to ``transformers.Qwen3Model`` on a fixed prompt — that's the test in
-``tests/test_qwen3_text.py``.
+28 layers, hidden 1024, 16 query / 8 KV heads of 128, SwiGLU 3072, rope θ 1e6,
+per-head q/k RMSNorm before RoPE. Names follow the HF layout so HF dumps and
+ComfyUI's ``qwen_3_06b_base.safetensors`` strict-load. Bit-identical to
+``transformers.Qwen3Model`` in fp32 (``tests/test_qwen3_text.py``).
 """
 
 from __future__ import annotations
@@ -76,11 +57,8 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 class Qwen3Attention(nn.Module):
-    """GQA self-attention with per-head q/k RMSNorm and RoPE.
-
-    Q has ``num_attention_heads`` heads; K/V have ``num_key_value_heads`` heads
-    (Qwen3-0.6B uses 16 / 8 → group size 2). K/V are repeat-interleaved up to
-    16 heads before SDPA so we never branch on the GQA ratio at attention time.
+    """GQA self-attention with per-head q/k RMSNorm and RoPE; K/V are
+    repeat-interleaved up to the query head count before attention.
     """
 
     def __init__(self, cfg: Qwen3Config):
@@ -113,12 +91,8 @@ class Qwen3Attention(nn.Module):
             k = k.repeat_interleave(repeats, dim=1)
             v = v.repeat_interleave(repeats, dim=1)
 
-        # Eager attention. SDPA's flash/efficient kernels reorder reductions
-        # for speed and lose ~1 fp32 ULP per layer vs the naive form HF uses,
-        # which compounds over 28 layers; the explicit matmul→softmax→matmul
-        # form below is bit-identical to ``transformers.Qwen3Model`` with
-        # ``attn_implementation="eager"`` and the perf delta at ≤512 tokens
-        # is negligible.
+        # Eager attention: SDPA's fused kernels lose ~1 ULP per layer vs HF's
+        # eager form, compounding over 28 layers.
         scale = self.head_dim**-0.5
         attn = torch.matmul(q, k.transpose(-1, -2)) * scale
         if attention_mask is not None:
@@ -164,11 +138,8 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class _Qwen3Inner(nn.Module):
-    """The 'model.*' subtree: embed → 28 layers → final norm.
-
-    Wrapping the whole inner stack in a ``model`` attribute matches the HF
-    state-dict layout (``model.embed_tokens``, ``model.layers.*``, ``model.norm``)
-    so a strict load works without key remapping.
+    """The ``model.*`` subtree (embed → layers → final norm), matching the HF
+    state-dict layout.
     """
 
     def __init__(self, cfg: Qwen3Config):
@@ -179,19 +150,9 @@ class _Qwen3Inner(nn.Module):
 
 
 class Qwen3TextEncoder(nn.Module):
-    """Qwen3 0.6B as a text encoder: tokens → final hidden states.
-
-    Args:
-        cfg: Qwen3 hyperparameters (defaults to Qwen3-0.6B-Base).
-
-    Forward:
-        input_ids:      LongTensor (B, T).
-        attention_mask: optional FloatTensor (B, 1, T, T) or boolean (B, 1, 1, T)
-                        for HF-style padding masks. If ``None``, a pure causal
-                        mask is applied via SDPA's ``is_causal=True`` fast path.
-
-    Returns:
-        hidden_states: FloatTensor (B, T, hidden_size).
+    """Qwen3 as a text encoder: ``input_ids`` (B, T) → hidden states
+    (B, T, hidden_size). ``attention_mask`` is an optional HF-style padding mask;
+    ``None`` runs pure causal SDPA.
     """
 
     def __init__(self, cfg: Qwen3Config | None = None):
@@ -206,11 +167,8 @@ class Qwen3TextEncoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         hidden_layers: list[int] | None = None,
     ):
-        """Run the stack. By default returns the final-norm hidden states.
-
-        ``hidden_layers`` (e.g. ``[9, 18, 27]`` for FLUX.2 Klein) instead returns
-        a list of the raw hidden states *after* each of those layer counts — no
-        final norm — for callers that concatenate intermediate layers.
+        """Final-norm hidden states, or with ``hidden_layers`` (e.g. ``[9, 18,
+        27]`` for FLUX.2 Klein) the raw states after those layers, no final norm.
         """
         B, T = input_ids.shape
         x = self.model.embed_tokens(input_ids)

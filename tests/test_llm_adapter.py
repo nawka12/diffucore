@@ -1,19 +1,5 @@
-"""LLM-Adapter (DT4) verification.
-
-Without an in-process ComfyUI oracle (its native deps don't install in this
-venv), this milestone verifies structurally and behaviorally:
-
-1. Key-set match — module params match the ``net.llm_adapter.*`` slice
-   of Anima's checkpoint exactly.
-2. Strict load — real weights load cleanly via the project's ``_load_sub``
-   prefix-stripping convention.
-3. Forward shape on a realistic input.
-4. Determinism — same inputs → same output, and a non-trivial change in
-   inputs produces a non-trivial change in output (catches identity bugs
-   like "ignored cross-attn context").
-
-Numerical bit-match against the ComfyUI reference is deferred to DT7 (the
-end-to-end image comparison is a stronger correctness signal anyway).
+"""LLM-Adapter: key-set match against the checkpoint's ``net.llm_adapter.*``
+slice, strict load, forward shape, and determinism / input sensitivity.
 """
 
 from __future__ import annotations
@@ -53,7 +39,7 @@ def test_llm_adapter_key_set_matches_checkpoint():
         ckpt_keys = {k[len(_PREFIX):] for k in f.keys() if k.startswith(_PREFIX)}
     mod_keys = set(LLMAdapter().state_dict().keys())
     assert mod_keys == ckpt_keys, (
-        f"key mismatch — missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
+        f"key mismatch; missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
         f"extra: {sorted(mod_keys - ckpt_keys)[:5]}"
     )
 

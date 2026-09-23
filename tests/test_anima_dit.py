@@ -1,10 +1,4 @@
-"""Anima DiT (DT5) verification — backbone + adapter wrapping.
-
-Layered structural + behavioral tests. Numerical bit-match against ComfyUI
-is deferred to DT7 (end-to-end image comparison against a ComfyUI-generated
-reference) because the local ComfyUI install can't import in this venv —
-the per-component oracle would be more fragile than the end-to-end check.
-"""
+"""Anima DiT structural and behavioural tests (backbone + adapter wrapping)."""
 
 from __future__ import annotations
 
@@ -46,7 +40,7 @@ def test_anima_dit_key_set_matches_checkpoint():
         ckpt_keys = {k[len(_PREFIX):] for k in f.keys() if k.startswith(_PREFIX)}
     mod_keys = set(AnimaDiT().state_dict().keys())
     assert mod_keys == ckpt_keys, (
-        f"key mismatch — missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
+        f"key mismatch; missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
         f"extra: {sorted(mod_keys - ckpt_keys)[:5]}"
     )
 
@@ -54,8 +48,7 @@ def test_anima_dit_key_set_matches_checkpoint():
 def test_anima_dit_parameter_count_matches_2B():
     """~2B parameters total (the architecture's headline figure)."""
     n = sum(p.numel() for p in AnimaDiT().parameters())
-    # 2.05B–2.15B band — pre-empts an off-by-one stage that would silently
-    # change channel hierarchy.
+    # 2.05B–2.15B band: catches an off-by-one stage in the channel hierarchy.
     assert 2.05e9 < n < 2.15e9, f"unexpected param count: {n/1e9:.3f}B"
 
 
@@ -74,7 +67,7 @@ def test_dit_forward_shape_image_path(loaded_dit):
 
 def test_dit_t5xxl_path_routes_through_adapter(loaded_dit):
     """Passing ``t5xxl_ids`` produces a different output than feeding the
-    pre-adapter context directly — proves the LLM-Adapter is actually in the
+    pre-adapter context directly, so the LLM-Adapter is actually in the
     forward path when its input keys are supplied."""
     torch.manual_seed(0)
     x = torch.randn(1, 16, 1, 16, 16)
@@ -89,8 +82,7 @@ def test_dit_t5xxl_path_routes_through_adapter(loaded_dit):
 
 def test_rope_cache_lives_on_compute_device():
     """The RoPE table is cached on the device it was built for, so a cache hit
-    returns the same tensor with no copy — it used to be parked on CPU and
-    re-uploaded (4 MB H2D at 1024²) on every forward."""
+    returns the same tensor with no copy (no 4 MB H2D upload per forward)."""
     from diffucore.models.anima_dit import _VideoRoPE3D
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     rope = _VideoRoPE3D(CosmosDiTConfig()).to(device)
@@ -103,12 +95,9 @@ def test_rope_cache_lives_on_compute_device():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_apply_rope_compiled_is_bit_equal_to_eager():
-    """The CUDA rope apply is torch.compile'd (×4.8 measured on an RTX 2060)
-    with ``emulate_precision_casts`` so the fused kernel rounds exactly like
-    eager — the default path must stay bit-identical. Pins that property across
-    shapes and batch sizes; if a torch upgrade breaks it, this fails rather
-    than images silently drifting. (When compile is unusable the dispatch falls
-    back to eager, and the assertion holds trivially.)"""
+    """The compiled CUDA RoPE apply must stay bit-identical to eager across
+    shapes and batch sizes (``emulate_precision_casts``), so a torch upgrade
+    that breaks it fails here instead of drifting images."""
     from diffucore.models.anima_dit import _VideoRoPE3D, _apply_rope, _apply_rope_eager
     device = torch.device("cuda")
     rope = _VideoRoPE3D(CosmosDiTConfig()).to(device)
@@ -121,7 +110,7 @@ def test_apply_rope_compiled_is_bit_equal_to_eager():
 # --- 3. conditioning sensitivity (catches "ignored input" bugs) ------------
 
 def test_dit_sensitive_to_timesteps(loaded_dit):
-    """The DiT must respond to the timestep — adaLN-LoRA is where this lives."""
+    """The DiT must respond to the timestep (via adaLN-LoRA)."""
     torch.manual_seed(0)
     x = torch.randn(1, 16, 1, 16, 16)
     ctx = torch.randn(1, 32, 1024)
@@ -133,8 +122,8 @@ def test_dit_sensitive_to_timesteps(loaded_dit):
 
 
 def test_dit_sensitive_to_context(loaded_dit):
-    """Changing the cross-attn context must change the output — guards
-    against a broken cross-attn wiring."""
+    """Changing the cross-attn context must change the output (guards
+    against broken cross-attn wiring)."""
     torch.manual_seed(0)
     x = torch.randn(1, 16, 1, 16, 16)
     t = torch.tensor([500.0])

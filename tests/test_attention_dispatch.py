@@ -1,9 +1,6 @@
-"""Attention dispatch (models/_attention.py) — resolution, stamping, fallback.
-
-The FA2-Turing kernel itself is GPU-only (sm75) and exercised by the
-scratchpad harness / e2e A/B; these tests pin the *dispatch* semantics that
-must hold everywhere: bit-exact SDPA default, silent "auto" fallback, loud
-explicit failure, and the per-call eligibility guard.
+"""Attention dispatch semantics: bit-exact SDPA default, silent "auto" fallback,
+loud explicit failure, and the per-call eligibility guard. The FA2-Turing
+kernel itself is sm75-only and not exercised here.
 """
 
 from __future__ import annotations
@@ -51,7 +48,7 @@ def test_bhld_sdpa_matches_manual():
 
 def test_fa2_backend_falls_back_off_gpu():
     """A stamped module must still run on CPU/fp32 inputs (test forwards,
-    detours) — the per-call guard reroutes to SDPA, same numbers."""
+    detours): the per-call guard reroutes to SDPA, same numbers."""
     torch.manual_seed(0)
     q = torch.randn(1, 16, 2, 64)
     assert torch.equal(

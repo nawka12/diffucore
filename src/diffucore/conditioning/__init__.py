@@ -1,8 +1,6 @@
 """Text conditioning: tokenizer + text encoder -> cross-attention embeddings.
-
-Implements the SD1.5 conditioning path per ``docs/IMPLEMENTATION_SPEC.md``
-§Conditioning. The CLIP BPE vocab/merges are vendored as ``clip_tokenizer.json``
-(OpenAI CLIP, MIT-licensed) and driven through the ``tokenizers`` library.
+The CLIP BPE vocab/merges are vendored as ``clip_tokenizer.json`` (OpenAI CLIP,
+MIT).
 """
 
 from __future__ import annotations
@@ -21,11 +19,8 @@ _DEFAULT_VOCAB = Path(__file__).with_name("clip_tokenizer.json")
 
 
 class CLIPTokenizer:
-    """CLIP BPE tokenizer.
-
-    Contract: ``encode(text) -> LongTensor[77]`` with BOS(49406) … EOS(49407)
-    padded to 77 with EOS. The vendored tokenizer's post-processor already wraps
-    the sequence in BOS/EOS; we only truncate and pad to 77 here.
+    """CLIP BPE tokenizer: ``encode(text) -> LongTensor[77]``, BOS … EOS padded
+    with EOS to 77.
     """
 
     def __init__(self, vocab_path: str | None = None):
@@ -42,8 +37,7 @@ class CLIPTokenizer:
         return torch.tensor(ids, dtype=torch.long)
 
     def encode_raw(self, text: str) -> list[int]:
-        """Token ids with no BOS/EOS and no padding — the bare content tokens.
-        Used by the LPW path, which adds its own per-chunk BOS/EOS and padding."""
+        """Bare content token ids (no BOS/EOS, no padding), for the LPW path."""
         return self._tokenizer.encode(text, add_special_tokens=False).ids
 
 
@@ -66,12 +60,9 @@ class Conditioner:
 
 
 # --- LPW (long prompt weighting) -------------------------------------------
-# AUTOMATIC1111-style prompt attention: `(word)` -> 1.1, `[word]` -> 1/1.1,
-# `(word:1.3)` -> explicit weight, nested brackets multiply, `\(` escapes a
-# literal paren. Long prompts are split into 75-token chunks (each wrapped with
-# BOS/EOS into a 77-token window) and encoded separately, lifting CLIP's 77-token
-# cap. Token weights scale the per-token embeddings with A1111's mean-preserving
-# renorm (multiply, then rescale so the chunk's mean magnitude is unchanged).
+# A1111 prompt attention: `(word)` 1.1, `[word]` 1/1.1, `(word:1.3)` explicit,
+# nesting multiplies, `\(` escapes. Long prompts split into 75-token chunks, each
+# encoded as its own 77-token window; weights use A1111's mean-preserving renorm.
 
 _RE_ATTENTION = re.compile(
     r"""
@@ -171,25 +162,14 @@ def _apply_weights(ctx: torch.Tensor, weights: list[float]) -> torch.Tensor:
 
 
 class SDXLConditioner:
-    """SDXL dual text conditioning with long-prompt weighting (LPW).
+    """SDXL dual text conditioning with long-prompt weighting.
 
-    Runs CLIP-L and OpenCLIP bigG on the prompt (both at ``clip_skip=2`` =
-    penultimate hidden, no final norm), concatenates their hidden states into the
-    2048-d cross-attention context, and returns bigG's pooled embedding (1280-d)
-    for the UNet's added conditioning.
-
-    The prompt is parsed for A1111 attention syntax and split into 75-token
-    chunks; each chunk is encoded as its own 77-token window and the chunk
-    contexts are concatenated along the sequence axis, so prompts longer than 77
-    tokens are supported. Per-token weights scale the context with A1111's
-    mean-preserving renorm. The pooled embedding is taken from the final chunk.
-    A short prompt with no weighting collapses to a single chunk and reproduces
-    the plain (non-LPW) encoding exactly.
-
-    The two encoders pad differently: CLIP-L with EOS (49407), bigG with 0.
-
-    Contract: ``__call__(prompt, batch=1) -> (context[batch, 77*n, 2048],
-    pooled[batch, 1280])``.
+    CLIP-L and OpenCLIP bigG (penultimate hidden, ``clip_skip=2``) are
+    concatenated into the 2048-d context, and bigG's pooled embedding (1280-d,
+    from the final chunk) feeds the added conditioning. Prompts are parsed for
+    A1111 attention syntax and chunked as above; a short unweighted prompt
+    reproduces the plain encoding exactly. CLIP-L pads with EOS, bigG with 0.
+    Returns ``(context[batch, 77*n, 2048], pooled[batch, 1280])``.
     """
 
     def __init__(self, tokenizer: "CLIPTokenizer", clip_l, clip_g, clip_skip: int = 2):

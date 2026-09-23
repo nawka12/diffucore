@@ -1,8 +1,8 @@
-"""Manual perf validation for PR-A (cudnn_benchmark + tf32 + channels_last) and
-PR-B (torch.compile). Runs a fixed-prompt/seed generation under each flag
-combination, reports wall-clock + visual similarity (PSNR) to the baseline.
+"""Manual perf validation of the perf flags (cudnn_benchmark, tf32,
+channels_last, torch.compile): a fixed-seed generation per flag combination,
+reporting wall-clock and PSNR against the baseline.
 
-Not part of the test suite — requires CUDA + a checkpoint. Run from repo root:
+Not part of the test suite; needs CUDA and a checkpoint. From the repo root:
     .venv/bin/python tests/_perf_validation.py --model {sd15,sdxl,anima}
 """
 
@@ -125,9 +125,8 @@ def _cases(model: str, device: torch.device):
             ("+compile (PR-B)",   P(cudnn_benchmark=True, tf32=True, channels_last=True, compile=True)),
         ]
     if model == "sdxl":
-        # SDXL 1024² peak is ~10.7 GB resident; on a 12 GB card we still fit
-        # without offload, but only just. compile is incompatible with
-        # offload='True/full' (raises) — 'encoders' is allowed and pairs well.
+        # SDXL at 1024² peaks ~10.7 GB resident, just fitting 12 GB. compile
+        # rejects full offload; 'encoders' pairs well with it.
         return [
             ("baseline",          P()),
             ("+cudnn_benchmark",  P(cudnn_benchmark=True)),
@@ -136,7 +135,7 @@ def _cases(model: str, device: torch.device):
             ("+compile (PR-B)",   P(cudnn_benchmark=True, tf32=True, channels_last=True, compile=True)),
         ]
     if model == "anima":
-        # DiT is pure transformer — channels_last is meaningless. Skip that case.
+        # channels_last is meaningless for a pure transformer.
         return [
             ("baseline",          P()),
             ("+cudnn_benchmark",  P(cudnn_benchmark=True)),

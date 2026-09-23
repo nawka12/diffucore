@@ -1,11 +1,5 @@
-"""Image-to-image pipeline (latent-init / strength).
-
-Encode an init image to a latent, add noise to it at the level the sampler
-expects partway down the schedule, then denoise the rest of the way. ``strength``
-sets how far down to start: 1.0 runs the full schedule (init mostly overwritten),
-small values keep most of the init image. Conditioning / sampling / decode reuse
-the shared :class:`._base._Pipeline` machinery, so offload + tiling apply here too
-(the VAE is staged for both the encode and the decode).
+"""Image-to-image pipeline: encode the init image, noise it to the schedule
+point ``strength`` selects (1.0 = full schedule), and denoise from there.
 """
 
 from __future__ import annotations

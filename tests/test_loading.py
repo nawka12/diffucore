@@ -94,7 +94,7 @@ def test_safetensors_load_and_header_roundtrip(tmp_path):
 
 def test_detect_from_real_header(tmp_path):
     # End-to-end: write a file with SD1.5-shaped tensors, read only the header,
-    # and detect — no full load required.
+    # and detect, with no full load.
     path = tmp_path / "fake_sd15.safetensors"
     save_file({k: torch.zeros(*v) for k, v in sd15_shapes().items()}, str(path))
     spec = detect_architecture(read_header(str(path)))
@@ -139,7 +139,7 @@ def test_detect_anima_under_comfyui_prefix():
 
 def test_detect_anima_takes_precedence_over_missing_unet():
     """Without the Anima marker, an unrelated key set raises ValueError. The
-    marker alone identifies the family — there is no ``model.diffusion_model.``
+    marker alone identifies the family; there is no ``model.diffusion_model.``
     prefix to find."""
     shapes_no_marker = {"net.blocks.0.adaln_modulation_self_attn.1.weight": (256, 2048)}
     with pytest.raises(ValueError):

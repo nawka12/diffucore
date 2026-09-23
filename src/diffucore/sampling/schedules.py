@@ -1,13 +1,8 @@
 """Sampling-time sigma schedules.
 
-A *schedule* chooses the decreasing sequence of noise levels (sigmas) the
-sampler walks down, from a high ``sigma_max`` to ``sigma_min`` and finally to 0
-(the clean sample). All schedules here return a 1-D tensor of length
-``steps + 1``, descending, with a trailing ``0.0`` appended.
-
-References:
-    Karras, Aittala, Aila, Laine. "Elucidating the Design Space of Diffusion-
-    Based Generative Models." NeurIPS 2022 (the ``karras`` schedule, eq. 5).
+Every schedule returns ``steps + 1`` descending sigmas from ``sigma_max`` down
+to ``sigma_min``, with a trailing ``0.0`` appended. Reference for ``karras``:
+Karras et al., NeurIPS 2022, eq. 5.
 """
 
 from __future__ import annotations
@@ -43,7 +38,7 @@ __all__ = [
 
 
 def append_zero(sigmas: torch.Tensor) -> torch.Tensor:
-    """Append a trailing ``0.0`` (the fully-denoised endpoint) to a sigma run."""
+    """Append a trailing ``0.0`` (the fully denoised endpoint)."""
     return torch.cat([sigmas, sigmas.new_zeros(1)])
 
 
@@ -56,11 +51,8 @@ def karras_schedule(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Karras et al. (2022) schedule.
-
-    Interpolates linearly in ``sigma ** (1/rho)`` between ``sigma_max`` and
-    ``sigma_min``. ``rho=7`` is the paper's default and front-loads steps at low
-    noise. Returns ``steps + 1`` sigmas (the last is 0).
+    """Karras et al. (2022): linear in ``sigma ** (1/rho)``. ``rho=7`` (the
+    paper's default) concentrates steps at low noise.
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
@@ -115,11 +107,8 @@ def kl_optimal_schedule(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """KL-optimal schedule (Karras-style, arXiv:2407.12173).
-
-    Interpolates linearly in ``arctan(sigma)`` from ``sigma_max`` to ``sigma_min``,
-    i.e. ``sigma_i = tan((1-i/(n-1))·atan(sigma_max) + (i/(n-1))·atan(sigma_min))``,
-    then appends the trailing 0. Model-agnostic (works for VE and flow ranges)."""
+    """KL-optimal schedule (arXiv:2407.12173): linear in ``arctan(sigma)``.
+    Works for VE and flow ranges."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     ramp = torch.arange(steps, device=device, dtype=dtype) / max(steps - 1, 1)
@@ -127,13 +116,9 @@ def kl_optimal_schedule(
     return append_zero(sigmas)
 
 
-# AYS optimized schedules (Sabour, Fidler & Kreis, "Align Your Steps", ICML 2024,
-# arXiv:2404.14507, Table 3). The values are the noise levels σ(t_n)..σ(t_0) of
-# the 10-step schedule the paper optimized per model family — descending from
-# the training σ_max to the training σ_min, with the sampler appending the final
-# 0. These exact lists (SD1.5/SDXL, plus SVD/DeepFloyd for completeness) are the
-# ones shipped by NVIDIA's AYS project page and carried verbatim by the A1111 /
-# ComfyUI-AlignYourSteps integrations.
+# AYS 10-step schedules (Sabour, Fidler & Kreis, "Align Your Steps", ICML 2024,
+# arXiv:2404.14507, Table 3), σ_max down to σ_min, as shipped by NVIDIA's AYS
+# page and the A1111 / ComfyUI integrations.
 _AYS_TABLES = {
     "sd15": [14.615, 6.475, 3.861, 2.697, 1.886, 1.396, 0.963, 0.652, 0.399, 0.152, 0.029],
     "sdxl": [14.615, 6.315, 3.771, 2.181, 1.342, 0.862, 0.555, 0.380, 0.234, 0.113, 0.029],
@@ -143,11 +128,8 @@ _AYS_TABLES = {
 
 
 def _loglinear_interp(t_steps, num_steps: int) -> torch.Tensor:
-    """Log-linear interpolation of a descending sequence to ``num_steps`` points
-    (NVIDIA's AYS ``loglinear_interp``): linear interpolation in ``log(sigma)``
-    over the normalized index, which preserves the geometric spacing of the
-    optimized points. Returns ``num_steps`` values, still descending, including
-    both original endpoints. Pure-torch equivalent of the reference ``np.interp``."""
+    """Log-linear interpolation of a descending sequence to ``num_steps`` points,
+    keeping both endpoints (NVIDIA's AYS ``loglinear_interp``, in torch)."""
     t = torch.as_tensor(t_steps, dtype=torch.float64)
     ys = t.flip(0).log()                                  # ascending in index
     pos = torch.linspace(0, 1, num_steps, dtype=torch.float64) * (len(t) - 1)
@@ -167,33 +149,14 @@ def align_your_steps_schedule(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Align Your Steps (AYS) schedule (Sabour, Fidler & Kreis, ICML 2024,
-    arXiv:2404.14507).
+    """Align Your Steps (Sabour, Fidler & Kreis, ICML 2024, arXiv:2404.14507).
 
-    The paper optimizes the *sampling schedule* — where the solver's steps land
-    on the trajectory — by minimizing an upper bound on the KL divergence
-    between the true and linearized generative SDEs, and shows the result beats
-    hand-crafted schedules (Karras, uniform, log-SNR) especially in the few-step
-    regime. The optimization itself needs the denoiser, so the practical
-    deliverable is the per-family schedule it produced; this scheduler stores
-    those 10-step tables (:data:`_AYS_TABLES`) and, for any other step count,
-    extends them by log-linear interpolation — the exact recipe the authors
-    recommend ("log-linearly interpolating the noise levels works well in
-    practice", NVIDIA AYS project page) and the one A1111 / the ComfyUI node
-    ship. The interpolation runs through all 11 table points (both endpoints
-    preserved), so at ``steps == 10`` the returned schedule is the log-linear
-    fit through the paper's Table 3 points ending at the table's σ_min — the
-    same output as A1111's ``get_align_your_steps_sigmas``. ``model`` selects
-    the family: ``"sd15"`` (SD 1.5), ``"sdxl"``, ``"svd"`` or ``"deepfloyd"``.
-    When ``sigma_min``/``sigma_max`` are supplied they are validated against
-    the table's range (a hard error if the model's schedule is far off, e.g. a
-    zero-terminal-SNR checkpoint with σ_max ~ 4500 — AYS was not optimized for
-    those); they are *not* used to rescale the schedule, matching the reference
-    integrations.
-
-    VE-only: the tables live on the variance-exploding σ scale (σ_max ≈ 14.6),
-    so this scheduler is for SD / SDXL, not the σ ∈ (0, 1] rectified-flow
-    families. Returns ``steps + 1`` descending sigmas ending at 0."""
+    The paper's per-family 10-step tables (:data:`_AYS_TABLES`), log-linearly
+    interpolated to any step count as the authors recommend (same output as
+    A1111's ``get_align_your_steps_sigmas``). ``model`` is ``"sd15"``,
+    ``"sdxl"``, ``"svd"`` or ``"deepfloyd"``. ``sigma_min``/``sigma_max``, if
+    given, are only checked against the table's range (zero-terminal-SNR
+    checkpoints fail), not used to rescale. VE-only (SD/SDXL)."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     try:
@@ -220,22 +183,15 @@ def flow_matching_schedule(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """SD3-style shifted rectified-flow schedule.
-
-    Anima (Cosmos-Predict2) and Flux sample σ values from
-    ``σ(t) = shift·t / (1 + (shift − 1)·t)`` for ``t = (N − i)/N``,
-    ``i = 0..N−1`` — descending uniform-in-t with the SD3 shift applied.
-    ``shift = 1`` collapses to the plain linear schedule. Higher ``shift``
-    concentrates more steps near ``σ = 1`` (where the model spent more
-    training compute). A trailing ``0`` is appended for the clean endpoint.
-
-    Anima ships with ``shift = 3.0``; the canonical Flux default is 1.15.
+    """SD3-style shifted rectified-flow schedule:
+    ``σ(t) = shift·t / (1 + (shift − 1)·t)`` for ``t = (N − i)/N``. Higher
+    ``shift`` puts more steps near ``σ = 1``. Anima ships with 3.0; Flux's
+    default is 1.15.
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
     if shift < 1.0:
         raise ValueError("shift must be >= 1")
-    # descending uniform t in (0, 1]
     t = torch.arange(steps, 0, -1, device=device, dtype=dtype) / steps
     sigmas = shift * t / (1.0 + (shift - 1.0) * t)
     return append_zero(sigmas)
@@ -251,18 +207,10 @@ def flow_matching_dynamic_shift(
 ) -> float:
     """Flux-style resolution-aware shift for :func:`flow_matching_schedule`.
 
-    Linearly interpolates the log-shift ``mu`` in the DiT token count
-    ``seq_len = (H // 16) * (W // 16)`` between ``base_shift`` (the ``mu`` at
-    ``base_seq_len``) and ``max_shift`` (the ``mu`` at ``max_seq_len``) — Flux's
-    ``calculate_shift`` — then returns the multiplicative shift ``exp(mu)`` that
-    :func:`flow_matching_schedule` consumes (its σ(t) map equals Flux's
-    ``time_shift`` exactly when ``shift == exp(mu)``).
-
-    Larger images get a larger shift, i.e. more steps near σ = 1 where the model
-    resolves global composition; smaller images get less. At 1024² (4096 tokens)
-    this returns ≈ 3.16, close to Anima's training shift of 3.0. ``base_shift``
-    and ``max_shift`` are ``mu`` (log-shift) endpoints, matching Flux's
-    (confusingly named) defaults.
+    Interpolates the log-shift ``mu`` linearly in the token count
+    ``seq_len = (H // 16) * (W // 16)`` between ``base_shift`` and
+    ``max_shift`` (Flux's ``calculate_shift``) and returns ``exp(mu)``. At
+    1024² this is ≈ 3.16, close to Anima's training shift of 3.0.
     """
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     mu = base_shift + m * (seq_len - base_seq_len)
@@ -270,13 +218,10 @@ def flow_matching_dynamic_shift(
 
 
 class FlowSamplingView:
-    """Minimal :class:`~diffucore.sampling.parameterization.DiscreteSchedule`-like
-    view of a rectified-flow model, so the table/timestep-based schedulers
-    (:func:`simple_schedule`, :func:`sgm_uniform_schedule`) work on Anima.
-
-    Mirrors ComfyUI's ``ModelSamplingDiscreteFlow``: a ``multiplier``-entry
-    ascending sigma table from ``sigma(t) = shift·t/(1+(shift-1)·t)``, with
-    ``sigma_to_t``/``t_to_sigma`` as the (invertible) timestep map ``t·multiplier``.
+    """``DiscreteSchedule``-like view of a rectified-flow model, so the
+    table/timestep schedulers work on Anima. Mirrors ComfyUI's
+    ``ModelSamplingDiscreteFlow``: an ascending ``multiplier``-entry sigma table
+    from ``sigma(t) = shift·t/(1+(shift-1)·t)``, with timesteps ``t·multiplier``.
     """
 
     def __init__(self, shift: float, *, multiplier: int = 1000,
@@ -307,8 +252,8 @@ class FlowSamplingView:
 
 def simple_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """ComfyUI ``simple``: pick ``steps`` sigmas from the model's (ascending)
-    training sigma table at evenly spaced strides from the high-noise end."""
+    """ComfyUI ``simple``: ``steps`` sigmas from the ascending training table at
+    even strides from the high-noise end."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     table = schedule.sigmas
@@ -321,9 +266,8 @@ def simple_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
 
 def sgm_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                          dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """ComfyUI ``sgm_uniform``: ``steps`` sigmas uniform in timestep between
-    ``sigma_max`` and ``sigma_min`` (``normal_scheduler`` with ``sgm=True`` —
-    ``steps + 1`` timesteps with the last dropped)."""
+    """ComfyUI ``sgm_uniform``: uniform in timestep, ``steps + 1`` timesteps
+    with the last dropped."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     start = float(schedule.sigma_to_t(schedule.sigma_max))
@@ -335,9 +279,7 @@ def sgm_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "
 
 def normal_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                     dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """ComfyUI ``normal``: ``steps`` sigmas uniform in timestep between
-    ``sigma_max`` and ``sigma_min`` (``normal_scheduler`` with ``sgm=False`` —
-    all ``steps`` timesteps kept, trailing 0 appended)."""
+    """ComfyUI ``normal``: uniform in timestep, all ``steps`` kept."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     start = float(schedule.sigma_to_t(schedule.sigma_max))
@@ -350,16 +292,10 @@ def normal_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
 def infinity_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                       dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Infinity Diffusion's sine-perturbed schedule (galpt/infinity-diffusion,
-    MIT; verified equivalent to upstream @4f72d8f, 2026-07-17): ``normal``'s
-    linear timestep ramp warped by ``f(u) = u − s·sin(πu)/π``, which shrinks
-    the first step's timestep gap to ``(1−s)×`` linear (gentler start) and
-    grows the last step's to ``(1+s)×`` (more room for the final cleanup),
-    with ``s = min(0.6, steps/50)`` adapting to the step count — near-linear
-    at low steps, fully perturbed from 30 up. ``f`` is strictly increasing
-    (``f′ ≥ 1−s > 0``) and fixes both endpoints, so the schedule still spans
-    exactly ``sigma_max``→``sigma_min`` through the model's native σ(t) —
-    flow-safe (starts at σ_max) and every sigma is from the training
-    distribution, unlike sigma-space schedules such as ``karras``."""
+    MIT; matches upstream @4f72d8f): ``normal``'s timestep ramp warped by
+    ``f(u) = u − s·sin(πu)/π`` with ``s = min(0.6, steps/50)``, shrinking the
+    first gap and growing the last. Endpoints are fixed and every sigma comes
+    from the model's σ(t), so it is flow-safe."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     start = float(schedule.sigma_to_t(schedule.sigma_max))
@@ -374,34 +310,15 @@ def infinity_schedule(schedule, steps: int, *, device: torch.device | str = "cpu
 
 def infinity_htds_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                            dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Infinity Diffusion's "Hyperbolic Tail-Density" schedule (HTDS —
-    galpt/infinity-diffusion ``omega``/``nano``, MIT, upstream @4319bc7):
-    ``normal``'s linear timestep ramp bent by a hyperbolic tangent,
-    ``decay(u) = tanh(δ·(1−u)) / tanh(δ)``, with ``δ = clamp((steps − 4)/26,
-    0, 1.8)`` adapting to the step count. At ``steps ≤ 4``, ``δ`` is 0 and the
-    schedule degenerates to exactly linear — upstream's guard for distilled
-    models — saturating from ~50 steps up.
+    """Infinity Diffusion's "Hyperbolic Tail-Density" schedule
+    (galpt/infinity-diffusion ``omega``/``nano``, MIT, upstream @4319bc7):
+    ``normal``'s ramp bent by ``tanh(δ·(1−u)) / tanh(δ)`` with
+    ``δ = clamp((steps − 4)/26, 0, 1.8)``; exactly linear at ``steps ≤ 4``.
 
-    ``decay`` is strictly decreasing with ``decay(0) = 1`` and ``decay(1) =
-    0``, so the run spans exactly ``sigma_max``→``sigma_min`` through the
-    model's native σ(t) — flow-safe, and every sigma is one the model was
-    trained on, like ``normal`` and ``infinity`` and unlike sigma-space
-    schedules such as ``karras``.
-
-    **The name is backwards.** ``tanh(δ(1−u))/tanh(δ)`` is *convex* on
-    ``[0, 1]`` — its slope at ``u=0`` is ``−δ·sech²(δ)/tanh(δ)``, shallower
-    than linear, steepening to ``−δ/tanh(δ)`` at ``u=1``. So sigma is held
-    high through the early trajectory and plunges at the end: HTDS is
-    high-σ-dense, the *opposite* of the low-noise tail density upstream's
-    README advertises (its "up to 45% of steps at σ ≤ 0.8" is, for the code as
-    written, closer to 3%). Measured against ``normal`` at 50 flow steps, HTDS
-    puts 7 sigmas below 0.5σ_max where ``normal`` puts 13. Ported faithfully
-    anyway — it is what upstream ships and what its comparisons were made
-    with — but pick it to spend budget on structure, not on texture.
-
-    This is the schedule upstream pairs with ``infinity_omega``, and on that
-    reading the pairing is coherent: the sampler's detail gain is also
-    strongest at high σ."""
+    The name is backwards: the curve is convex, so sigma stays high early and
+    plunges late (at 50 flow steps it puts 7 sigmas below 0.5σ_max where
+    ``normal`` puts 13). Ported as upstream ships it; it suits structure, not
+    texture, and pairs coherently with ``infinity_omega``."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     start = float(schedule.sigma_to_t(schedule.sigma_max))
@@ -416,9 +333,8 @@ def infinity_htds_schedule(schedule, steps: int, *, device: torch.device | str =
 
 def ddim_uniform_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                           dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """ComfyUI ``ddim_uniform``: pick sigmas from the model's (ascending) sigma
-    table at a fixed stride from the low-noise end, then reverse to descending
-    with a trailing 0."""
+    """ComfyUI ``ddim_uniform``: sigmas from the ascending table at a fixed
+    stride from the low-noise end, reversed, with a trailing 0."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     table = schedule.sigmas
@@ -437,10 +353,9 @@ def linear_quadratic_schedule(schedule, steps: int, *, threshold_noise: float = 
                               linear_steps: int | None = None,
                               device: torch.device | str = "cpu",
                               dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """ComfyUI ``linear_quadratic`` (Mochi, arXiv:2412.xxxx): a normalized
-    schedule that is linear up to ``threshold_noise`` over the first
-    ``linear_steps`` (default ``steps // 2``) and quadratic after, scaled to the
-    model's ``sigma_max``. Returns ``steps + 1`` descending sigmas ending at 0."""
+    """ComfyUI ``linear_quadratic`` (from Mochi): linear up to
+    ``threshold_noise`` over the first ``linear_steps`` (default ``steps // 2``),
+    quadratic after, scaled to ``sigma_max``."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     if steps == 1:
@@ -462,17 +377,9 @@ def linear_quadratic_schedule(schedule, steps: int, *, threshold_noise: float = 
 
 def smoothstep_schedule(schedule, steps: int, *, device: torch.device | str = "cpu",
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """U-shaped (endpoint-dense) flow schedule: smoothstep-eased ``t`` mapped
-    through the model's shift.
-
-    ``t`` is warped by ``u = t²·(3 − 2t)`` (the smoothstep polynomial, whose
-    derivative vanishes at both ends) before the rectified-flow σ(t) map, so
-    steps cluster near σ = 1 *and* near σ = 0 with a sparser middle — unlike
-    ``linear_quadratic``, which spends its density budget at σ ≈ 1 only and
-    ends on a large final jump. Designed to pair with σ-annealed ancestral
-    samplers (``euler_ancestral_anneal``): the dense high-σ region feeds the
-    stochastic burn-in, the dense low-σ tail feeds the near-deterministic
-    detail refinement. Returns ``steps + 1`` descending sigmas ending at 0."""
+    """U-shaped flow schedule: ``t`` warped by smoothstep ``u = t²·(3 − 2t)``
+    before the shift map, so steps cluster near σ = 1 and σ = 0 with a sparser
+    middle. Made for the σ-annealed ancestral samplers."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     t = torch.arange(steps, 0, -1, device=device, dtype=torch.float32) / steps
@@ -482,16 +389,9 @@ def smoothstep_schedule(schedule, steps: int, *, device: torch.device | str = "c
 
 
 def _beta_inv_cdf(q: torch.Tensor, alpha: float, beta: float, *, grid: int = 4096) -> torch.Tensor:
-    """Inverse regularized incomplete beta function (the Beta(α, β) quantile
-    function), in pure torch.
-
-    The CDF is built by midpoint-rule integration of the unnormalized density
-    ``x^(α−1)·(1−x)^(β−1)`` on a uniform grid (midpoints avoid evaluating the
-    α, β < 1 endpoint singularities; the two edge cells, where the midpoint
-    rule is poorest, use the exact leading-order masses ``h^α/α`` and
-    ``h^β/β``), then inverted by linear interpolation. Accurate to ~1e-5 —
-    far below the σ resolution any schedule needs — without a scipy
-    dependency. ``q`` is float64-promoted."""
+    """Beta(α, β) quantile function in pure torch: midpoint-rule CDF on a
+    uniform grid (exact leading-order masses in the two singular edge cells),
+    inverted by linear interpolation. Accurate to ~1e-5; float64."""
     edges = torch.linspace(0.0, 1.0, grid + 1, dtype=torch.float64)
     centers = 0.5 * (edges[:-1] + edges[1:])
     pdf = centers ** (alpha - 1.0) * (1.0 - centers) ** (beta - 1.0)
@@ -510,18 +410,11 @@ def _beta_inv_cdf(q: torch.Tensor, alpha: float, beta: float, *, grid: int = 409
 def beta_schedule(schedule, steps: int, *, alpha: float = 0.6, beta: float = 0.6,
                   device: torch.device | str = "cpu",
                   dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Beta-quantile schedule (ComfyUI's ``beta``; cf. Lee et al.,
-    "Beta Sampling is All You Need", arXiv:2407.12173).
-
-    Timesteps are placed at the quantiles of a Beta(α, β) distribution —
-    ``t_i = 1 − BetaInvCDF(i/(n−1))`` — then mapped through the model's σ(t)
-    (the shift map for rectified flow). With the α = β = 0.6 default the
-    density is U-shaped in *t*: dense near t = 1 (σ = 1, global composition)
-    and near t = 0 (fine detail), sparser in the middle. Unlike
-    :func:`smoothstep_schedule` (a fixed easing), the endpoint emphasis is
-    tunable via α (low-t end) and β (high-t end). The first sigma is exactly
-    ``σ(1)`` (1.0 for flow — the pure-noise init) and the last nonzero sigma is
-    the table floor ``σ(1/multiplier)``; a trailing 0 is appended."""
+    """Beta-quantile schedule (ComfyUI's ``beta``; Lee et al., "Beta Sampling
+    is All You Need", arXiv:2407.12173): ``t_i = 1 − BetaInvCDF(i/(n−1))``
+    through the model's σ(t). α = β = 0.6 is U-shaped in t; α tunes the low-t
+    end, β the high-t end. Runs from ``σ(1)`` to the table floor
+    ``σ(1/multiplier)``."""
     if steps < 1:
         raise ValueError("steps must be >= 1")
     if alpha <= 0 or beta <= 0:
@@ -534,13 +427,8 @@ def beta_schedule(schedule, steps: int, *, alpha: float = 0.6, beta: float = 0.6
 
 def _beta_mixture_inv_cdf(q: torch.Tensor, weight: float, alpha1: float, beta1: float,
                           alpha2: float, beta2: float, *, grid: int = 4096) -> torch.Tensor:
-    """Inverse CDF of a two-component Beta mixture
-    ``weight·Beta(α1, β1) + (1−weight)·Beta(α2, β2)``.
-
-    Same midpoint-rule integration + linear-interp inversion scheme as
-    :func:`_beta_inv_cdf`, applied to the *mixture* density. Both edge cells
-    use the exact leading-order mass for each component (the mixture's edge
-    mass is the weight-weighted sum of the two). Returns float64."""
+    """Inverse CDF of ``weight·Beta(α1, β1) + (1−weight)·Beta(α2, β2)``, by the
+    same scheme as :func:`_beta_inv_cdf`. Float64."""
     edges = torch.linspace(0.0, 1.0, grid + 1, dtype=torch.float64)
     centers = 0.5 * (edges[:-1] + edges[1:])
     pdf1 = centers ** (alpha1 - 1.0) * (1.0 - centers) ** (beta1 - 1.0)
@@ -565,46 +453,22 @@ def beta_mix_schedule(schedule, steps: int, *, weight: float = 0.5,
                            alpha2: float = 3.0, beta2: float = 0.7,
                            device: torch.device | str = "cpu",
                            dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Two-component Beta mixture schedule (``beta_mix``).
+    """Two-component Beta mixture schedule: timestep density
+    ``weight·Beta(α1, β1) + (1−weight)·Beta(α2, β2)`` in ``x = 1 − t``, mapped
+    through the model's σ(t), so the two endpoint peaks can differ.
 
-    A generalization of :func:`beta_schedule` that drops the symmetry
-    constraint: the timestep density is
-    ``weight·Beta(α1, β1) + (1−weight)·Beta(α2, β2)`` in the ``x = 1 − t``
-    variable (so ``x = 0`` is the high-noise end, ``x = 1`` the clean end),
-    then ``t_i = 1 − F_mix⁻¹(i/(n−1))`` is mapped through the model's σ(t).
-    With symmetric ``α = β`` and the two components equal this collapses to
-    the plain Beta schedule; the asymmetry lets the two endpoint peaks
-    differ in shape.
-
-    The defaults follow Lee et al.'s ("Beta Sampling is All You Need",
-    arXiv:2407.12173 Fig. 2d) observation that latent-diffusion models want an
-    *asymmetric* importance curve — more steps at the high-frequency detail
-    (low-σ) end than at the high-noise end — but are tuned for Anima's
-    rectified-flow ``σ(t)`` rather than transcribed literally. The paper's raw
-    LDM params ``Beta(0.5, 2.0) + Beta(3.0, 0.5)`` misbehave under the flow
-    shift map: the two ``x^{-1/2}`` singularities make the t-density nearly
-    *symmetric* (squandering the mixture) and, once pushed through σ(t),
-    over-pack the pure-noise ``σ ≈ 1`` end — where the denoiser changes least —
-    while colliding several steps at the table floor for step counts ≳ 40.
-    The tuned defaults keep a low-frequency peak at ``t ≈ 1``
-    (``Beta(0.8, 2.0)`` — α₁ raised from 0.5 to relieve that over-pack without
-    starving the high-σ end) and a stronger high-frequency peak near ``t ≈ 0``
-    (``Beta(3.0, 0.7)`` — genuinely more concentrated than the noise end, yet
-    clear of the floor: strictly descending through ~117 steps).
-    ``weight = 0.5`` balances the two; symmetric ``Beta(0.6, 0.6)`` (the plain
-    ``beta`` scheduler) instead forces both peaks to equal width.
-
-    Pair with a 2nd-order solver (``dpmpp_2m``, ``heunpp2``) for best
-    effect — step placement and per-step solver order are orthogonal
-    efficiency axes, so the gain compounds. The first sigma is exactly
-    ``σ(1)`` (1.0 for flow — the pure-noise init) and the last nonzero
-    sigma is the table floor ``σ(1/multiplier)``; a trailing 0 is appended.
+    Defaults follow Lee et al.'s (arXiv:2407.12173, Fig. 2d) detail-leaning
+    curve but are tuned for the flow shift map: the paper's
+    ``Beta(0.5, 2.0) + Beta(3.0, 0.5)`` turns nearly symmetric there, over-packs
+    σ ≈ 1 and collides steps at the table floor beyond ~40 steps. The tuned
+    ``Beta(0.8, 2.0) + Beta(3.0, 0.7)`` stays strictly descending through ~117
+    steps. Runs from ``σ(1)`` to the table floor.
     """
     if steps < 1:
         raise ValueError("steps must be >= 1")
     if not 0.0 < weight < 1.0:
         raise ValueError("weight must be in (0, 1); 0 or 1 collapses to a "
-                         "single Beta — use the 'beta' scheduler instead")
+                         "single Beta; use the 'beta' scheduler instead")
     if alpha1 <= 0 or beta1 <= 0 or alpha2 <= 0 or beta2 <= 0:
         raise ValueError("alpha1, beta1, alpha2, beta2 must all be > 0")
     q = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
@@ -618,76 +482,24 @@ def pump_dual_schedule(schedule, steps: int, *, pump_end: float = 0.45,
                        pump_share: float = 0.85, top_sigma: float = 0.99,
                        device: torch.device | str = "cpu",
                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Two-band schedule for ``cogent3_pump``: a step-dense pumped band and a
-    short refinement band, joined at the pump's own cutoff, terminating where
-    ``flow`` terminates.
+    """Two-band schedule for ``cogent3_pump``: a step-dense pumped band above
+    ``pump_end`` (the pump's hard cutoff) and a short refinement band ending at
+    ``flow``'s terminus ``σ(t = 1/steps)``.
 
-    ``cogent3_pump``'s coherence pump is hard-stopped below ``pump_end`` (in
-    the ``sigma_frac`` coordinate, which for flow is ``sigma``). Each step in
-    the pumped band injects coherence-gated noise that the next CFG-guided
-    model call must re-answer — one *re-deciding round* for the prompt per
-    injected step — so the band's step count is the schedule's main lever on
-    what the pump can do. Below the cutoff the sampler is plain ``cogent3`` on
-    the 3M exponential core.
+    Uniform-in-``u`` points through a piecewise-linear warp of
+    ``λ = −logit(σ)``: the first step jumps ``σ_max`` → ``top_sigma`` (the
+    model is σ-invariant near 1), then ``pump_share`` of the steps are uniform
+    in λ down to ``pump_end``, and the rest uniform in λ to the terminus.
+    Stopping at ``flow``'s terminus rather than the σ table floor (0.003) is
+    what matters: on the cogent3 toy benchmark, deeper termini were
+    monotonically worse (16× worse than ``flow`` at 8 steps at 0.003).
+    ``pump_share`` above ~0.9 collapses the tail. With no room below
+    ``pump_end`` (few steps, high shift) it is one uniform-λ band.
 
-    The schedule is a single uniform-in-``u`` grid of ``steps`` points run
-    through a piecewise-linear warp of the half-logSNR coordinate
-    ``λ = −logit(σ)``:
-
-    * **First step** — the run's universal burn-in: ``σ_max`` → ``top_sigma``
-      (a ≈ 5.9 λ jump at the default), matching the first-step sizing of the
-      whole family. The model is σ-invariant at ``σ ≈ 1``, so a uniform-λ
-      grid run all the way to ``σ_max`` would waste several near-identical
-      calls (``beta_mix`` spends 2 at ``σ ≥ 0.995``, ``flow`` 1; a naive
-      uniform-λ grid spends 9); the cap hands that budget to steps that move.
-    * **Pumped band** — ``pump_share`` of the run's steps (default 0.85, i.e.
-      27 of 32), spaced uniformly in λ (~0.18 λ each at the default).
-    * **Refinement band** — the remaining steps, also uniform in λ, ending at
-      ``σ(t = 1/steps)`` — **``flow``'s own terminus**, not the σ table floor.
-
-    Terminating at the table floor (σ ≈ 0.003, what ``beta`` / ``beta_mix`` /
-    ``kl_optimal`` / ``normal`` / ``infinity`` all do) is what this schedule
-    got wrong first. Measured on ``scripts/ab_cogent3.py``'s toy with the
-    terminus as the *only* variable (32 steps, ``eta_max=1.0``, rough model,
-    5 seeds): σ_end 0.0882 → 0.145, 0.03 → 0.210, 0.01 → 0.287, 0.003 → 0.365
-    energy distance, against ``flow``'s 0.141 — monotone in depth, and 16×
-    worse than ``flow`` at 8 steps. It is the terminus, not the last λ-step:
-    holding σ_end at 0.003 and making the final step *finer* (0.52 → 0.24 λ)
-    makes it worse still (0.370 → 0.420), while ``flow``'s much coarser 0.73 λ
-    final step at σ_end 0.088 is fine. Across the eleven schedulers of
-    ``docs/cogent.md`` §6 the same ordering holds: Spearman ρ of the published
-    rough-32 ranking is +0.91 against terminal depth and +0.94 against final
-    λ-step, but only +0.46 against the *minimum* λ-step that section names as
-    the mechanism, and −0.19 against pumped-step count.
-
-    With ``S_hi = λ(pump_end) − λ(top_sigma)`` and
-    ``S_lo = λ(σ_end) − λ(pump_end)``, the warp is
-    ``λ(u) = λ_top + (S_hi/pump_share)·u`` on ``u ≤ pump_share`` and
-    ``λ(u) = λ_knee + (S_lo/(1 − pump_share))·(u − pump_share)`` after — so
-    the pumped band's λ-step is ``S_hi/(pump_share·(steps−1))`` and the
-    refinement band's is ``S_lo/((1−pump_share)·(steps−1))``, with one blended
-    step across the join (where the pump itself is ramping to zero). At
-    ``pump_share = S_hi/(S_hi + S_lo)`` — ≈ 0.69 at 32 steps, drifting with
-    the budget — the two collapse into one uniform-λ grid; the 0.85 default
-    sits above it, so the pumped band is the finer of the two. On the same toy
-    that default beats ``flow`` on both metrics at 24–40 steps (rough 0.127 vs
-    0.141, deterministic RMSE 0.0121 vs 0.0156 at 32) while firing 27 pump
-    injections against ``flow``'s 26 and ``beta_mix``'s 21. Raising it further
-    is the sharp edge: 0.95 collapses (the 2-step tail goes to 1.4 λ).
-
-    When ``σ(t = 1/steps)`` still sits above ``pump_end`` — few steps, or a
-    high ``shift`` — there is no room for a refinement band and the whole run
-    is one uniform-λ grid, pumped end to end, as ``flow`` is at that budget.
-
-    Flow-only, like the other band-shaped table schedulers: it is evaluated
-    against a :class:`FlowSamplingView` whose ``σ_max`` is exactly 1.0.
-    ``pump_end`` pairs with ``sample_cogent3``'s own ``pump_end=0.45`` /
-    ``pump_span=0.25``, so the schedule knee sits on the sampler's hard
-    cutoff; the two must be changed together. Note the pumped band is defined
-    in σ and the flow ``shift`` is a pure translation in λ, so ``shift``
-    reaches this schedule only through the terminus — unlike every other flow
-    scheduler, where it also sets the high-σ density.
-    Returns ``steps + 1`` descending sigmas ending at 0."""
+    Flow-only (``σ_max`` must be 1.0). ``pump_end`` matches ``sample_cogent3``'s
+    default, so change them together. Since ``shift`` is a translation in λ it
+    only reaches this schedule through the terminus.
+    """
     if steps < 3:
         raise ValueError("steps must be >= 3")
     if not 0.0 < pump_share < 1.0:
@@ -704,8 +516,6 @@ def pump_dual_schedule(schedule, steps: int, *, pump_end: float = 0.45,
     def lam(sig: float) -> float:
         return math.log(1.0 / sig - 1.0)  # flow half-logSNR log((1-σ)/σ)
 
-    # `flow`'s terminus, σ(t = 1/steps) — shift-aware, and the one geometric
-    # property that predicts this core's measured scheduler ranking.
     sigma_end = float(schedule.t_to_sigma(schedule.multiplier / steps))
     lam_top, lam_fin, lam_knee = lam(top_sigma), lam(sigma_end), lam(pump_end)
     u = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
@@ -726,43 +536,22 @@ def pump_taper_schedule(schedule, steps: int, *, pump_end: float = 0.45,
                         top_sigma: float = 0.99,
                         device: torch.device | str = "cpu",
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """``pump_dual`` for ~30 steps: the pumped band's steps start at the
-    50-step density where the image is being decided and widen toward the
-    pump's cutoff, and the refinement tail is cut to what detail needs.
+    """``pump_dual`` for ~30 steps, aiming at the look of ``cogent3_pump`` +
+    ``pump_dual`` at 50.
 
-    Measured on ``cogent3_pump`` + ``pump_dual`` at 50 steps (AnimaFranken
-    v1.3, 1024×1536, CFG 4.5), which is the look this schedule is built to
-    reach in fewer steps:
+    Measured on that 50-step run: a 4-step refinement tail stays close to its
+    8-step one (RMSE ~11/255; 2 steps visibly darkens line art), and the x0
+    prediction changes fastest at the top of the band (σ ≈ 0.98–0.9) and ~10×
+    slower by 0.7–0.45. So the tail is ``max(1, round(tail_share·steps))``
+    λ-uniform steps, and the band's λ-density is tilted by ``exp(−taper·λ)``:
+    at the defaults and 30 steps its steps run from 0.12 λ (the 50-step
+    density) to 0.35 λ. ``taper=0`` is a uniform band.
 
-    * **The tail is cheap.** Replaying the 50-step run's first 42 steps and
-      swapping only the refinement tail, on the same scene: its 8 steps to
-      σ 0.058 vs 5 steps to 0.094 differ by RMSE ~5/255 (judged "almost
-      identical"), 4 steps by ~11, 3 by ~17; 2 steps visibly thickens and
-      darkens line art. ``tail_share`` 0.13 gives 4 tail steps at 30.
-    * **The band's work is top-heavy.** The per-λ change of the model's x0
-      prediction peaks where CFG switches on (σ ≈ 0.98), stays high through
-      σ ≈ 0.9 and falls roughly as ``e^(−0.87·λ)`` — about 10× slower by
-      σ 0.7–0.45. ``pump_dual`` spends its band uniformly in λ, so at 30
-      steps the top gets 0.19 λ per step against the 50-step run's 0.115.
-
-    So the band's λ-density is tilted by ``exp(−taper·λ)``: at the default
-    0.25 and 30 steps its first steps are 0.12 λ (the 50-step density) and
-    its last ones 0.35 λ. ``taper=0`` is a uniform band.
-
-    Layout, like ``pump_dual``: ``σ_max``, then ``steps − 1 − n_tail`` band
-    points from ``top_sigma`` (excluded — the first step is the family's
-    burn-in jump) down to exactly ``pump_end``, then ``n_tail =
-    max(1, round(tail_share·steps))`` λ-uniform points ending at ``flow``'s
-    terminus ``σ(t = 1/steps)``, then 0. When that terminus sits at or above
-    ``pump_end`` (few steps or a high ``shift``) there is no tail and the
-    tilted band runs to the terminus.
-
-    Pair with ``cogent3_pump_rate``: bigger band steps at the bottom mean
-    fewer pump injections there, and the rate-scaled pump keeps the injected
-    dose per λ at the 50-step value. With a step-fraction CFG interval the
-    tilt moves the CFG cutoff up in σ — at 30 steps an interval end of 0.75
-    stops CFG at σ ≈ 0.69, 0.8 at ≈ 0.54. Flow-only (``σ_max`` must be 1.0).
-    Returns ``steps + 1`` descending sigmas ending at 0."""
+    Layout otherwise as ``pump_dual``; with no room below ``pump_end`` the
+    tilted band runs to the terminus. Pair with ``cogent3_pump_rate``. With a
+    step-fraction CFG interval, end 0.75 stops CFG at σ ≈ 0.69 at 30 steps and
+    0.8 at ≈ 0.54. Flow-only.
+    """
     if steps < 3:
         raise ValueError("steps must be >= 3")
     if not 0.0 < tail_share < 1.0:
@@ -780,7 +569,7 @@ def pump_taper_schedule(schedule, steps: int, *, pump_end: float = 0.45,
         return math.log(1.0 / sig - 1.0)  # flow half-logSNR log((1-σ)/σ)
 
     def tilted(l0: float, l1: float, n: int) -> torch.Tensor:
-        # n points after l0, ending on l1, with λ-density ∝ exp(−taper·λ)
+        # n points after l0 ending on l1, λ-density ∝ exp(−taper·λ)
         u = torch.arange(1, n + 1, dtype=torch.float64) / n
         if taper == 0:
             return l0 + (l1 - l0) * u
@@ -800,11 +589,9 @@ def pump_taper_schedule(schedule, steps: int, *, pump_end: float = 0.45,
     return append_zero(sigmas.to(device=device, dtype=dtype))
 
 
-# Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
-# / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
-# routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
-# on purpose: it starts below σ_max, which the flow pipelines' σ_max==1 pure-noise
-# init assumes; it is offered for SD/SDXL only (which scales its init by σ[0]).
+# Flow table schedulers, evaluated against a FlowSamplingView. ``flow`` /
+# ``flow_dyn`` / ``oss`` are computed in the pipelines. ``ddim_uniform`` is
+# SD-only: it starts below σ_max, and the flow pipelines init at σ_max == 1.
 _FLOW_TABLE_SCHEDULERS = {
     "sgm_uniform": sgm_uniform_schedule,
     "simple": simple_schedule,
@@ -829,18 +616,13 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
                         pump_end: float = 0.45, pump_share: float = 0.85,
                         device: torch.device | str = "cpu",
                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Build a flow sigma schedule for the table/timestep-based schedulers by
-    evaluating them against a :class:`FlowSamplingView` of the rectified-flow
-    model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``infinity``,
-    ``infinity_htds``, ``linear_quadratic``, ``smoothstep``, ``beta``,
-    ``beta_mix``, ``pump_dual``, ``pump_taper`` and ``kl_optimal``.
+    """Build a flow sigma schedule for a table/timestep scheduler against a
+    :class:`FlowSamplingView`. Also handles ``kl_optimal``.
 
-    ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint
-    density; ``bm_*`` tune the ``beta_mix`` two-Beta mixture;
-    ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee;
-    ``pump_end``/``pump_share`` tune ``pump_dual``'s band join and the pumped
-    band's share of steps (``pump_end`` also sets ``pump_taper``'s knee). All
-    are ignored by the schedulers that don't take them."""
+    ``alpha``/``beta`` tune ``beta``, ``bm_*`` tune ``beta_mix``,
+    ``threshold_noise`` tunes ``linear_quadratic``, ``pump_end``/``pump_share``
+    tune ``pump_dual`` (``pump_end`` also ``pump_taper``). Schedulers ignore
+    the knobs they don't take."""
     view = FlowSamplingView(shift, device=device, dtype=dtype)
     if scheduler == "kl_optimal":
         return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),

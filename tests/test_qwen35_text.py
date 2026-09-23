@@ -1,18 +1,18 @@
 """Qwen3.5 hybrid text encoder (experimental) verification.
 
-The encoder covers two checkpoints — the Anima-packaged 4B (with a baked-in
+The encoder covers two checkpoints: the Anima-packaged 4B (with a baked-in
 projection head) and the raw 0.8B base (plain final norm, no projection). Both
 are multi-GB, so the offline tests build the module on the ``meta`` device (no
 allocation) and check it against the vendored backbone headers
-(``qwen35_4b_header.json`` / ``qwen35_08b_base_header.json`` — the key→shape maps
+(``qwen35_4b_header.json`` / ``qwen35_08b_base_header.json``, the key→shape maps
 read off the real files, prefix already stripped / vision+MTP dropped):
 
 1. ``from_state_dict`` derives the right config and the module's keys+shapes
-   match the real backbone — i.e. a strict load of the real file succeeds.
+   match the real backbone, so a strict load of the real file succeeds.
 2. The default config reproduces the 4B (keeps the defaults honest).
 3. A small-config forward exercises every path (SSM scan, gated attention,
    hybrid routing, RoPE, ExpRMSNorm / plain-norm head) and checks shape/finite.
-4. Strict load + forward on a real checkpoint — skipped unless one is on disk.
+4. Strict load + forward on a real checkpoint, skipped unless one is on disk.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def test_qwen35_derived_config_matches_real_header(name):
     cfg = Qwen35Config.from_state_dict(dummy)
     mod = _meta_state_dict(cfg)
     assert set(mod) == set(real), (
-        f"[{name}] key mismatch — missing: {sorted(set(real) - set(mod))[:5]} | "
+        f"[{name}] key mismatch; missing: {sorted(set(real) - set(mod))[:5]} | "
         f"extra: {sorted(set(mod) - set(real))[:5]}"
     )
     bad = {k: (mod[k], real[k]) for k in real if mod[k] != real[k]}
@@ -69,7 +69,7 @@ def test_qwen35_derived_config_matches_real_header(name):
 
 
 def test_qwen35_08b_base_uses_plain_norm_head():
-    """The 0.8B base has no projection head — a plain final RMSNorm at hidden
+    """The 0.8B base has no projection head, just a plain final RMSNorm at hidden
     width, not the 4B's Linear→ExpRMSNorm→SiLU→Linear (``norm.0/1/3``)."""
     cfg = Qwen35Config.from_state_dict(
         {k: torch.empty(s, device="meta") for k, s in _header("08b_base").items()}
@@ -100,7 +100,7 @@ def _tiny_cfg(**over):
 
 @pytest.mark.parametrize("projection", [True, False])
 def test_qwen35_forward_small_config(projection):
-    """Tiny config — both head kinds run and yield the expected output width."""
+    """Tiny config: both head kinds run and yield the expected output width."""
     out_dim = 32 if projection else 64  # plain norm keeps hidden width (64)
     cfg = _tiny_cfg(output_projection=projection)
     model = Qwen35TextEncoder(cfg).eval()
@@ -121,11 +121,11 @@ def test_qwen35_exp_rms_norm_preserves_diversity():
         a = model(torch.tensor([[1, 2, 3, 4]]))
         b = model(torch.tensor([[5, 6, 7, 8]]))
     cos = torch.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
-    assert cos < 0.999, f"outputs collapsed (cos={cos:.4f}) — ExpRMSNorm not applied?"
+    assert cos < 0.999, f"outputs collapsed (cos={cos:.4f}); ExpRMSNorm not applied?"
 
 
 def test_qwen_encode_runs_without_autograd_graph():
-    """``_qwen_encode`` must run under no_grad — the hybrid encoder's unrolled SSM
+    """``_qwen_encode`` must run under no_grad: the hybrid encoder's unrolled SSM
     scan would otherwise retain every per-timestep state and OOM. Guards both
     encoders against a regression that drops the wrapper."""
     from diffucore.pipelines._anima import _qwen_encode

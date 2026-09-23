@@ -1,10 +1,5 @@
-"""Shared normalization layers and small helpers.
-
-``RMSNorm`` is used by the DiT, Qwen3, and LLM-Adapter; ``_rotate_half`` is the
-common sub-expression in both RoPE ``_apply_rope`` variants.
-
-All are implemented in fp32 for numerical fidelity, matching the oracle
-references.
+"""Shared normalization layers and helpers (``RMSNorm`` for the DiT, Qwen3 and
+LLM-Adapter; ``_rotate_half`` for RoPE), computed in fp32 like the references.
 """
 
 from __future__ import annotations
@@ -28,7 +23,7 @@ class RMSNorm(nn.Module):
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Negate the second half of the last dim and swap halves — the RoPE
+    """Negate the second half of the last dim and swap halves: the RoPE
     ``(−sin, cos)`` mixing operator applied per pair of channels."""
     half = x.shape[-1] // 2
     return torch.cat([-x[..., half:], x[..., :half]], dim=-1)

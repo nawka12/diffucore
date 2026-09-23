@@ -1,4 +1,4 @@
-"""OpenCLIP ViT-bigG/14 text transformer — SDXL's second text encoder.
+"""OpenCLIP ViT-bigG/14 text transformer, SDXL's second text encoder.
 
 Implements the OpenCLIP text tower (Ilharco et al., 2021; Radford et al., 2021)
 used as SDXL's ``conditioner.embedders.1``. Submodule and parameter names mirror

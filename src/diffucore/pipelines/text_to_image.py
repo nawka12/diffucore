@@ -1,13 +1,5 @@
-"""Text-to-image pipeline.
-
-A thin wrapper over the shared pipeline machinery in :mod:`._base`: build the
-conditioning, sample a fresh-noise latent down the full sigma schedule, decode.
-Conditioning / sampling / decode (and their offload + tiling placement) live in
-:class:`._base._Pipeline`.
-
-For Anima (a flow-matching DiT with its own VAE, TE, and tokenizer pair) the
-call dispatches into :func:`._anima.anima_text_to_image` — that path doesn't
-share enough machinery with SD/SDXL to ride on top of ``_Pipeline``.
+"""Text-to-image pipeline: a thin wrapper over :class:`._base._Pipeline`. Anima
+and FLUX dispatch to their own drivers.
 """
 
 from __future__ import annotations

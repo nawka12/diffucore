@@ -1,11 +1,6 @@
-"""Conditioning cache: the LRU itself and its wiring into the shared SD/SDXL
-``_Pipeline._encode_prompts``.
-
-Pure-CPU, no model files: the encoder half (``_encode_conditioning``) is stubbed
-so these exercise the cache *logic* — hit/miss keying, the resolution-independent
-split (SDXL's ``y`` rebuilt per call, context/pooled cached) — not the encoders.
-The Anima/FLUX pipeline-level hits (zero re-encode, bit-identity) are covered in
-``test_anima_pipeline.py`` against the real fixture.
+"""Conditioning cache: the LRU and its wiring into ``_Pipeline._encode_prompts``,
+with the encoder stubbed (keying, and SDXL's ``y`` rebuilt while context/pooled
+are cached). Anima/FLUX hits are covered in ``test_anima_pipeline.py``.
 """
 
 from __future__ import annotations
@@ -86,7 +81,7 @@ def test_encode_prompts_sdxl_reassembles_y_per_resolution():
 
 def test_encode_prompts_no_cache_reencodes_each_call():
     """``cond_cache=None`` (the default / direct-library path) never consults a
-    cache and re-encodes every call — exactly today's behavior."""
+    cache and re-encodes every call."""
     pipe, calls = _stub_pipeline("sd15", None)
     pipe._encode_prompts("a cat", "blurry", 128, 128, _POLICY)
     pipe._encode_prompts("a cat", "blurry", 128, 128, _POLICY)

@@ -1,4 +1,4 @@
-"""T5 v1.1 XXL encoder — FLUX.1's primary text encoder.
+"""T5 v1.1 XXL encoder, FLUX.1's primary text encoder.
 
 Implements the encoder half of the T5 text-to-text transformer (Raffel et al.,
 2020) in its v1.1 form (Shazeer's gated-GELU FFN, no embedding/output tying, no
@@ -15,7 +15,7 @@ Contract:
     forward(input_ids: LongTensor[B, L]) -> last_hidden_state: FloatTensor[B, L, 4096]
 
 T5 specifics this implements faithfully:
-    - T5LayerNorm == RMSNorm (no mean-subtraction, no bias) — reuses ``_norm.RMSNorm``.
+    - T5LayerNorm == RMSNorm (no mean-subtraction, no bias), so ``_norm.RMSNorm``.
     - Relative position bias (32 buckets, max distance 128), computed once in the
       first block and shared across all layers.
     - No 1/sqrt(d) attention scaling (folded into the trained weights).
@@ -104,7 +104,7 @@ class T5Attention(nn.Module):
 
         q, k, v = shape(self.q(x)), shape(self.k(x)), shape(self.v(x))
         # T5 does not scale queries by 1/sqrt(d_kv); the position bias is added to
-        # the raw scores. Softmax in fp32 — T5 activations overflow fp16 otherwise.
+        # the raw scores. Softmax in fp32: T5 activations overflow fp16.
         scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) + position_bias.float()
         attn = scores.softmax(dim=-1).to(v.dtype)
         out = torch.matmul(attn, v).transpose(1, 2).reshape(b, length, -1)

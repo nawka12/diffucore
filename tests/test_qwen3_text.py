@@ -4,8 +4,7 @@ Three layers:
 
 1. Key-set match against the on-disk Qwen3 safetensors header.
 2. Strict load + forward shape check.
-3. Bit-identity (max|Δ| = 0 in fp32) against ``transformers.Qwen3Model`` —
-   the Apache-2.0 oracle we use, same pattern as SDXL's CLIP-L/bigG match.
+3. Bit-identity (max|Δ| = 0 in fp32) against ``transformers.Qwen3Model``.
 
 Tests 2 and 3 are skipped if the Qwen3 checkpoint isn't on disk.
 """
@@ -45,7 +44,7 @@ def test_qwen3_key_set_matches_checkpoint():
         ckpt_keys = set(f.keys())
     mod_keys = set(Qwen3TextEncoder().state_dict().keys())
     assert mod_keys == ckpt_keys, (
-        f"key mismatch — missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
+        f"key mismatch; missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
         f"extra: {sorted(mod_keys - ckpt_keys)[:5]}"
     )
 
@@ -86,8 +85,7 @@ def test_qwen3_bit_identical_to_transformers(loaded_te):
     hf.load_state_dict(sd_hf, strict=True)
     hf = hf.float().eval()
 
-    # A few tokens drawn from the Qwen2.5 vocab — the exact IDs don't matter
-    # for the comparison; we just need a non-trivial sequence.
+    # Any non-trivial Qwen2.5 token sequence will do.
     input_ids = torch.tensor([[151643, 9707, 11, 1879, 0, 358, 1079, 264, 4128, 1614, 13]])
     with torch.no_grad():
         o = loaded_te(input_ids)

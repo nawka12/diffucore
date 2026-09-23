@@ -1,35 +1,14 @@
-"""FLUX DiT — Black Forest Labs' rectified-flow transformer (FLUX.1 / FLUX.2).
+"""FLUX DiT: Black Forest Labs' rectified-flow MMDiT (FLUX.1 / FLUX.2).
 
-A double-stream + single-stream MMDiT (Esser et al. SD3, 2024; FLUX, BFL 2024).
-Image and text tokens first flow through ``depth`` *double-stream* blocks that
-keep separate weights per modality but attend jointly, then are concatenated and
-flow through ``depth_single_blocks`` *single-stream* blocks (one fused
-qkv+MLP linear). Positions use an axial RoPE; every block is AdaLN-modulated; QK
-is RMSNorm'd per head.
+Double-stream blocks (separate weights per modality, joint attention), then
+single-stream blocks; axial RoPE, AdaLN modulation, per-head QK RMSNorm. Names
+mirror BFL's ``flux`` repository (Apache-2.0) for a strict load.
 
-Submodule and parameter names mirror Black Forest Labs' ``flux`` repository
-(Apache-2.0; the same lineage ComfyUI follows) so a ``strict=True`` load against
-an official transformer file is the correctness check.
-
-The same module covers two configs:
-
-* **FLUX.1** (``image_model="flux"``): per-block ``img_mod``/``txt_mod``
-  modulation, GELU-tanh MLP, biases on, RoPE axes ``(16,56,56)`` θ=10000,
-  ``qkv_bias=True``. 2×2 patchify happens in the pipeline (in_channels=64).
-* **FLUX.2** (``image_model="flux2"``): a single *global* set of three shared
-  modulators (``double_stream_modulation_img``/``_txt``,
-  ``single_stream_modulation``, bias-free) drives every block; SiLU-gated MLP;
-  **no biases** anywhere; RoPE axes ``(32,32,32,32)`` θ=2000. patch_size=1, so
-  the pipeline feeds the latent channels directly (in_channels=128) and the text
-  ids carry positions on axis 3.
-
-Config is driven from the checkpoint shapes (:meth:`FluxConfig.from_state_dict`);
-the family constants the shapes don't reveal are passed by the loader.
-
-Contract:
-    forward(img:[B,L_img,in_ch], img_ids:[B,L_img,A], txt:[B,L_txt,ctx],
-            txt_ids:[B,L_txt,A], timesteps:[B], y:[B,vec]|None, guidance:[B]|None)
-        -> [B, L_img, in_ch]
+FLUX.1: per-block modulation, GELU-tanh MLP, biases, RoPE ``(16,56,56)``
+θ=10000, 2×2 patchify in the pipeline. FLUX.2: three shared global modulators,
+SiLU-gated MLP, no biases, RoPE ``(32,32,32,32)`` θ=2000, patch_size 1, text
+positions on axis 3. Widths come from the checkpoint shapes
+(:meth:`FluxConfig.from_state_dict`), family constants from the loader.
 """
 
 from __future__ import annotations
@@ -278,8 +257,7 @@ class DoubleStreamBlock(nn.Module):
         super().__init__()
         mlp_hidden = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
-        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in
-        # (see models/_attention.py). Plain attribute — no state-dict impact.
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in.
         self.attn_backend = "sdpa"
         self.modulation = modulation
         if modulation:
@@ -330,8 +308,7 @@ class SingleStreamBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in
-        # (see models/_attention.py). Plain attribute — no state-dict impact.
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in.
         self.attn_backend = "sdpa"
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # SiLU-gated MLP needs twice the first-linear width (it halves on gating).

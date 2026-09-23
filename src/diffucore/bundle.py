@@ -1,13 +1,8 @@
-"""Loading a checkpoint into a ready-to-run :class:`ModelBundle`.
+"""Load checkpoints into a ready-to-run :class:`ModelBundle`.
 
-Architecture detection (implemented, M3) runs here; building the modules and
-loading their weights is the M4–M6 work described in
-``docs/IMPLEMENTATION_SPEC.md``.
-
-Anima checkpoints ship as three separate files (DiT / VAE / Qwen3 TE) rather
-than one bundled safetensors; the :func:`load_anima_checkpoint` entrypoint
-takes all three paths and returns the same :class:`ModelBundle` type as
-:func:`load_checkpoint` so the pipelines can dispatch by ``spec.architecture``.
+Anima and split-file FLUX arrive as several files (DiT / VAE / text encoders);
+their loaders return the same :class:`ModelBundle` so the pipelines can
+dispatch on ``spec.architecture``.
 """
 
 from __future__ import annotations
@@ -31,8 +26,8 @@ from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
 
-# On-disk prefixes (minus the top-level architecture prefix). SDXL keeps CLIP-L
-# under embedders.0 and adds OpenCLIP bigG under embedders.1.
+# On-disk prefixes. SDXL keeps CLIP-L under embedders.0 and OpenCLIP bigG under
+# embedders.1.
 _VAE_PREFIX = "first_stage_model."
 _UNET_PREFIX = "model.diffusion_model."
 _SD15_CLIP = "cond_stage_model.transformer."
@@ -42,8 +37,7 @@ _SDXL_CLIP_G = "conditioner.embedders.1.model."
 
 def _load_sub(module, state_dict, prefix):
     sub = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
-    # position_ids is a derived constant (non-persistent buffer); drop it if a
-    # checkpoint ships one so the strict load neither misses nor rejects it.
+    # position_ids is a derived non-persistent buffer; drop it if shipped.
     sub = {k: v for k, v in sub.items() if not k.endswith("position_ids")}
     module.load_state_dict(sub, strict=True)
     return module
@@ -55,13 +49,13 @@ class ModelBundle:
 
     spec: ModelSpec
     schedule: DiscreteSchedule
-    tokenizer: object               # conditioning.CLIPTokenizer
-    text_encoder: object            # CLIPTextEncoder (CLIP-L)
-    backbone: object                # models.UNetModel
-    vae: object                     # models.AutoencoderKL
-    text_encoder_2: object = None   # SDXL only: OpenCLIPTextEncoder (bigG)
-    policy: DevicePolicy = None      # placement authority; None -> all-resident
-    cond_cache: object = None        # optional runtime.ConditioningCache; None -> no caching (today's behavior)
+    tokenizer: object
+    text_encoder: object
+    backbone: object
+    vae: object
+    text_encoder_2: object = None   # SDXL OpenCLIP bigG / FLUX.1 CLIP-L
+    policy: DevicePolicy = None      # None -> all-resident
+    cond_cache: object = None        # optional runtime.ConditioningCache
 
 
 def load_checkpoint(
@@ -70,30 +64,23 @@ def load_checkpoint(
     dtype: torch.dtype = torch.float16,
     policy: DevicePolicy | None = None,
 ) -> ModelBundle:
-    """Detect, build, and weight-load a checkpoint into a :class:`ModelBundle`.
+    """Detect, build and weight-load an SD1.5 / SDXL checkpoint (an all-in-one
+    FLUX file is routed to :func:`load_flux_checkpoint`).
 
-    Supports SD1.5 and SDXL. Text encoder(s) and UNet run in ``dtype`` (fp16 on
-    CUDA); the VAE stays fp32 (fp16 decode produces artifacts/NaNs).
-
-    ``policy`` is the single placement authority. When omitted, one is built from
-    ``device``/``dtype`` with offload off (current all-resident behavior). When
-    ``policy.offload`` is set, modules are left on CPU; the pipeline shuttles each
-    onto the GPU around its stage. The sigma schedule always lives on the compute
-    device — it is never offloaded.
+    ``policy`` is the placement authority; without one, everything is resident
+    in ``dtype`` on ``device``. The VAE runs in ``policy.vae_dtype``. The sigma
+    schedule always lives on the compute device.
     """
     if policy is None:
         policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
 
     spec = detect_architecture(read_header(path))
-    # An all-in-one FLUX checkpoint (transformer + CLIP/T5/Mistral + VAE in one
-    # file) lands here too; route it to the FLUX loader.
     if spec.architecture in ("flux1", "flux2"):
         return load_flux_checkpoint(path, device=device, dtype=dtype, policy=policy)
     if spec.architecture not in ("sd15", "sdxl"):
         raise NotImplementedError(f"unsupported architecture {spec.architecture!r}")
 
-    # The training schedule is fully determined by the spec; keep its sigma table
-    # (fp32) on the compute device so sigma<->t stays with the latents.
+    # Keep the fp32 sigma table on the compute device, next to the latents.
     schedule = DiscreteSchedule(
         make_betas(spec.beta_schedule, spec.num_train_timesteps),
         zero_terminal_snr=spec.zero_terminal_snr,
@@ -103,9 +90,7 @@ def load_checkpoint(
 
     state_dict = load_state_dict(path, device="cpu")
 
-    # With offload, modules wait on CPU and the pipeline moves them per stage. The
-    # "idle" group (text encoders + VAE) offloads in every mode; the UNet only in
-    # full offload ("encoders" mode keeps it resident — see RUNTIME_SPEC.md R4).
+    # The text encoders + VAE offload in every mode; the UNet only under full.
     idle_target = policy.offload_device if policy.offload_idle else policy.device
     unet_target = policy.offload_device if policy.offload_unet else policy.device
 
@@ -124,11 +109,7 @@ def load_checkpoint(
 
     text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
     if policy.offload_stream:
-        # Park the whole UNet on CPU and stream its blocks (down / mid / up) onto
-        # the GPU one at a time per forward, keeping only the small modules
-        # (time/label embed, final conv) resident — the SD/SDXL analog of ComfyUI's
-        # --lowvram. Fits SDXL's ~2.6 GB UNet on a 4 GB card, where whole-module
-        # staging ("full") OOMs once 1024² activations land on top of it.
+        # Stream the UNet's blocks (ComfyUI --lowvram analog), so SDXL fits ~4 GB.
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("input_blocks", "middle_block", "output_blocks"),
                       policy.device, policy.offload_device,
@@ -137,14 +118,12 @@ def load_checkpoint(
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
-    # NHWC for the conv backbones when opted in. cuDNN picks faster channels-last
-    # kernels on Ampere+ fp16. Text encoders and 1D-attention modules stay default.
+    # NHWC for the conv backbones when opted in.
     if policy.channels_last:
         backbone = to_channels_last(backbone)
         vae = to_channels_last(vae)
 
-    # torch.compile wraps the backbone after channels_last so Inductor's first
-    # specialize sees the final layout. Raises if the policy offloads the UNet.
+    # Compile after channels_last so Inductor specializes on the final layout.
     backbone = maybe_compile_backbone(backbone, policy)
 
     return ModelBundle(
@@ -159,8 +138,8 @@ def load_checkpoint(
     )
 
 
-# Anima DiT keys are bare (``net.*``) in a native export but ``model.diffusion_model.*``
-# inside an all-in-one ComfyUI checkpoint; recover whichever prefix by this leaf.
+# Anima DiT keys are bare (``net.*``) in a native export but under
+# ``model.diffusion_model.*`` in an all-in-one file; this leaf finds either.
 _ANIMA_DIT_LEAF = "llm_adapter.blocks.0.cross_attn.q_proj.weight"
 
 
@@ -173,29 +152,20 @@ def load_anima_checkpoint(
     dtype: torch.dtype = torch.float16,
     policy: DevicePolicy | None = None,
 ) -> ModelBundle:
-    """Load Anima's three-file split (DiT + Qwen-Image VAE + Qwen3 TE) into a
-    :class:`ModelBundle`. The VAE runs in ``policy.vae_dtype`` (fp32 default;
-    fp16 measured ~2.8× faster on decode with max pixel error < 3/255, and the
-    pipelines retry any non-finite fp16 output in fp32); the DiT and Qwen3
-    encoder run in ``dtype``.
-
-    ``schedule`` is left ``None`` — flow-matching models drive sampling from a
-    σ table built at pipeline time by :func:`diffucore.sampling.flow_matching_schedule`,
-    not from a discrete training schedule.
+    """Load Anima's three files (DiT + Qwen-Image VAE + Qwen3 TE) into a
+    :class:`ModelBundle`. The VAE runs in ``policy.vae_dtype``, the DiT and text
+    encoder in ``dtype``. ``schedule`` is ``None``: flow models build their σ
+    schedule at sample time.
     """
     if policy is None:
         policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
 
-    # Progress markers to the server's stdout: the load reads three multi-GB files
-    # and builds a 2B-param module with no other output, so the last line printed
-    # tells you which stage is slow (or stuck).
+    # Per-stage progress, so a slow (or stuck) multi-GB load shows where it is.
     _t0 = time.perf_counter()
     def _stage(msg: str) -> None:
         print(f"[load] (+{time.perf_counter() - _t0:.1f}s) {msg}", flush=True)
 
-    # Detection runs on the DiT file (the VAE/TE have their own keys and are
-    # already known by name). It validates the file is Anima before we build
-    # the 2B-param module.
+    # Validate the DiT file is Anima before building the 2B-param module.
     _stage("detecting architecture")
     spec = detect_architecture(read_header(dit_path))
     if spec.architecture != "anima":
@@ -206,20 +176,16 @@ def load_anima_checkpoint(
     idle_target = policy.offload_device if policy.offload_idle else policy.device
     unet_target = policy.offload_device if policy.offload_unet else policy.device
 
-    # VAE: independent file with no key prefix.
     _stage("loading VAE weights")
     vae = QwenImageVAE()
     vae.load_state_dict(load_state_dict(vae_path, device="cpu"), strict=True)
     vae = vae.to(idle_target, policy.vae_dtype).eval()
 
-    # Text encoder: independent file. Anima's stock encoder is Qwen3-0.6B; the
-    # experimental cosmos-qwen3.5 swap ships a Qwen3.5 hybrid (SSM+attention)
-    # encoder instead — both the Anima-packaged 4B and the raw 0.8B base. They're
-    # identified by an SSM ``linear_attn`` block; the backbone is extracted by its
-    # ``embed_tokens.weight`` leaf, which strips any ``model.language_model.``
-    # prefix and drops the base model's ``model.visual.*`` / ``mtp.*`` heads. Both
-    # expose a 1024-d output, so the LLM-Adapter and DiT are unchanged; only the
-    # encoder + its BPE vocab differ.
+    # Stock Anima uses Qwen3-0.6B; the experimental cosmos-qwen3.5 swap (4B, or
+    # the raw 0.8B base) is a Qwen3.5 hybrid, identified by an SSM
+    # ``linear_attn`` block. ``_extract_component`` strips any
+    # ``model.language_model.`` prefix and drops the vision / mtp heads. Both
+    # emit 1024-d, so the adapter and DiT are unchanged.
     te_sd = load_state_dict(te_path, device="cpu")
     qwen35_sd = _extract_component(te_sd, "embed_tokens.weight")
     is_qwen35 = qwen35_sd is not None and any("linear_attn.A_log" in k for k in qwen35_sd)
@@ -233,18 +199,16 @@ def load_anima_checkpoint(
         text_encoder.load_state_dict(te_sd, strict=True)
     text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
 
-    # DiT (incl. the LLM-Adapter under ``llm_adapter``): keys live under a ``net.*``
-    # or ``model.diffusion_model.*`` prefix, recovered and stripped by the leaf.
+    # The DiT (with ``llm_adapter``) sits under ``net.*`` or
+    # ``model.diffusion_model.*``.
     _stage("loading DiT weights (largest file)")
     sd_dit = _extract_component(load_state_dict(dit_path, device="cpu"), _ANIMA_DIT_LEAF)
     _stage("building DiT backbone (2B params)")
     backbone = AnimaDiT()
     backbone.load_state_dict(sd_dit, strict=True)
     if policy.offload_stream:
-        # Stream the DiT blocks (the SD/FLUX --lowvram analog) so Anima's ~4 GB
-        # DiT fits a small card. Keep block 0 resident: TeaCache probes its
-        # modulated_self_attn_input directly (outside the block's __call__, so the
-        # stream hooks don't fire), and that probe must find its weights on the GPU.
+        # Keep block 0 resident: TeaCache probes it outside the block's
+        # __call__, where the stream hooks don't fire.
         _stage("streaming DiT blocks to GPU (low-VRAM mode)")
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("blocks",), policy.device, policy.offload_device,
@@ -254,16 +218,14 @@ def load_anima_checkpoint(
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
-    # Attention dispatch (models/_attention.py): resolve the policy's kernel
-    # choice once and stamp the DiT's attention modules. "sdpa" (default)
-    # stamps nothing — the modules already default to it.
+    # "sdpa" (default) stamps nothing; the modules already use it.
     attn_backend = resolve_attention_backend(policy)
     if attn_backend != "sdpa":
         set_attention_backend(backbone, attn_backend)
         _stage(f"attention backend: {attn_backend}")
 
     if policy.compile:
-        _stage("compiling backbone (torch.compile warmup — may take minutes)")
+        _stage("compiling backbone (torch.compile warmup, may take minutes)")
     backbone = maybe_compile_backbone(backbone, policy)
     _stage("model ready")
 
@@ -271,7 +233,7 @@ def load_anima_checkpoint(
 
     return ModelBundle(
         spec=spec,
-        schedule=None,                  # flow-matching: σ-schedule built at sample time
+        schedule=None,                  # flow: σ schedule built at sample time
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         backbone=backbone,
@@ -282,12 +244,8 @@ def load_anima_checkpoint(
 
 
 # ─── FLUX (FLUX.1 + FLUX.2) ──────────────────────────────────────────────────
-#
-# FLUX components can arrive bundled in one all-in-one checkpoint or as separate
-# files (transformer / VAE / text-encoder(s)). Rather than enumerate the many
-# on-disk prefix conventions, each component is located by a fingerprint leaf key
-# and its prefix is recovered and stripped — so bare BFL files and nested
-# ``model.diffusion_model.`` / ``text_encoders.*`` all-in-one layouts both work.
+# Components come all-in-one or as separate files; each is located by a
+# fingerprint leaf key whose prefix is recovered and stripped.
 
 _FLUX_DIT_LEAF = "double_blocks.0.img_attn.qkv.weight"
 _FLUX_VAE_LEAF = "decoder.conv_in.weight"
@@ -297,8 +255,8 @@ _FLUX_MISTRAL_LEAF = "model.layers.0.self_attn.q_proj.weight"
 
 
 def _flux_arch(architecture: str) -> dict:
-    """Per-family FLUX DiT constants the tensor shapes don't reveal. Both families
-    keep head_dim 128 (axes sum to 128), so ``num_heads = hidden // 128``."""
+    """Per-family FLUX DiT constants the tensor shapes don't reveal. head_dim is
+    128 for both, so ``num_heads = hidden // 128``."""
     if architecture == "flux2":
         return dict(
             axes_dim=(32, 32, 32, 32), theta=2000, mlp_ratio=3.0, qkv_bias=False,
@@ -311,14 +269,10 @@ def _flux_arch(architecture: str) -> dict:
 
 
 def _infer_vae_config(sd, *, scale_factor: float, shift_factor: float) -> VAEConfig:
-    """Build a :class:`VAEConfig` from an LDM-style autoencoder state dict.
-
-    FLUX.1's VAE is 16-channel / 8× (channel_mult ``(1,2,4,4)``) and FLUX.2's is
-    128-channel / 16× (one extra downsample stage) — both follow the LDM
-    ``encoder.down.{i}.block.{j}`` layout, so the depth, base width, per-level
-    multipliers, res-block count, latent channels and quant-conv presence are all
-    read off the weights rather than hardcoded. (Attention is assumed mid-only, as
-    in the FLUX autoencoders.)
+    """Build a :class:`VAEConfig` from an LDM-style autoencoder state dict
+    (FLUX.1: 16-ch / 8×; FLUX.2: 128-ch / 16×), reading depth, widths, res
+    blocks, latent channels and quant convs off the weights. Attention is
+    assumed mid-only.
     """
     ch = sd["encoder.conv_in.weight"].shape[0]
     num_res = 0
@@ -342,17 +296,14 @@ def _infer_vae_config(sd, *, scale_factor: float, shift_factor: float) -> VAECon
         z_channels=z_channels,
         scale_factor=scale_factor,
         shift_factor=shift_factor,
-        # SD/LDM keeps them at the top level; FLUX.2 nests them under
-        # encoder./decoder. (lifted by _lift_quant_convs before this runs).
+        # FLUX.2 nests these under encoder./decoder. (see _lift_quant_convs).
         use_quant_conv="quant_conv.weight" in sd or "encoder.quant_conv.weight" in sd,
     )
 
 
 def _lift_quant_convs(sd):
     """Lift FLUX.2's nested ``encoder.quant_conv.*`` / ``decoder.post_quant_conv.*``
-    to the top-level ``quant_conv.*`` / ``post_quant_conv.*`` that
-    :class:`AutoencoderKL` expects. A no-op for SD/LDM and FLUX.1 (which either
-    keep them top-level or have none)."""
+    to the top level :class:`AutoencoderKL` expects. No-op otherwise."""
     moves = (("encoder.quant_conv.", "quant_conv."),
              ("decoder.post_quant_conv.", "post_quant_conv."))
     out = {}
@@ -366,8 +317,8 @@ def _lift_quant_convs(sd):
 
 
 def _extract_component(sd, leaf: str):
-    """Locate the component whose keys end with ``leaf``, strip its on-disk prefix,
-    and return the sub-state-dict (or ``None`` if the component isn't present)."""
+    """The sub-state-dict of the component whose keys end with ``leaf``, prefix
+    stripped, or ``None``."""
     if sd is None:
         return None
     prefix = None
@@ -381,22 +332,21 @@ def _extract_component(sd, leaf: str):
 
 
 def _load_no_missing(module, sub, drop_suffixes=()):
-    """Load ``sub`` into ``module``, tolerating benign *extra* keys (duplicated
-    embeddings, projection heads, ``position_ids``) but rejecting any *missing*
-    key — a missing key is a real architecture mismatch, the correctness check."""
+    """Load ``sub`` into ``module``, tolerating extra keys but rejecting missing
+    ones (a real architecture mismatch)."""
     drop = ("position_ids",) + tuple(drop_suffixes)
     sub = {k: v for k, v in sub.items() if not any(k.endswith(s) for s in drop)}
     missing, _ = module.load_state_dict(sub, strict=False)
     if missing:
         raise RuntimeError(
             f"{type(module).__name__}: {len(missing)} missing key(s) "
-            f"(e.g. {missing[:5]}) — checkpoint/architecture mismatch"
+            f"(e.g. {missing[:5]}), checkpoint/architecture mismatch"
         )
     return module
 
 
 def _qwen3_config_from_sd(sd) -> Qwen3Config:
-    """Derive a Qwen3 config from a checkpoint (head_dim from the per-head q-norm)."""
+    """Derive a Qwen3 config from a checkpoint (head_dim from the q-norm)."""
     emb = sd["model.embed_tokens.weight"]
     n = 0
     while f"model.layers.{n}.self_attn.q_proj.weight" in sd:
@@ -413,9 +363,9 @@ def _qwen3_config_from_sd(sd) -> Qwen3Config:
 
 
 def _build_flux2_text_encoder(lm_sub):
-    """Build FLUX.2's text encoder from its LM state dict. Returns
-    ``(encoder, tokenizer_kind, needs_mistral_tokenizer)``. Qwen3 (Klein) is told
-    apart from Mistral (Dev) by its per-head ``q_norm`` weight."""
+    """Build FLUX.2's text encoder: ``(encoder, tokenizer_kind,
+    needs_mistral_tokenizer)``. Qwen3 (Klein) has a per-head ``q_norm``;
+    Mistral (Dev) doesn't."""
     if "model.layers.0.self_attn.q_norm.weight" in lm_sub:   # Qwen3 (Klein)
         cfg = _qwen3_config_from_sd(lm_sub)
         encoder = Qwen3TextEncoder(cfg)
@@ -443,14 +393,11 @@ def load_flux_checkpoint(
 ) -> ModelBundle:
     """Load FLUX.1 or FLUX.2 into a :class:`ModelBundle`.
 
-    Components come from their dedicated file when given, else from the all-in-one
-    ``path``; pass either (or a mix). FLUX.1 needs transformer + VAE + T5-XXL +
-    CLIP-L; FLUX.2 needs transformer + VAE + Mistral-3 (+ its ``tokenizer.json``,
-    ``mistral_tokenizer_path`` or a sidecar next to the encoder file).
-
-    Like Anima, ``schedule`` is left ``None`` — FLUX is flow-matching and builds
-    its σ schedule (a resolution-dependent shift) at pipeline time. The VAE runs
-    fp32; the transformer and text encoder(s) run in ``dtype``.
+    Each component comes from its own file when given, else from the all-in-one
+    ``path``. FLUX.1 needs transformer + VAE + T5-XXL + CLIP-L; FLUX.2 needs
+    transformer + VAE + Qwen3 or Mistral-3 (Mistral also needs a
+    ``tokenizer.json``: ``mistral_tokenizer_path`` or a sidecar). The VAE runs
+    in ``policy.vae_dtype``; ``schedule`` is ``None``.
     """
     if path is None and transformer_path is None:
         raise ValueError("provide an all-in-one `path` or at least `transformer_path`")
@@ -477,7 +424,7 @@ def load_flux_checkpoint(
     idle_target = policy.offload_device if policy.offload_idle else policy.device
     unet_target = policy.offload_device if policy.offload_unet else policy.device
 
-    # ---- transformer (DiT). Family constants from _flux_arch; widths from shapes.
+    # ---- transformer: family constants from _flux_arch, widths from shapes
     dit_sub = _extract_component(dit_sd_full, _FLUX_DIT_LEAF)
     hidden = dit_sub["img_in.weight"].shape[0]
     arch_params = _flux_arch(spec.architecture)
@@ -487,8 +434,7 @@ def load_flux_checkpoint(
     backbone = Flux(flux_cfg)
     _load_no_missing(backbone, dit_sub)
     if policy.offload_stream:
-        # Park the whole DiT on CPU at the right dtype, then keep the small
-        # modules resident and stream the blocks (fits FLUX.1 on a 24 GB card).
+        # Keep the small modules resident and stream the blocks.
         backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
         stream_blocks(backbone, ("double_blocks", "single_blocks"),
                       policy.device, policy.offload_device,
@@ -496,27 +442,24 @@ def load_flux_checkpoint(
                       prefetch=policy.stream_prefetch)
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
-    # Attention dispatch: resolve the policy's kernel choice once and stamp the
-    # DiT blocks ("sdpa" stamps nothing — the modules already default to it).
+    # "sdpa" stamps nothing; the modules already use it.
     attn_backend = resolve_attention_backend(policy)
     if attn_backend != "sdpa":
         set_attention_backend(backbone, attn_backend)
     backbone = maybe_compile_backbone(backbone, policy)
 
-    # ---- VAE (config inferred from the weights: 16-ch/8× for FLUX.1, 128-ch/16×
-    # for FLUX.2; scale/shift from the spec — FLUX.2 uses none).
+    # ---- VAE: config inferred from the weights, scale/shift from the spec.
     vae_sub = _extract_component(source(vae_path), _FLUX_VAE_LEAF)
     if vae_sub is None:
         raise ValueError("no VAE found (need it in `path` or `vae_path`)")
-    vae_sub = _lift_quant_convs(vae_sub)   # FLUX.2 nests the quant convs
+    vae_sub = _lift_quant_convs(vae_sub)
     vae = AutoencoderKL(_infer_vae_config(
         vae_sub, scale_factor=spec.latent_scale, shift_factor=spec.latent_shift
     ))
     _load_no_missing(vae, vae_sub)
     # FLUX.2 bridges its 32-ch VAE latent to the 128-ch DiT space with a 2×2
-    # pixel-shuffle + a (non-affine) batch-norm latent normalisation. The conv
-    # stack lives in AutoencoderKL; stash the bn stats so the pipeline can invert
-    # them before decode (see _flux.flux_text_to_image). eps = config batch_norm_eps.
+    # pixel-shuffle and a non-affine batch norm; keep the bn stats so the
+    # pipeline can invert them before decode.
     if spec.architecture == "flux2" and "bn.running_mean" in vae_sub:
         eps = 1e-4
         vae.register_buffer(
@@ -547,7 +490,7 @@ def load_flux_checkpoint(
         )
         text_encoder_2 = text_encoder_2.to(idle_target, policy.compute_dtype).eval()
         tokenizer = FluxTokenizer()
-    else:  # flux2 — a single decoder LM (Klein/Qwen3 or Dev/Mistral)
+    else:  # flux2: one decoder LM (Klein/Qwen3 or Dev/Mistral)
         lm_sub = _extract_component(source(mistral_path), _FLUX_MISTRAL_LEAF)
         if lm_sub is None:
             raise ValueError("FLUX.2 needs a Qwen3 (Klein) or Mistral-3 (Dev) encoder")
@@ -565,7 +508,7 @@ def load_flux_checkpoint(
 
     return ModelBundle(
         spec=spec,
-        schedule=None,                  # flow-matching: σ-schedule built at sample time
+        schedule=None,                  # flow: σ schedule built at sample time
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         backbone=backbone,

@@ -1,17 +1,8 @@
-"""SD1.5 UNet — the epsilon-prediction diffusion backbone.
+"""SD1.5 / SDXL UNet (Rombach et al., 2022), the epsilon/v-prediction backbone.
 
-Implements the LDM/Stable-Diffusion UNet (Rombach et al., 2022) with the
-cross-attention conditioning of Vaswani et al. (2017). Submodule and parameter
-names mirror the on-disk ``model.diffusion_model.*`` keys (the original LDM
-naming) so a ``strict=True`` load is the correctness check.
-
-Contract:
-    forward(x: FloatTensor[B, 4, h, w],
-            timesteps: FloatTensor[B],
-            context: FloatTensor[B, 77, 768]) -> eps: FloatTensor[B, 4, h, w]
-
-``timesteps`` are the continuous indices produced by
-``DiscreteSchedule.sigma_to_t``; they are embedded with a sinusoidal embedding.
+Names mirror the on-disk ``model.diffusion_model.*`` keys, so a strict load is
+the correctness check. ``forward(x, timesteps, context)``, where ``timesteps``
+come from ``DiscreteSchedule.sigma_to_t``.
 """
 
 from __future__ import annotations
@@ -245,22 +236,11 @@ class Upsample(nn.Module):
 class DeepCache:
     """DeepCache (Ma et al., 2024, arXiv:2312.00858) for the SD/SDXL UNet.
 
-    A U-Net's deep, low-resolution features change slowly between adjacent
-    denoising steps, while the shallow high-resolution blocks carry the fast-
-    changing fine detail. On a *cached* step we reuse the cached deep feature
-    (the up-path activation at the outermost split) and recompute only the
-    shallow level-0 blocks — a much cheaper step. Every ``interval``-th model
-    evaluation runs the full UNet and refreshes the cache; ``interval == 1``
-    disables caching (every step full).
-
-    One instance per generation. It counts *model evaluations*, so a CFG step
-    that batches cond+uncond into one forward counts as one. The first call (no
-    cached feature yet) always computes.
-
-    Unlike Anima's :class:`~diffucore.models.anima_dit.TeaCache`, the schedule
-    here is a fixed interval rather than an adaptive rel-L1 threshold: the UNet
-    has no single residual stream to probe, so DeepCache exploits the encoder/
-    decoder skip structure instead.
+    Deep, low-resolution features change slowly between steps, so a cached step
+    reuses the deep up-path feature and recomputes only the shallow level-0
+    blocks. Every ``interval``-th model evaluation (a batched CFG step counts
+    once) runs the full UNet; ``interval == 1`` disables it. One instance per
+    generation; the first call always computes.
     """
 
     def __init__(self, interval: int):
@@ -304,9 +284,8 @@ class UNetModel(nn.Module):
                 )
             )
 
-        # Per-level attention depth (0 = no attention). A scalar transformer_depth
-        # is the SD1.5 convention: attention at levels whose downsample factor is
-        # in attention_resolutions. A per-level sequence is the SDXL convention.
+        # Per-level attention depth (0 = none): a scalar transformer_depth applies
+        # at attention_resolutions (SD1.5); a per-level sequence is SDXL's form.
         depths = self._depths_per_level(cfg)
         middle_depth = cfg.transformer_depth[-1] if _is_seq(cfg.transformer_depth) else cfg.transformer_depth
 
@@ -372,10 +351,9 @@ class UNetModel(nn.Module):
         return depths
 
     def _deepcache_split(self) -> int:
-        """Index of the first *shallow* output block — the splice point. Blocks
-        before it (the deep up-path) are cached; from it on (the level-0 output
-        blocks, which consume the freshly recomputed level-0 skips) are always
-        recomputed. Mirror of the level-0 input blocks ``input_blocks[:nrb+1]``."""
+        """Index of the first shallow output block, the splice point: blocks
+        before it are cached, blocks from it on are recomputed. Mirrors the
+        level-0 input blocks ``input_blocks[:nrb+1]``."""
         return len(self.input_blocks) - 1 - self.config.num_res_blocks
 
     def forward(
@@ -391,8 +369,7 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y.to(x.dtype))
 
         # DeepCache: on a cached step, recompute only the shallow level-0 blocks
-        # and splice in the cached deep feature; skip the encoder downsamples,
-        # the middle block, and the deep output blocks entirely.
+        # and splice in the cached deep feature.
         cache = getattr(self, "_deepcache", None)
         if cache is not None and not cache.should_compute():
             split = self._deepcache_split()

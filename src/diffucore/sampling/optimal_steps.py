@@ -1,21 +1,10 @@
-"""Optimal-stepsize sampling schedules (OSS / GITS).
+"""Optimal-stepsize sampling schedules (OSS; Pu et al., arXiv:2503.21774, related
+to GITS).
 
-Unlike the closed-form schedules in :mod:`diffucore.sampling.schedules`, which
-are pure functions of ``(steps, shift)`` and therefore blind to the model, this
-module *derives* a schedule from the model's own sampling trajectory.
-
-The method (Pu et al., "Optimal Stepsize for Diffusion Sampling",
-arXiv:2503.21774; closely related to Chen et al.'s GITS) runs one fine
-"teacher" trajectory over a dense grid of candidate noise levels, measures the
-single-step (Euler) truncation error of jumping between every pair of candidate
-levels, and solves a dynamic program for the ``N``-step sub-grid that minimizes
-total error. Reformulating stepsize selection as recursive error minimization
-gives an optimal-substructure DP, so the chosen schedule is globally optimal
-for the measured local-error matrix.
-
-This is offline calibration: you run :func:`calibrate_oss_schedule` once per
-(model, resolution) on a GPU, cache the resulting sigmas, then sample with them.
-The DP itself (:func:`optimal_step_schedule`) is model-free and CPU-cheap.
+One dense "teacher" trajectory measures the single-step Euler error between
+every pair of candidate noise levels, and a dynamic program picks the ``N``-step
+sub-grid with the least total error. Calibration (:func:`calibrate_oss_schedule`)
+runs once per (model, resolution) on a GPU; the DP itself is cheap.
 """
 
 from __future__ import annotations
@@ -32,15 +21,10 @@ __all__ = ["optimal_step_schedule", "calibrate_oss_schedule"]
 def optimal_step_schedule(cost: torch.Tensor, num_steps: int) -> list[int]:
     """Dynamic-programming optimal sub-schedule over a descending candidate grid.
 
-    ``cost`` is a ``K×K`` matrix of *local* single-step errors: ``cost[i][j]``
-    (for ``i < j``) is the error of taking one solver step directly from
-    candidate level ``i`` to candidate level ``j``. Returns the ``num_steps + 1``
-    candidate indices (ascending, always starting at ``0`` — highest noise — and
-    ending at ``K - 1`` — lowest noise) whose ``num_steps`` consecutive steps
-    minimize the summed local error.
-
-    The optimal-substructure recurrence is
-    ``dp[n][j] = min_{i<j} dp[n-1][i] + cost[i][j]`` with ``dp[0][0] = 0``.
+    ``cost[i][j]`` (``i < j``) is the error of one step from candidate ``i`` to
+    ``j``. Returns ``num_steps + 1`` ascending candidate indices from ``0``
+    (highest noise) to ``K - 1`` minimizing the summed error, via
+    ``dp[n][j] = min_{i<j} dp[n-1][i] + cost[i][j]``.
     """
     if cost.dim() != 2 or cost.shape[0] != cost.shape[1]:
         raise ValueError("cost must be a square K×K matrix")
@@ -89,24 +73,12 @@ def calibrate_oss_schedule(
 ) -> torch.Tensor:
     """Distill an error-optimal σ schedule from a fine reference trajectory.
 
-    ``denoise(x, sigma)`` returns the x0 estimate (the sampler-registry
-    convention: ``sigma`` is a length-B tensor). ``candidate_sigmas`` is a dense
-    *descending* grid of length ``K`` (no trailing zero). The function:
-
-      1. Euler-integrates ``denoise`` across the full grid to get teacher states
-         ``x*[k]`` at every candidate level.
-      2. Fills ``cost[i][j]`` = error of one Euler step from teacher state
-         ``x*[i]`` to level ``j``, measured against ``x*[j]``.
-      3. Runs :func:`optimal_step_schedule` for ``num_steps`` sampling steps.
-
-    Because a rectified-flow trajectory is near-straight, a single big Euler step
-    is accurate where the trajectory is straight and costly where it bends, so
-    the DP spends steps exactly where the model actually curves.
-
-    Returns ``num_steps + 1`` σ (descending, trailing ``0`` appended) — i.e.
-    ``num_steps`` sampling steps, matching the other schedule functions.
-    ``progress_callback(done, total)`` (if given) fires once per teacher step,
-    which is the bulk of the work (the DP afterwards is cheap).
+    ``denoise(x, sigma)`` returns the x0 estimate; ``candidate_sigmas`` is a
+    dense descending grid (no trailing zero). Euler-integrates the whole grid
+    for teacher states, fills ``cost[i][j]`` with the error of one Euler step
+    from ``x*[i]`` to level ``j``, and runs :func:`optimal_step_schedule`. Steps
+    land where the trajectory bends. Returns ``num_steps + 1`` descending σ with
+    a trailing 0; ``progress_callback(done, total)`` fires per teacher step.
     """
     if num_steps < 2:
         raise ValueError("num_steps must be >= 2")

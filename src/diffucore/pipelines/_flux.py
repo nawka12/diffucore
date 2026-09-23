@@ -1,22 +1,12 @@
-"""FLUX text-to-image + img2img / inpaint pipeline (FLUX.1 + FLUX.2).
+"""FLUX.1 / FLUX.2 text-to-image and img2img / inpaint pipelines.
 
-A self-contained driver, in the spirit of ``_anima.py``, that bridges the
-FLUX-specific bits without threading them through the SD ``_Pipeline``:
-
-  prompt  -> FLUX.1: CLIP-L (pooled vector) + T5-XXL (sequence context)
-             FLUX.2: a decoder LM (Klein/Qwen3 or Dev/Mistral); the context is the
-                     concatenation of three intermediate layers (no pooled vector)
-          -> patchify the latent into tokens; build axial position ids
-             (FLUX.1: 3 axes, 2×2 patch, 8× VAE; FLUX.2: 4 axes with text tokens
-              positioned on axis 3, patch_size 1, 128-ch 16× VAE)
-          -> Flux.forward(img, img_ids, txt, txt_ids, t, y, guidance)
-             (guidance-distilled: a single forward per step, no CFG pass)
-          -> resolution/family-shifted rectified-flow schedule + Euler / registry
-          -> unpatchify -> AutoencoderKL.decode (FLUX.1 unscale+shift; FLUX.2 none)
-
-``flux_img2img`` reuses this path but starts the ODE from a strength-noised init
-latent (``x_σ = (1-σ)·z0 + σ·ε``); with a mask it pins the keep region to the
-init each step and composites the original pixels back (soft latent-mask inpaint).
+FLUX.1 conditions on CLIP-L (pooled) + T5-XXL (context); FLUX.2 on three
+concatenated intermediate layers of one decoder LM (Klein/Qwen3 or
+Dev/Mistral). The latent is patchified into tokens with axial position ids
+(FLUX.1: 3 axes, 2×2 patch, 8× VAE; FLUX.2: 4 axes, patch 1, 128-ch 16× VAE).
+Guidance is distilled, so each step is a single forward with no CFG pass.
+``flux_img2img`` starts from a strength-noised init and, with a mask, pins the
+keep region each step (soft latent-mask inpaint).
 """
 
 from __future__ import annotations
@@ -50,14 +40,13 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
     "cogent", "cogent3", "sa_solver", "sa_solver_pece",
 }
-# "ddim_uniform" omitted on flow: it starts below σ_max, clashing with the
-# pure-noise init. See schedules._FLOW_TABLE_SCHEDULERS.
+# "ddim_uniform" is omitted: it starts below σ_max, but the init is pure noise.
 _FLUX_SCHEDULERS = (
     "flux", "flow", "sgm_uniform", "simple",
     "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
 )
 
-# FLUX.2 uses ModelSamplingFlux with shift=2.02 (the value is the log-shift `mu`).
+# FLUX.2 uses ModelSamplingFlux with shift=2.02 (the log-shift `mu`).
 _FLUX2_SHIFT = math.exp(2.02)
 
 if TYPE_CHECKING:
@@ -65,17 +54,17 @@ if TYPE_CHECKING:
 
 
 def _geom(arch: str) -> dict:
-    """Per-family latent geometry: VAE downscale, DiT patch size, RoPE axis count,
-    and which txt-id axis carries text-token positions (None = all-zero txt ids)."""
+    """Per-family latent geometry: VAE downscale, DiT patch, RoPE axis count, and
+    which txt-id axis carries text positions (None = all-zero txt ids)."""
     if arch == "flux2":
         return dict(downscale=16, patch=1, n_axes=4, txt_axis=3)
     return dict(downscale=8, patch=2, n_axes=3, txt_axis=None)
 
 
 def _flux_shift(seq_len: int, base_shift: float = 0.5, max_shift: float = 1.15) -> float:
-    """FLUX.1 resolution-dependent schedule shift. ``mu`` interpolates linearly in
-    image-token count between (256 -> 0.5) and (4096 -> 1.15); the schedule shift
-    is ``exp(mu)`` (BFL ``get_schedule`` / ComfyUI ``flux_time_shift``)."""
+    """FLUX.1 resolution-dependent shift: ``mu`` linear in image-token count
+    between (256 → 0.5) and (4096 → 1.15), shift ``exp(mu)`` (BFL
+    ``get_schedule``)."""
     x1, x2 = 256, 4096
     m = (max_shift - base_shift) / (x2 - x1)
     mu = m * seq_len + base_shift - m * x1
@@ -92,22 +81,16 @@ def _unpatchify(x: torch.Tensor, h: int, w: int, patch: int) -> torch.Tensor:
 
 
 def _flux2_unpatchify_latents(x: torch.Tensor) -> torch.Tensor:
-    """Invert FLUX.2's 2×2 latent pixel-shuffle: [B, 4C, H, W] -> [B, C, 2H, 2W].
-
-    FLUX.2 runs the DiT in a 128-ch latent space that is the VAE's 32-ch latent
-    pixel-shuffled by 2 (config ``patch_size=[2,2]``). Matches the reference BFL
-    ``Flux2`` pipeline ``_unpatchify_latents`` exactly (reshape→permute→reshape)."""
+    """Invert FLUX.2's 2×2 latent pixel-shuffle: [B, 4C, H, W] -> [B, C, 2H, 2W]
+    (BFL ``Flux2`` ``_unpatchify_latents``)."""
     b, c, h, w = x.shape
     x = x.reshape(b, c // 4, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3)
     return x.reshape(b, c // 4, h * 2, w * 2)
 
 
 def _flux2_patchify_latents(x: torch.Tensor) -> torch.Tensor:
-    """Invert :func:`_flux2_unpatchify_latents`: [B, C, 2H, 2W] -> [B, 4C, H, W].
-
-    The encode-side 2×2 latent pixel-shuffle for FLUX.2 img2img — folds the VAE's
-    32-ch latent into the DiT's 128-ch working space (the reference BFL ``Flux2``
-    pipeline ``_patchify_latents``)."""
+    """[B, C, 2H, 2W] -> [B, 4C, H, W], the inverse of
+    :func:`_flux2_unpatchify_latents` (BFL ``_patchify_latents``)."""
     b, c, H, W = x.shape
     x = x.reshape(b, c, H // 2, 2, W // 2, 2).permute(0, 1, 3, 5, 2, 4)
     return x.reshape(b, c * 4, H // 2, W // 2)
@@ -136,8 +119,7 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
 
 
 def _encode_text(model: "ModelBundle", prompt: str, device, dtype):
-    """Return ``(context, pooled)`` for one prompt. FLUX.1: T5 context + CLIP pooled
-    vector. FLUX.2: concatenation of three intermediate LM layers, no pooled vector."""
+    """``(context, pooled)`` for one prompt; FLUX.2 has no pooled vector."""
     tok = model.tokenizer
     if model.spec.architecture == "flux1":
         t = tok(prompt)
@@ -168,18 +150,17 @@ def flux_text_to_image(
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
 ) -> Image.Image:
-    """Drive FLUX (FLUX.1 or FLUX.2) text-to-image end-to-end.
+    """Drive FLUX text-to-image end-to-end.
 
-    ``guidance`` is FLUX's distilled guidance scale (ignored when the model carries
-    no guidance embedding). ``scheduler``: ``"flux"`` (the family-shifted
-    rectified-flow default), ``"flow"`` (constant ``shift``), or
-    ``"sgm_uniform"``/``"simple"`` against a flow sigma table.
+    ``guidance`` is the distilled guidance scale (ignored without a guidance
+    embedding). ``scheduler`` is ``"flux"`` (family-shifted default),
+    ``"flow"`` (constant ``shift``) or a flow table scheduler.
     """
     if sampler not in _FLUX_SAMPLERS:
         raise ValueError(f"FLUX sampler must be one of {sorted(_FLUX_SAMPLERS)}; got {sampler!r}")
     if scheduler not in _FLUX_SCHEDULERS:
         raise ValueError(f"FLUX scheduler must be one of {_FLUX_SCHEDULERS}; got {scheduler!r}")
-    del negative_prompt  # guidance-distilled: single forward, no CFG pass
+    del negative_prompt  # guidance-distilled: no CFG pass
     arch = model.spec.architecture
     geom = _geom(arch)
     policy = model.policy
@@ -189,11 +170,8 @@ def flux_text_to_image(
         raise ValueError(f"width/height must be divisible by {geom['downscale']}; got {width}x{height}")
 
     with perf_context(policy):
-        # ---- 1+2. tokenize + encode (text encoders staged on device when offloading).
-        # Conditioning cache: keyed on the prompt (FLUX is guidance-distilled, no
-        # negative), a repeat skips the encode and — the big win — the T5-XXL /
-        # Mistral PCIe staging. The check sits before staged() so a hit never brings
-        # the encoder onto the GPU.
+        # 1+2. tokenize + encode. The cache is keyed on the prompt alone and
+        # checked before staged(), so a hit skips the T5-XXL / Mistral staging.
         cache = model.cond_cache
         cached_ctx = cache.get((prompt,)) if cache is not None else None
         if cached_ctx is None:
@@ -215,8 +193,8 @@ def flux_text_to_image(
         img_ids = _img_ids(h_lat, w_lat, patch, geom["n_axes"], device)
         txt_ids = _txt_ids(context.shape[1], geom["n_axes"], geom["txt_axis"], device)
 
-        # ---- 3. σ schedule. FLUX.2 uses a fixed shift; FLUX.1-dev shifts by
-        # resolution; FLUX.1-schnell (no guidance embed) is unshifted.
+        # 3. σ schedule: FLUX.2 fixed shift, FLUX.1-dev shifted by resolution,
+        # FLUX.1-schnell (no guidance embed) unshifted.
         if arch == "flux2":
             eff_shift = _FLUX2_SHIFT
         elif model.spec.guidance_distilled:
@@ -244,10 +222,8 @@ def flux_text_to_image(
             t = torch.full((1,), float(sigma_scalar), device=device, dtype=dtype)
             return model.backbone(x_tokens, img_ids, context, txt_ids, t, pooled, guidance_vec)
 
-        # ---- 4. integrate the rectified-flow ODE/SDE (CONST: denoised = x − σ·v)
-        # ``preview_callback`` is accepted for a uniform pipeline API but not wired
-        # here: FLUX's latent is patchified token-space [B, L, C], so a live preview
-        # would need _unpatchify first (left out until FLUX gets GPU-verified).
+        # 4. integrate (CONST: denoised = x − σ·v). preview_callback isn't wired:
+        # the latent is token-space and would need unpatchifying first.
         backbone = model.backbone
         with torch.no_grad(), staged([backbone], device, policy.offload_unet):
             if sampler == "euler":
@@ -260,7 +236,7 @@ def flux_text_to_image(
                         on_step(i, sigma, x, None)
             else:
                 def denoise(x_in, sigma_b):
-                    # The loop runs on 3D token tensors [B, L, C]; broadcast σ over (L, C).
+                    # Broadcast σ over the token tensor's (L, C).
                     v = velocity(x_in.to(dtype), sigma_b.flatten()[0])
                     sig = sigma_b.float().view(-1, 1, 1)
                     return x_in.float() - sig * v.float()
@@ -277,9 +253,8 @@ def flux_text_to_image(
 
         x = _unpatchify(x.to(dtype), h_lat, w_lat, patch)
 
-        # ---- 5. decode (AutoencoderKL.decode folds in the FLUX.1 unscale+shift).
-        # FLUX.2 first bridges the 128-ch DiT latent back to the VAE's 32-ch latent:
-        # denormalise the latent batch-norm, then invert the 2×2 pixel-shuffle.
+        # 5. decode. FLUX.2 first undoes the latent batch norm and the 2×2
+        # pixel-shuffle back to the VAE's 32-ch latent.
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             if arch == "flux2":
                 if getattr(model.vae, "flux2_latent_mean", None) is not None:
@@ -315,19 +290,12 @@ def flux_img2img(
     return_info: bool = False,
 ) -> Image.Image:
     """FLUX image-to-image, or inpaint when ``mask_image`` is given (white =
-    repaint, black = keep).
+    repaint).
 
-    Mirrors :func:`flux_text_to_image` but starts the rectified-flow ODE from the
-    strength-noised init latent ``x_σ = (1-σ)·z0 + σ·ε`` instead of pure noise
-    (the same construction as :func:`._anima.anima_img2img`). FLUX is
-    guidance-distilled, so there is no CFG/uncond pass — ``negative_prompt`` is
-    ignored. For inpaint the keep region (mask 0) is pinned to the init latent
-    ``z0`` at the x0 estimate each step, and the original pixels are composited
-    back after decode so untouched areas stay exact.
-
-    Sampler/scheduler are coerced to FLUX-valid defaults (``euler`` / ``flux``)
-    when an SD-style value arrives, so the shared img2img/inpaint pipelines just
-    work on FLUX.
+    Starts from ``x_σ = (1-σ)·z0 + σ·ε`` like :func:`._anima.anima_img2img`;
+    ``negative_prompt`` is ignored. For inpaint the keep region is pinned to
+    ``z0`` at the x0 estimate each step and the original pixels are composited
+    back. SD-style sampler/scheduler names fall back to ``euler`` / ``flux``.
     """
     if sampler not in _FLUX_SAMPLERS:
         sampler = "euler"
@@ -335,7 +303,7 @@ def flux_img2img(
         scheduler = "flux"
     if not 0.0 < strength <= 1.0:
         raise ValueError(f"strength must be in (0, 1], got {strength}")
-    del negative_prompt  # guidance-distilled: single forward, no CFG pass
+    del negative_prompt  # guidance-distilled: no CFG pass
     arch = model.spec.architecture
     geom = _geom(arch)
     policy = model.policy
@@ -345,10 +313,7 @@ def flux_img2img(
         raise ValueError(f"width/height must be divisible by {geom['downscale']}; got {width}x{height}")
 
     with perf_context(policy):
-        # ---- 1. tokenize + encode (text encoders staged on device when offloading).
-        # Conditioning cache keyed on the prompt (shares t2i's entries). See
-        # flux_text_to_image; the check sits before staged() so a hit skips the
-        # T5-XXL / Mistral staging.
+        # 1. tokenize + encode (shares t2i's cache entries).
         cache = model.cond_cache
         cached_ctx = cache.get((prompt,)) if cache is not None else None
         if cached_ctx is None:
@@ -370,10 +335,8 @@ def flux_img2img(
         img_ids = _img_ids(h_lat, w_lat, patch, geom["n_axes"], device)
         txt_ids = _txt_ids(context.shape[1], geom["n_axes"], geom["txt_axis"], device)
 
-        # ---- 2. σ schedule. img2img/inpaint follow ComfyUI's KSampler denoise
-        # convention (mirrors _anima): build the schedule at int(steps/strength)
-        # resolution and keep the last `steps + 1` σ, so a strength<1 run still
-        # takes `steps` from the strength-appropriate σ. Family shift as in t2i.
+        # 2. σ schedule, ComfyUI's denoise convention (as in _anima): build at
+        # int(steps/strength), keep the last steps + 1. Family shift as in t2i.
         if arch == "flux2":
             eff_shift = _FLUX2_SHIFT
         elif model.spec.guidance_distilled:
@@ -390,17 +353,15 @@ def flux_img2img(
             sigmas = flow_table_schedule(scheduler, eff_shift, sched_steps, device=device, dtype=torch.float32)
         sigmas = sigmas[-(steps + 1):]
 
-        # ---- 3. encode init → DiT-space latent z0; build the strength-noised start.
-        # FLUX.1: vae.encode already lands in the (scaled) sampling space. FLUX.2:
-        # fold the 32-ch VAE latent into the 128-ch DiT space, then normalise — the
-        # exact inverse of the t2i decode bridge.
+        # 3. encode init → DiT-space z0 and the strength-noised start. FLUX.2
+        # folds the 32-ch latent into 128-ch and normalises (the inverse of the
+        # decode bridge).
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             vae_lat = model.vae.encode(pixels)
             if vae_lat.dtype == torch.float16 and not torch.isfinite(vae_lat).all():
-                # fp16 encode overflow poisons the whole run — retry fp32 (see
-                # vae_fallback_to_fp32; the decode below then also runs fp32).
+                # An fp16 encode overflow poisons the run; retry in fp32.
                 vae_fallback_to_fp32(model.vae, policy)
                 vae_lat = model.vae.encode(pixels.float())
         if arch == "flux2":
@@ -416,7 +377,7 @@ def flux_img2img(
         sigma0 = sigmas[0].to(dtype)
         noise = torch.randn(1, model.spec.latent_channels, h_lat, w_lat,
                             generator=gen, device=device, dtype=dtype)
-        x = _patchify((1.0 - sigma0) * z0 + sigma0 * noise, patch)  # flow forward: x_σ=(1-σ)z0+σε
+        x = _patchify((1.0 - sigma0) * z0 + sigma0 * noise, patch)  # x_σ = (1-σ)·z0 + σ·ε
 
         mask_lat = None
         if mask_image is not None:
@@ -433,9 +394,7 @@ def flux_img2img(
             t = torch.full((1,), float(sigma_scalar), device=device, dtype=dtype)
             return model.backbone(x_tokens, img_ids, context, txt_ids, t, pooled, guidance_vec)
 
-        # ---- 4. integrate the rectified-flow ODE through a CONST x0 closure (keep
-        # region pinned to z0 for inpaint). All samplers route through the registry
-        # x0 estimate — `preview_callback` stays unwired (token-space), as in t2i.
+        # 4. integrate through a CONST x0 closure (keep region pinned for inpaint).
         backbone = model.backbone
         with torch.no_grad(), staged([backbone], device, policy.offload_unet):
             def denoise(x_in, sigma_b):
@@ -460,7 +419,7 @@ def flux_img2img(
 
         x = _unpatchify(x.to(dtype), h_lat, w_lat, patch)
 
-        # ---- 5. decode (same bridge as flux_text_to_image)
+        # 5. decode (same bridge as t2i)
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             if arch == "flux2":
                 if getattr(model.vae, "flux2_latent_mean", None) is not None:
@@ -472,7 +431,7 @@ def flux_img2img(
             image, decode_mode = vae_decode_safe(model.vae, latent, policy)
         image = _to_pil(image)
 
-        # inpaint: paste the original pixels back into the keep region (byte-exact)
+        # inpaint: paste the original pixels back into the keep region
         if mask_image is not None:
             keep = np.asarray(mask_image.convert("L").resize((width, height), Image.NEAREST)) < 128
             original = np.asarray(init_image.convert("RGB").resize((width, height), Image.LANCZOS))

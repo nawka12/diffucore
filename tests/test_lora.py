@@ -1,7 +1,7 @@
 """LoRA fusing (kohya format) verified against tiny real-structure models.
 
 Full SD/SDXL backbones are too heavy for the CPU suite, so these build the same
-module structure at small dimensions — the kohya key names depend on structure,
+module structure at small dimensions: the kohya key names depend on structure,
 not size, so the name-mangling is exercised for real.
 """
 

@@ -1,4 +1,4 @@
-"""AutoencoderKL — the SD1.5 VAE (pixels <-> 4-channel latents).
+"""AutoencoderKL, the SD VAE (pixels <-> latents).
 
 Implements the original LDM/CompVis autoencoder (Rombach et al., 2022, building
 on Esser et al., 2021). Submodule and parameter names mirror the on-disk

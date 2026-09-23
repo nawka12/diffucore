@@ -1,4 +1,4 @@
-"""LoRA removal / swapping — verifying the snapshot-and-refuse unload path.
+"""LoRA removal / swapping: the snapshot-and-refuse unload path.
 
 Builds on the same tiny real-structure models as ``test_lora.py``: ``apply_lora``
 fuses deltas in place, and ``remove_lora`` / ``clear_loras`` undo a fuse by
@@ -96,8 +96,8 @@ def test_clear_loras_restores_original_exactly(tmp_path):
 
 
 def test_clear_loras_is_byte_identical_in_fp16(tmp_path):
-    """Snapshot/restore is a plain copy, so unload is exact even in fp16 — no
-    add/subtract drift (the reason we snapshot rather than recompute-and-subtract)."""
+    """Snapshot/restore is a plain copy, so unload is exact even in fp16, with
+    no add/subtract drift."""
     bundle = _bundle(_tiny_unet().half(), _tiny_clip().half())
     target = _clip_q(bundle)
     orig = target.weight.detach().clone()

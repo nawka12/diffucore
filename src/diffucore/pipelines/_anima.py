@@ -1,22 +1,13 @@
-"""Anima end-to-end text-to-image pipeline (DT7).
+"""Anima text-to-image, img2img/inpaint and calibration pipelines.
 
-A focused, self-contained driver that bridges the Anima-specific bits without
-threading flow-matching state through the SD/SDXL ``_Pipeline`` scaffolding:
+prompt → AnimaTokenizer (Qwen2 + T5) → Qwen3 hidden states → LLM-Adapter (once
+per generation) → AnimaDiT each step on a flow-matching σ schedule →
+QwenImageVAE decode.
 
-  prompt  -> AnimaTokenizer (Qwen2 + T5)
-          -> Qwen3 (source hidden states)
-          -> AnimaDiT.preprocess_text_embeds (LLM-Adapter, once per generation)
-          -> AnimaDiT.forward(..., context=prepared_ctx) each step
-          -> flow-matching σ schedule + CONST scaling + Euler integration
-          -> QwenImageVAE.process_out then VAE.decode
-
-Compared to ``_Pipeline._sample``, CFG runs as two sequential batch-1
-forwards per step (cond, then uncond) instead of one stacked batch-2 pass —
-deliberately: a batch-2 forward measures no faster on a compute-bound GPU
-(RTX 2060: 2149 ms vs 2×1066 ms), while sequential halves peak activation
-memory and lets the guidance-interval and per-branch TeaCache skips drop
-the uncond forward entirely. We manage the 4D↔5D shape ourselves at the
-DiT boundary rather than wrapping the backbone in an adapter.
+CFG runs as two sequential batch-1 forwards per step rather than one batch-2
+pass: batch-2 is no faster on a compute-bound GPU (2149 ms vs 2×1066 ms on an
+RTX 2060), sequential halves peak activations, and the guidance interval and
+per-branch TeaCache can then skip the uncond forward entirely.
 """
 
 from __future__ import annotations
@@ -40,8 +31,8 @@ from ..sampling import (
     guidance_interval_bounds,
 )
 
-# Samplers Anima can drive (all routed through a CONST x0 denoiser closure).
-# The stochastic, flow-aware ones additionally take ``model_type``/``shift``.
+# Samplers Anima can drive through a CONST x0 denoiser closure; the stochastic,
+# flow-aware ones also take ``model_type``/``shift``.
 _ANIMA_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "euler_ancestral_anneal", "er_sde",
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
@@ -61,8 +52,8 @@ _FLOW_AWARE_SAMPLERS = {
     "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
     "sa_solver", "sa_solver_pece",
 }
-# "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
-# with the pure-noise (σ_max == 1) init used here. See schedules._FLOW_TABLE_SCHEDULERS.
+# "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
+# noise at σ_max == 1.
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
     "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
@@ -74,17 +65,14 @@ if TYPE_CHECKING:
 
 
 def _qwen_encode(qwen3, ids, mask, device, dtype):
-    """Run the Qwen text encoder and return its last hidden state in ``dtype``.
-
-    Wrapped in ``no_grad`` because encoding is pure inference: without it the
-    Qwen3.5 hybrid encoder's unrolled O(L) SSM scan retains every per-timestep
-    state for a backward that never comes — enough to OOM by itself — and even
-    the plain Qwen3 transformer needlessly holds its activation graph."""
+    """Run the Qwen text encoder and return its last hidden state in ``dtype``,
+    under ``no_grad``: the Qwen3.5 encoder's unrolled SSM scan would otherwise
+    retain enough per-step state to OOM by itself."""
     ids = ids.to(device)
     if mask is not None:
         mask = mask.to(device)
     with torch.no_grad():
-        out = qwen3(ids, attention_mask=None)   # causal-only fast path; mask handled by padding below
+        out = qwen3(ids, attention_mask=None)   # causal-only; padding handles the mask
     return out.to(dtype)
 
 
@@ -93,34 +81,23 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(img[0].permute(1, 2, 0).cpu().numpy())
 
 
-# EasyCache warm-up: calls of a stream that always compute before the rule may
-# skip. The paper uses R = 5-10 of 50 steps; 3 is ~10 % of a 28-32 step run.
+# EasyCache warm-up calls that always compute (the paper uses 5-10 of 50 steps;
+# 3 is ~10% of a 28-32 step run).
 _EASY_WARMUP = 3
 
 
 def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float,
                    forecast: str = "hermite", rule: str = "drift",
                    uncond_scale: float = 1.0):
-    """Build the per-CFG-branch TeaCache streams (or ``(None, None)`` when off).
-    The uncond stream is omitted when CFG is disabled (single forward per step).
+    """Build the per-CFG-branch TeaCache streams, or ``(None, None)`` when off;
+    no uncond stream without CFG.
 
-    ``forecast`` picks how skipped steps extrapolate the cached residual:
-    ``"hermite"`` (HiCache, arXiv:2508.16984 — order-2 scaled-Hermite with the
-    paper's σ=0.5) or ``"taylor"`` (TaylorSeer — order-1 linear).
-
-    ``rule`` picks *when* to skip: ``"drift"`` (TeaCache's input-drift
-    accumulator, optionally calibrated through ``coeffs``) or ``"easy"``
-    (EasyCache, arXiv:2507.02860 — accumulated predicted *output* change, with
-    ``thresh`` read as its τ). ``coeffs`` are meaningless under ``"easy"`` and
-    are dropped here, so the engine can keep passing them unconditionally.
-
-    ``uncond_scale`` > 1 loosens the *uncond* stream's threshold. Note the
-    uncond pass is not the less important one: with
-    ``v = v_uncond + s·(v_cond − v_uncond)`` at s = 4.5 an error in
-    ``v_uncond`` enters the guided velocity with weight |1 − s| = 3.5 against
-    the cond branch's 4.5. It is only empirically *smoother*, so it already
-    skips more at an equal threshold — hence this is a knob to measure, not a
-    free win. Applies under both rules."""
+    ``forecast`` is ``"hermite"`` (HiCache, order 2, σ=0.5) or ``"taylor"``
+    (order 1). ``rule`` is ``"drift"`` (optionally calibrated by ``coeffs``) or
+    ``"easy"`` (EasyCache; ``thresh`` is its τ and ``coeffs`` are dropped).
+    ``uncond_scale`` > 1 loosens the uncond stream's threshold. That is a knob
+    to measure, not a free win: at CFG s an uncond error enters the guided
+    velocity with weight |1 − s| (3.5 at s = 4.5). Applies under both rules."""
     if thresh <= 0:
         return None, None
     if rule not in ("drift", "easy"):
@@ -138,9 +115,8 @@ def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: f
 
 
 def _note_follow_miss(tc_cond, tc_uncond) -> None:
-    """Count a step where the cond stream skipped but the uncond one computed —
-    the forwards a leader/follower link between the streams could save.
-    Instrumentation only; call right after each uncond forward."""
+    """Count a step where the cond stream skipped but the uncond one computed
+    (instrumentation; call after each uncond forward)."""
     if tc_cond is not None and tc_uncond is not None \
             and not tc_cond.last_computed and tc_uncond.last_computed:
         tc_uncond.follow_misses += 1
@@ -192,32 +168,17 @@ def anima_text_to_image(
 ) -> Image.Image:
     """Drive Anima's text-to-image path end-to-end.
 
-    ``shift`` controls the SD3-style rectified-flow schedule (Anima's training
-    default is 3.0). ``cfg_scale`` is the CFG strength; the Anima ComfyUI
-    workflow defaults to ~4.0. ``cfg_interval_start``/``cfg_interval_end``
-    restrict CFG to that fraction of the run (Kynkäänniemi et al., 2024) — the
-    uncond forward is skipped outside the band, saving a full backbone pass per
-    skipped step; the ``(0, 1)`` default guides every step.
+    ``shift`` sets the rectified-flow schedule (Anima trains at 3.0).
+    ``cfg_interval_start``/``cfg_interval_end`` restrict CFG to that fraction of
+    the run (Kynkäänniemi et al., 2024), skipping the uncond forward outside it.
+    ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` is the exact
+    closed-form flow step). ``scheduler`` is ``"flow"``, ``"flow_dyn"``
+    (resolution-aware shift, ignoring ``shift``), ``"oss"`` (needs
+    ``oss_sigmas``) or any flow table scheduler.
 
-    ``sampler`` is any of :data:`_ANIMA_SAMPLERS` (``"euler"`` keeps the exact
-    closed-form rectified-flow step; the rest run through the shared sampler
-    registry against a CONST x0 denoiser). ``scheduler`` picks the σ schedule:
-    ``"flow"`` (the rectified-flow t-uniform default), ``"flow_dyn"`` (``flow``
-    with a Flux-style resolution-aware shift derived from the image's token
-    count, ignoring the passed-in ``shift``), ``"oss"`` (a pre-calibrated
-    optimal-stepsize schedule supplied via ``oss_sigmas``), ``"sgm_uniform"`` or
-    ``"simple"`` (ComfyUI's, evaluated against a flow sigma table).
-
-    ``teacache_thresh`` > 0 enables TeaCache (arXiv:2411.19108): steps whose
-    accumulated rescaled relative-L1 drift stays under the threshold reuse the
-    cached transformer-block residual instead of recomputing it. Larger = more
-    skipping = faster but lower fidelity; 0 disables. Uncalibrated on Anima
-    (identity rescale), so tune the threshold empirically.
-    ``teacache_forecast`` picks the skip-step extrapolation basis and
-    ``teacache_rule`` the skip *decision* rule (``"drift"`` or EasyCache's
-    ``"easy"``, which reads ``teacache_thresh`` as its τ and ignores the
-    coefficients). ``teacache_uncond_scale`` > 1 loosens the uncond stream's
-    threshold relative to the cond one — see :func:`_make_teacache`.
+    ``teacache_thresh`` > 0 enables TeaCache (arXiv:2411.19108); see
+    :func:`_make_teacache` for ``teacache_forecast``, ``teacache_rule`` and
+    ``teacache_uncond_scale``.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -231,32 +192,29 @@ def anima_text_to_image(
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
 
     with perf_context(policy):
-        # Conditioning cache: the post-adapter context depends only on the prompt
-        # pair, so a repeat (seed hunting, X/Y/Z sweeps) skips tokenize + encode +
-        # the LLM-Adapter — and, under offload, the Qwen encoder's PCIe round-trip.
-        # The check sits before staged() so a hit never brings the encoder onto the
-        # GPU. The cached value (post-adapter cond/uncond ctx) is produced inside
-        # the backbone staged() block below, where the adapter runs today.
+        # The post-adapter context depends only on the prompt pair, so a repeat
+        # skips tokenize + encode + adapter (and the encoder's offload round
+        # trip). Checked before staged() so a hit never stages the encoder.
         cache = model.cond_cache
         cache_key = (prompt, negative_prompt)
         cached_ctx = cache.get(cache_key) if cache is not None else None
 
         if cached_ctx is None:
-            # ---- 1. tokenize cond + uncond
+            # 1. tokenize cond + uncond
             cond_tok = model.tokenizer(prompt)
             uncond_tok = model.tokenizer(negative_prompt)
 
-            # ---- 2. encode with Qwen3 (staged onto device when offloading)
+            # 2. encode with Qwen3 (staged onto device when offloading)
             with staged([model.text_encoder], device, policy.offload_idle):
                 qwen_dtype = next(model.text_encoder.parameters()).dtype
                 cond_hidden = _qwen_encode(model.text_encoder, cond_tok.qwen_ids, cond_tok.qwen_mask, device, dtype)
                 uncond_hidden = _qwen_encode(model.text_encoder, uncond_tok.qwen_ids, uncond_tok.qwen_mask, device, dtype)
-                del qwen_dtype  # silence unused warning if the Qwen3 dtype probe ever shifts
+                del qwen_dtype
 
             cond_t5 = cond_tok.t5_ids.to(device)
             uncond_t5 = uncond_tok.t5_ids.to(device)
 
-        # ---- 3. σ schedule, init noise
+        # 3. σ schedule, init noise
         sched_shift = shift
         if scheduler == "flow":
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
@@ -282,28 +240,22 @@ def anima_text_to_image(
         h_lat, w_lat = height // 8, width // 8
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = torch.randn(1, 16, h_lat, w_lat, generator=gen, device=device, dtype=dtype)
-        # With σ_max == 1 the initial state is exactly pure noise (no rescale).
+        # σ_max == 1, so the initial state is exactly pure noise.
 
-        # Guidance interval: CFG only while σ in (lo, hi]; the uncond forward is
-        # skipped outside the band (see guidance_interval_bounds). (0, 1) = always.
+        # CFG only while σ in (lo, hi]. (0, 1) = always.
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
 
-        # ---- 4. integrate the rectified-flow ODE/SDE
+        # 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
-        # TeaCache: one cache stream per CFG branch (cond/uncond are separate
-        # forwards whose modulated inputs coincide, so they can't share one).
-        # ``teacache_coefficients`` rescales the raw drift (identity if None).
+        # One TeaCache stream per CFG branch; their modulated inputs coincide.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
                                             teacache_uncond_scale)
-        # staged() OUTSIDE inference_mode: offloaded weights moved under inference
-        # mode become inference tensors that break later in-place LoRA (add_/copy_).
+        # staged() outside inference_mode: weights moved under inference mode
+        # become inference tensors that break later in-place LoRA.
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
-            # The LLM-Adapter output depends only on the prompt: run it once per
-            # generation and feed the DiT the prepared context (t5xxl_ids=None),
-            # instead of re-running the adapter inside every backbone forward
-            # (per step, per CFG branch). On a cache hit both contexts come straight
-            # off CPU (adapter skipped too); on a miss we compute and cache them.
+            # Run the LLM-Adapter once per generation (both contexts come off the
+            # cache on a hit) and feed the DiT the prepared context.
             if cached_ctx is None:
                 cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
                 uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
@@ -325,32 +277,31 @@ def anima_text_to_image(
                         if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
                             v = v_cond
                         else:
-                            # CUDA Graphs (reduce-overhead) returns a view of the
-                            # graph's static output buffer, which the uncond replay
-                            # below overwrites — clone the cond output first
-                            # (PyTorch's documented fix for sequential invocations).
+                            # CUDA Graphs returns a view of the static output
+                            # buffer, which the uncond replay overwrites: clone
+                            # the cond output first.
                             if policy.cuda_graphs:
                                 v_cond = v_cond.clone()
                             v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                             _note_follow_miss(tc_cond, tc_uncond)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
 
-                        # CONST flow: denoised = x − σ·v ; Euler step is x + (σ_next − σ)·v
-                        # (closed-form exact for any constant x0 estimate).
+                        # CONST flow: denoised = x − σ·v; the Euler step
+                        # x + (σ_next − σ)·v is exact for a constant x0.
                         denoised = x - sigma.to(dtype) * v
                         x = x + (sigma_next - sigma).to(dtype) * v
                         on_step(i, sigma, x, denoised)
-            else:  # registry samplers — need a CONST x0 estimate; integrate in fp32 like ComfyUI
+            else:  # registry samplers: CONST x0 estimate, fp32 solver math like ComfyUI
                 def denoise(x_in, sigma_b):
-                    """``model(x, σ) -> x0``: predict velocity (with CFG), return the
-                    CONST x0 estimate ``x − σ·v`` in fp32 for the solver math."""
+                    """``model(x, σ) -> x0``: CFG velocity, returned as the CONST
+                    x0 estimate ``x − σ·v`` in fp32."""
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
                     v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
                     if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                         v = v_cond
                     else:
-                        if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see euler path)
+                        if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                             v_cond = v_cond.clone()
                         v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                         _note_follow_miss(tc_cond, tc_uncond)
@@ -366,8 +317,7 @@ def anima_text_to_image(
                 if sampler in ("secant", "secant_anneal"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
-                # aether injects coherence-gated grain; it is stochastic but takes no
-                # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
+                # aether is stochastic but takes no model_type/shift.
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
@@ -375,18 +325,15 @@ def anima_text_to_image(
                     kwargs["eta_max"] = eta_max
                 if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
                     kwargs["gate_reduce"] = gate_reduce
-                # uni_pc_anneal intentionally omitted: even with its order-ramp the
-                # shared 1.0 panel default over-softens it (deterministic stays
-                # cleanest), so it ships a low baked-in eta_max (0.2).
+                # uni_pc_anneal keeps its baked-in eta_max (0.2); the shared 1.0
+                # panel default over-softens it.
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
 
-        # ---- 5. process_out then decode (tiled when explicitly requested, or
-        # auto-tiled when free VRAM can't host an untiled decode — Qwen-Image
-        # VAE decode is whole-tensor and OOMs on 12 GB above 1024² with the
-        # DiT resident, but at 1024² it fits and the smart check picks untiled).
+        # 5. process_out then decode, tiled when requested or when free VRAM
+        # can't host an untiled decode.
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z = model.vae.process_out(x.to(policy.vae_dtype))
             image, decode_mode = vae_decode_safe(model.vae, z, policy)
@@ -433,18 +380,12 @@ def anima_img2img(
     return_info: bool = False,
 ) -> Image.Image:
     """Anima image-to-image, or inpaint when ``mask_image`` is given (white =
-    repaint, black = keep).
+    repaint).
 
-    Mirrors :func:`anima_text_to_image` but starts the rectified-flow ODE from the
-    strength-noised init latent ``x_σ = (1-σ)·z0 + σ·ε`` instead of pure noise.
-    For inpaint the keep region (mask 0) is pinned to the init latent ``z0`` at the
-    x0-estimate each step — the same masking the SD ``MaskedDenoiser`` does, which
-    is scaling-agnostic, so it holds for the flow ``x0 = x − σ·v`` too — and the
-    original pixels are composited back after decode so untouched areas stay exact.
-
-    Sampler/scheduler are coerced to Anima-valid defaults (``euler`` / ``flow``)
-    when an SD-style value comes through, so the shared img2img/inpaint pipelines
-    and the detailer "just work" on Anima.
+    Starts from the strength-noised init ``x_σ = (1-σ)·z0 + σ·ε``. For inpaint
+    the keep region is pinned to ``z0`` at the x0 estimate each step (as SD's
+    ``MaskedDenoiser`` does) and the original pixels are composited back after
+    decode. SD-style sampler/scheduler names fall back to ``euler`` / ``flow``.
     """
     if sampler not in _ANIMA_SAMPLERS:
         sampler = "euler"
@@ -458,8 +399,7 @@ def anima_img2img(
     device, dtype = policy.device, policy.compute_dtype
 
     with perf_context(policy):
-        # ---- 1. tokenize + encode cond/uncond (same as t2i, and shares its cache —
-        # the post-adapter context is resolution-independent). See anima_text_to_image.
+        # 1. tokenize + encode (shares t2i's resolution-independent cache)
         cache = model.cond_cache
         cache_key = (prompt, negative_prompt)
         cached_ctx = cache.get(cache_key) if cache is not None else None
@@ -472,11 +412,9 @@ def anima_img2img(
             cond_t5 = cond_tok.t5_ids.to(device)
             uncond_t5 = uncond_tok.t5_ids.to(device)
 
-        # ---- 2. σ schedule. img2img/inpaint follow ComfyUI's KSampler denoise
-        # convention (Anima's reference): build the schedule at int(steps/strength)
-        # resolution and keep the last `steps + 1` σ (sliced in step 3), so a
-        # strength<1 run still takes the full `steps` from the strength-appropriate
-        # σ — unlike SD/SDXL's A1111 default (see _base.img2img_start).
+        # 2. σ schedule, ComfyUI's denoise convention (Anima's reference): build
+        # at int(steps/strength) and keep the last steps + 1, so strength < 1
+        # still runs all `steps` (unlike SD/SDXL's A1111 convention).
         sched_shift = shift
         sched_steps = int(steps / strength)
         if scheduler == "flow":
@@ -497,25 +435,23 @@ def anima_img2img(
                                          bm_beta2=bm_beta2,
                                          device=device, dtype=torch.float32)
 
-        # ---- 3. encode init → DiT-space latent z0; build strength-noised start
+        # 3. encode init → DiT-space latent z0; build the strength-noised start
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z_vae = model.vae.encode(pixels)
             if z_vae.dtype == torch.float16 and not torch.isfinite(z_vae).all():
-                # fp16 encode overflow poisons the whole run — retry fp32 (see
-                # vae_fallback_to_fp32; the decode below then also runs fp32).
+                # An fp16 encode overflow poisons the run; retry in fp32.
                 vae_fallback_to_fp32(model.vae, policy)
                 z_vae = model.vae.encode(pixels.float())
             z0 = model.vae.process_in(z_vae).to(dtype)
-        # Keep the tail: last `steps + 1` σ → run `steps` from σ(t≈strength), the
-        # ComfyUI denoise slice. OSS is a fixed calibrated trajectory, so it falls
-        # back to the A1111 start index instead.
+        # Keep the last steps + 1 σ. OSS is a fixed calibrated trajectory, so it
+        # uses the A1111 start index instead.
         sigmas = sigmas[img2img_start(steps, strength):] if scheduler == "oss" \
             else sigmas[-(steps + 1):]
         sigma0 = sigmas[0].to(dtype)
         noise = torch.randn(z0.shape, generator=gen, device=device, dtype=dtype)
-        x = (1.0 - sigma0) * z0 + sigma0 * noise            # flow forward: x_σ=(1-σ)z0+σε
+        x = (1.0 - sigma0) * z0 + sigma0 * noise            # x_σ = (1-σ)·z0 + σ·ε
 
         mask_lat = None
         if mask_image is not None:
@@ -523,21 +459,18 @@ def anima_img2img(
             mask_lat = torch.from_numpy(np.asarray(m, dtype=np.float32) / 255.0)[None, None].to(device)
         z0_f = z0.float()
 
-        # Guidance interval over the sliced schedule (the steps that actually
-        # run); the uncond forward is skipped outside (lo, hi]. (0, 1) = always.
+        # Guidance interval over the sliced schedule. (0, 1) = always.
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
 
-        # ---- 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
+        # 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
-        # TeaCache: one cache stream per CFG branch (see anima_text_to_image).
+        # One TeaCache stream per CFG branch.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
                                             teacache_uncond_scale)
-        # staged() OUTSIDE inference_mode: offloaded weights moved under inference
-        # mode become inference tensors that break later in-place LoRA (add_/copy_).
+        # staged() outside inference_mode (see t2i).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
-            # Adapter runs once per generation, not per forward (see t2i); the
-            # post-adapter context is cached across repeats (shared with t2i).
+            # Adapter once per generation, cached across repeats (shared with t2i).
             if cached_ctx is None:
                 cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
                 uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
@@ -555,7 +488,7 @@ def anima_img2img(
                 if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                     v = v_cond
                 else:
-                    if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
+                    if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                         v_cond = v_cond.clone()
                     v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                     _note_follow_miss(tc_cond, tc_uncond)
@@ -574,8 +507,7 @@ def anima_img2img(
             if sampler in ("secant", "secant_anneal"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
-            # aether injects coherence-gated grain; it is stochastic but takes no
-            # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
+            # aether is stochastic but takes no model_type/shift.
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
@@ -583,20 +515,19 @@ def anima_img2img(
                 kwargs["eta_max"] = eta_max
             if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
                 kwargs["gate_reduce"] = gate_reduce
-            # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
-            # low baked-in eta_max (0.2) instead of the shared 1.0 panel default.
+            # uni_pc_anneal keeps its baked-in eta_max (see t2i).
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
 
-        # ---- 5. decode
+        # 5. decode
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
             z = model.vae.process_out(x.to(policy.vae_dtype))
             image, decode_mode = vae_decode_safe(model.vae, z, policy)
         image = _to_pil(image)
 
-        # inpaint: paste the original pixels back into the keep region (byte-exact)
+        # inpaint: paste the original pixels back into the keep region
         if mask_image is not None:
             keep = np.asarray(mask_image.convert("L").resize((width, height), Image.NEAREST)) < 128
             original = np.asarray(init_image.convert("RGB").resize((width, height), Image.LANCZOS))
@@ -621,16 +552,11 @@ def anima_calibrate_oss(
     seed: int = 0,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[float]:
-    """Calibrate an OSS (optimal-stepsize) schedule for this Anima model/config.
-
-    Runs one dense ``grid``-point teacher trajectory, scores every candidate
-    single step, and DP-distills the ``steps``-step schedule that minimizes total
-    truncation error (see :func:`diffucore.sampling.calibrate_oss_schedule`).
-    Returns the descending σ list (trailing ``0`` included). One-time and
-    GPU-heavy; cache the result and feed it back via ``oss_sigmas``.
-
-    The conditioning + denoise closure mirror the registry-sampler path in
-    :func:`anima_text_to_image` (a CONST x0 estimate ``x − σ·v`` with CFG).
+    """Calibrate an OSS (optimal-stepsize) schedule for this model/config: one
+    dense ``grid``-point teacher trajectory, then a DP over single-step
+    candidates for the ``steps``-step schedule with the least truncation error
+    (:func:`diffucore.sampling.calibrate_oss_schedule`). Returns the descending
+    σ list with a trailing 0; cache it and pass it back as ``oss_sigmas``.
     """
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
@@ -655,10 +581,9 @@ def anima_calibrate_oss(
         candidate = flow_matching_schedule(grid, shift=shift, device=device, dtype=torch.float32)[:-1]
 
         backbone = model.backbone
-        # staged() OUTSIDE inference_mode: offloaded weights moved under inference
-        # mode become inference tensors that break later in-place LoRA (add_/copy_).
+        # staged() outside inference_mode (see t2i).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
-            # Adapter runs once per calibration, not per forward (see t2i).
+            # Adapter once per calibration.
             cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
             uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
 
@@ -669,7 +594,7 @@ def anima_calibrate_oss(
                 if cfg_scale == 1.0:
                     v = v_cond
                 else:
-                    if policy.cuda_graphs:  # uncond replay overwrites v_cond's buffer (see t2i)
+                    if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                         v_cond = v_cond.clone()
                     v_uncond = backbone(x_5d, t, uncond_ctx).squeeze(2)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
@@ -698,20 +623,12 @@ def anima_calibrate_teacache(
     degree: int = 4,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[float]:
-    """Fit TeaCache rescaling coefficients for this Anima model (arXiv:2411.19108).
-
-    Runs one full euler trajectory and records, per step, the pair
-    ``(x = rel-L1 drift of the block-0 timestep-modulated input,
-       y = rel-L1 drift of the conditioned velocity output)`` — then least-squares
-    fits a degree-``degree`` polynomial ``y ≈ f(x)``. That polynomial is what
-    rescales raw input drift into an output-change estimate so the accumulated
-    threshold means the same thing across step counts and resolutions.
-
-    The fit is a property of the **architecture**, not the prompt/seed, so one
-    calibration transfers across Anima checkpoints and settings. Run at a high
-    ``steps`` (dense σ sampling) so the curve covers lower step counts too.
-    Returns coefficients highest-degree-first (``numpy.polyfit`` / ``poly1d``
-    order), ready to hand to :class:`~diffucore.models.anima_dit.TeaCache`.
+    """Fit TeaCache rescaling coefficients (arXiv:2411.19108): record, per step
+    of one euler trajectory, the rel-L1 drift of the block-0 modulated input
+    (x) and of the cond velocity output (y), then fit a degree-``degree``
+    polynomial ``y ≈ f(x)``. It is a property of the architecture, so one fit
+    serves every Anima checkpoint; use many ``steps``. Returns coefficients
+    highest-degree first (``poly1d`` order).
     """
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
@@ -741,7 +658,7 @@ def anima_calibrate_teacache(
 
         backbone = model.backbone
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
-            # Adapter runs once per calibration, not per forward (see t2i).
+            # Adapter once per calibration.
             cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
             uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
             total = len(sigmas) - 1
@@ -752,9 +669,8 @@ def anima_calibrate_teacache(
                     t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
                     v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
                     if policy.cuda_graphs:
-                        # prev_v is read on the NEXT step, after every intervening
-                        # replay has overwritten the graph's static output buffer —
-                        # clone at production (also covers the uncond replay below).
+                        # prev_v is read next step, after later replays overwrite
+                        # the static output buffer: clone it now.
                         v_cond = v_cond.clone()
                     if prev_v is not None:
                         denom = prev_v.abs().mean().clamp_min(1e-8)

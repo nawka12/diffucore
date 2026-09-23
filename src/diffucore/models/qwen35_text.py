@@ -1,42 +1,17 @@
-"""Qwen3.5 hybrid (Mamba2 SSM + gated attention) text encoder — experimental.
+"""Qwen3.5 hybrid (Mamba2 SSM + gated attention) text encoder, experimental.
 
-Anima normally conditions on Qwen3-0.6B-base (see ``qwen3_text.py``). The
-``cosmos-qwen3.5`` project swaps in a Qwen3.5 text backbone as a newer semantic
-encoder. Unlike Qwen3 these models are *hybrid*: a 3:1 stack where every 4th
-decoder layer is gated self-attention and the rest are Mamba2-style selective
-state-space (SSM) blocks. Two variants are supported, told apart from the
-checkpoint by :meth:`Qwen35Config.from_state_dict`:
+The ``cosmos-qwen3.5`` swap for Anima's Qwen3-0.6B encoder: every 4th layer is
+gated self-attention, the rest Mamba2-style SSM blocks. Two variants, told
+apart by :meth:`Qwen35Config.from_state_dict`: the 4B Anima encoder (32
+layers, hidden 2560, a projection head to 1024) and the 0.8B base (24 layers,
+hidden 1024, plain final RMSNorm). Both emit 1024-d, like Qwen3-0.6B.
 
-  * **4B Anima encoder** (``qwen35_4b.safetensors``): 32 layers (attention at
-    3,7,…,31; layer 31 has no MLP), hidden 2560, and a baked-in projection head
-    ``Linear 2560->1024 -> ExpRMSNorm -> SiLU -> Linear 1024->1024``.
-  * **0.8B base** (``qwen_3_5_08b_base``): 24 layers (attention at 3,7,…,23),
-    hidden 1024, and *no* projection — just a plain final RMSNorm, so its output
-    is already the 1024-d the adapter expects (same convention as Qwen3-0.6B).
+Ported from ``GumGum10/comfyui-qwen35-anima`` (MIT). Parameter names mirror
+the checkpoint so the backbone strict-loads. Two load-bearing details: the late
+norm scales by ``exp(weight)`` (:class:`ExpRMSNorm`), and ``in_proj_b`` feeds
+``dt`` while ``in_proj_a`` feeds the ``D`` skip (verified, not a typo).
 
-Either way the output is 1024-d — the *same* interface Qwen3-0.6B exposes, so
-these encoders are drop-in interchangeable at the Anima boundary.
-
-Ported from the MIT-licensed reference node ``GumGum10/comfyui-qwen35-anima``
-(which reverse-engineered ``nightknocker/cosmos-qwen3.5``). Submodule and
-parameter names mirror the on-disk checkpoint (``embed_tokens.*``,
-``layers.{i}.*``, and ``norm.{0,1,3}.*`` or plain ``norm.*``) so a strict load
-of the backbone succeeds without remapping (the loader strips any
-``model.language_model.`` prefix and drops the base model's vision/MTP heads).
-
-Two reference details are load-bearing:
-  * The late norm uses an ``exp(weight)`` parameterization (:class:`ExpRMSNorm`).
-    Its learned weights are ~-0.003; read as a plain RMSNorm scale they collapse
-    every token to the same vector. ``exp(-0.003) ~ 1`` keeps near-identity
-    scaling and preserves token diversity.
-  * The SSM block's input projections are named off-by-one vs intuition:
-    ``in_proj_b`` feeds the input-dependent timestep ``dt`` and ``in_proj_a``
-    feeds the ``D`` skip term (verified against the checkpoint, not a typo).
-
-Experimental: not bit-verified against an oracle (the 4B weights are fp8 and
-need a GPU). It is shape- and strict-load-verified offline. The reference's
-optional calibration / Procrustes-alignment refinements and its image ViT are
-out of scope here.
+Shape- and strict-load-verified offline; not bit-verified against an oracle.
 """
 
 from __future__ import annotations
@@ -52,14 +27,12 @@ from ._norm import RMSNorm, _rotate_half
 
 @dataclass
 class Qwen35Config:
-    # Defaults describe the 4B Anima encoder; ``from_state_dict`` derives the rest
-    # of the family (e.g. the 0.8B base) from a checkpoint.
+    # Defaults describe the 4B encoder; ``from_state_dict`` derives the others.
     vocab_size: int = 248320
     hidden_size: int = 2560
     intermediate_size: int = 9216
     output_dim: int = 1024              # context width handed to the LLM-Adapter
-    output_projection: bool = True       # 4B: Linear→ExpRMSNorm→SiLU→Linear head.
-                                         # False (0.8B base): plain final RMSNorm.
+    output_projection: bool = True       # 4B head; False = plain final RMSNorm (0.8B)
     num_hidden_layers: int = 32
     # Layer roles (the rest are SSM; the listed layers are gated self-attention).
     self_attn_layers: tuple[int, ...] = (3, 7, 11, 15, 19, 23, 27, 31)
@@ -80,11 +53,8 @@ class Qwen35Config:
 
     @classmethod
     def from_state_dict(cls, sd) -> "Qwen35Config":
-        """Derive the config from a bare-key Qwen3.5 backbone state dict (prefix
-        already stripped, vision/MTP heads already dropped). Sizes, the layer
-        roles (SSM vs attention, which layers carry an MLP) and the output-head
-        kind are all read off the tensors; ``rope_theta`` / eps are family
-        constants the checkpoint doesn't record."""
+        """Derive the config from a bare-key backbone state dict (prefix stripped,
+        vision/MTP heads dropped). ``rope_theta`` and eps are family constants."""
         vocab_size, hidden_size = sd["embed_tokens.weight"].shape
         n = 0
         while f"layers.{n}.input_layernorm.weight" in sd:
@@ -117,12 +87,8 @@ class Qwen35Config:
 
 
 class ExpRMSNorm(nn.Module):
-    """RMSNorm whose scale is ``exp(weight)`` instead of ``weight``.
-
-    The late-norm's learned weights sit at ~-0.003; a plain RMSNorm would read
-    that as "scale to ~0" and collapse every token to the same vector. With the
-    exponential parameterization, ~0 means ``exp(0) ~ 1`` (near-identity), which
-    preserves token diversity. Computed in fp32, matching :class:`RMSNorm`.
+    """RMSNorm scaled by ``exp(weight)``. The learned weights sit at ~-0.003, which
+    a plain RMSNorm would read as "scale to ~0". fp32, like :class:`RMSNorm`.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -154,12 +120,9 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 class SSMBlock(nn.Module):
-    """Mamba2-style selective state-space block (ref: ``state-spaces/mamba``).
-
-    ``in_proj_qkv`` → conv1d → SiLU → split into ``x`` (d_ssm) + ``B`` + ``C``;
-    ``in_proj_z`` is the gate that *bypasses* the conv; ``in_proj_b`` / ``in_proj_a``
-    produce the per-head input-dependent ``dt`` / ``D`` (skip). The recurrence is
-    a proper outer-product state of width ``d_state``.
+    """Mamba2-style selective state-space block (ref: ``state-spaces/mamba``):
+    ``in_proj_qkv`` → conv1d → SiLU → ``x`` + ``B`` + ``C``; ``in_proj_z`` gates
+    around the conv; ``in_proj_b`` / ``in_proj_a`` give per-head ``dt`` / ``D``.
     """
 
     def __init__(self, cfg: Qwen35Config):
@@ -235,10 +198,8 @@ class SSMBlock(nn.Module):
 
 
 class GatedSelfAttention(nn.Module):
-    """GQA self-attention with a SiLU-gated output and per-head q/k RMSNorm.
-
-    ``q_proj`` emits ``2·inner`` = query + gate; the gate multiplies the attention
-    output (after re-flattening) before ``o_proj``.
+    """GQA self-attention with per-head q/k RMSNorm; ``q_proj`` also emits a SiLU
+    gate applied to the output before ``o_proj``.
     """
 
     def __init__(self, cfg: Qwen35Config):
@@ -316,16 +277,8 @@ class HybridBlock(nn.Module):
 
 
 class Qwen35TextEncoder(nn.Module):
-    """Qwen3.5 4B hybrid text encoder: tokens → 1024-dim source hidden states.
-
-    Forward:
-        input_ids:      LongTensor (B, T).
-        attention_mask: optional (B, T) {0,1} padding mask. ``None`` (Anima's
-                        path — the tokenizer doesn't pad) runs pure causal
-                        attention via SDPA's fast path.
-
-    Returns:
-        hidden_states: FloatTensor (B, T, output_dim=1024).
+    """Qwen3.5 hybrid text encoder: ``input_ids`` (B, T) → (B, T, 1024) hidden
+    states. ``attention_mask=None`` (Anima's unpadded path) runs pure causal SDPA.
     """
 
     def __init__(self, cfg: Qwen35Config | None = None):
@@ -340,11 +293,8 @@ class Qwen35TextEncoder(nn.Module):
             HybridBlock(cfg, use_ssm=(i not in self_attn), has_mlp=(i not in no_mlp))
             for i in range(cfg.num_hidden_layers)
         ])
-        # Output head. The 4B Anima encoder bakes in a projection (``norm.0/1/3``:
-        # Linear 2560→1024 → ExpRMSNorm → SiLU → Linear, SiLU at index 2 carrying
-        # no params). The raw base models (e.g. 0.8B) have no projection — just a
-        # plain final RMSNorm (``norm.weight``) at hidden width, which is already
-        # the 1024-d the LLM-Adapter expects (same convention as Qwen3-0.6B-base).
+        # Output head: the 4B encoder's ``norm.0/1/3`` projection (SiLU at index
+        # 2 has no params), or a plain final ``norm.weight`` on the base models.
         if cfg.output_projection:
             self.norm = nn.Sequential(
                 nn.Linear(cfg.hidden_size, cfg.output_dim, bias=True),

@@ -1,19 +1,11 @@
 """FLUX tokenizers.
 
-FLUX.1 conditions on two encoders: CLIP-L (pooled vector, 77 tokens, EOS-padded)
-and T5-XXL (sequence context, padded to at least 256). Both vocabs are already
-vendored: ``clip_tokenizer.json`` (OpenAI CLIP, MIT) and ``t5_tokenizer.json``
-(google-t5, Apache-2.0).
-
-FLUX.2 conditions on a single decoder LM, and uses the **concatenation of three
-intermediate layers** of that LM as the DiT context (no final norm). Two families:
-
-* **Klein** — Qwen3-4B/8B, layers ``[9, 18, 27]``, with the Qwen chat template.
-  The Qwen2.5 vocab is the already-vendored ``qwen3_tokenizer.json`` (pad 151643).
-* **Dev** — Mistral-3 24B, layers ``[10, 20, 30]``, with a SYSTEM_PROMPT template.
-  Mistral's Tekken vocab is not vendored — supply a ``tokenizer.json`` path.
-
-The templates and layer indices mirror ComfyUI's FLUX.2 text-encoder definitions.
+FLUX.1: CLIP-L (77 tokens, EOS-padded) + T5-XXL (padded to at least 256), both
+vendored. FLUX.2: one decoder LM whose three concatenated intermediate layers
+are the context: Klein (Qwen3-4B/8B, layers ``[9, 18, 27]``, Qwen chat
+template, vendored vocab) or Dev (Mistral-3 24B, layers ``[10, 20, 30]``,
+SYSTEM_PROMPT template; supply Mistral's ``tokenizer.json``). Templates and
+layers follow ComfyUI's FLUX.2 definitions.
 """
 
 from __future__ import annotations
@@ -46,8 +38,8 @@ _MISTRAL_LAYERS = [10, 20, 30]
 class FluxTokenized:
     """Token IDs for one prompt::
 
-        clip_ids: LongTensor (1, 77)        — CLIP-L BPE, EOS-padded
-        t5_ids:   LongTensor (1, >=256)     — T5 BPE, pad(0)-padded
+        clip_ids: LongTensor (1, 77)        CLIP-L BPE, EOS-padded
+        t5_ids:   LongTensor (1, >=256)     T5 BPE, pad(0)-padded
     """
     clip_ids: torch.Tensor
     t5_ids: torch.Tensor

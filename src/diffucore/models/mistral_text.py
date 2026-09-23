@@ -1,4 +1,4 @@
-"""Mistral-3 decoder LM — FLUX.2's text encoder.
+"""Mistral-3 decoder LM, FLUX.2's text encoder.
 
 FLUX.2 (Black Forest Labs, 2025) drops the FLUX.1 T5-XXL + CLIP pair and instead
 conditions on the hidden states of a Mistral-Small-3 (24B) language model. This
@@ -17,7 +17,7 @@ and Mistral-Small-3.1-24B config (head_dim 128, rope θ 1e6, full causal attenti
 but has **not** been numerically verified against FLUX.2 weights. The exact layer
 whose hidden state FLUX.2 consumes (here: final-norm ``last_hidden_state``) is the
 most likely choice and the first thing to confirm against a reference. Mistral's
-Tekken tokenizer is not vendored — supply ``tokenizer.json`` via the tokenizer.
+Tekken tokenizer is not vendored; supply ``tokenizer.json`` via the tokenizer.
 
 Contract:
     forward(input_ids: LongTensor[B, L]) -> last_hidden_state: FloatTensor[B, L, dim]

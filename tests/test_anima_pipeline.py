@@ -1,4 +1,4 @@
-"""Anima end-to-end pipeline (DT7) — smoke + reproducibility.
+"""Anima end-to-end pipeline: smoke and reproducibility.
 
 Skipped when any of the three Anima checkpoints aren't on disk. Runs on CUDA
 fp16 when available, else CPU fp32 (CPU at 1024² is many minutes per step;
@@ -130,8 +130,7 @@ def test_anima_produces_rgb_image(pipe):
 
 def test_adapter_runs_once_per_branch(pipe, monkeypatch):
     """The LLM-Adapter's output depends only on the prompt, so a CFG generation
-    must run it exactly twice (cond + uncond) — not once per backbone forward
-    (per step, per branch), which is what it regressed from."""
+    must run it exactly twice (cond + uncond), not once per backbone forward."""
     from diffucore.models.anima_dit import AnimaDiT
 
     calls = []
@@ -207,11 +206,9 @@ def test_anima_seed_reproducible(pipe):
 
 
 def test_anima_scheduler_choice_changes_output(pipe):
-    """Regression: the t2i wrapper coerced any scheduler outside a stale
-    hardcoded allowlist to "flow", silently ignoring the selection (normal,
-    kl_optimal, linear_quadratic, smoothstep all ran as "flow"). Same seed
-    with different schedulers must produce different pixels. steps=3 because
-    at steps=2 smoothstep's σ run coincides with flow's by construction."""
+    """Regression: schedulers outside a stale allowlist silently ran as "flow".
+    Same seed, different schedulers, different pixels (steps=3, since at 2
+    smoothstep coincides with flow)."""
     flow = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="flow"))
     lq = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="linear_quadratic"))
     ss = np.asarray(_gen(pipe, seed=7, steps=3, scheduler="smoothstep"))
@@ -220,10 +217,8 @@ def test_anima_scheduler_choice_changes_output(pipe):
     assert not np.array_equal(flow, lq)
     assert not np.array_equal(flow, ss)
     assert not np.array_equal(lq, ss)
-    # beta_mix and beta share the endpoint σ values, so they must each
-    # differ from flow (sanity) and from each other (verifies the mixture's
-    # asymmetric shape actually flows through to pixels, not silently aliased
-    # back to beta or flow).
+    # beta_mix and beta share endpoints; each must differ from flow and from
+    # each other (the mixture isn't aliased back to beta).
     assert not np.array_equal(flow, beta)
     assert not np.array_equal(flow, mix)
     assert not np.array_equal(beta, mix)

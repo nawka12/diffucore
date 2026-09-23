@@ -2,16 +2,16 @@
 
 Layered tests:
 
-1. Key-set match — the module's parameter names match the on-disk safetensors
+1. Key-set match: the module's parameter names match the on-disk safetensors
    keys exactly. Needs no checkpoint.
-2. Strict load + round-trip PSNR — load real weights, encode/decode a
+2. Strict load + round-trip PSNR: load real weights, encode/decode a
    smooth test image, require PSNR above a threshold. Skipped if the
    ``DIFFUCORE_QWEN_IMAGE_VAE`` checkpoint is absent.
 3. Numerical agreement vs ComfyUI's ``WanVAE`` (the upstream reference). The
    GPL-licensed ComfyUI tree is imported here in ``tests/`` only; nothing
    under ``src/diffucore/`` touches it. Skipped if ComfyUI is absent.
 
-   **These two skip under the app venv** — importing ComfyUI pulls in native
+   **These two skip under the app venv**: importing ComfyUI pulls in native
    deps (``comfy_aimdo``, ``comfy_kitchen``) that only exist in ComfyUI's own
    interpreter. To actually run them, use that interpreter (comfy-cli installs
    ComfyUI into a pyenv version; ``pyenv which python`` from the ComfyUI
@@ -23,7 +23,7 @@ Layered tests:
    to some other checkout on the system rather than this one.
 
    Last run 2026-07-25 against ``qwen_image_vae.safetensors``: encode
-   max\\|Δ\\| 2.4e-06, decode 3.2e-06 — float32 round-off, i.e. the 4-D
+   max\\|Δ\\| 2.4e-06, decode 3.2e-06, float32 round-off, so the 4-D
    image-only path reproduces the reference 5-D VAE exactly at T=1.
 """
 
@@ -55,7 +55,7 @@ def _psnr(a: torch.Tensor, b: torch.Tensor, peak: float = 2.0) -> float:
 
 
 def _gradient_image(h: int = 256, w: int = 256, seed: int = 0) -> torch.Tensor:
-    """A smooth coloured gradient with mild structure — easy for a VAE to compress."""
+    """A smooth coloured gradient with mild structure, easy for a VAE to compress."""
     torch.manual_seed(seed)
     yy, xx = torch.meshgrid(
         torch.linspace(-1, 1, h), torch.linspace(-1, 1, w), indexing="ij",
@@ -81,7 +81,7 @@ def test_qwen_image_vae_key_set_matches_checkpoint_header():
 
     mod_keys = set(QwenImageVAE().state_dict().keys())
     assert mod_keys == ckpt_keys, (
-        f"key mismatch — missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
+        f"key mismatch; missing: {sorted(ckpt_keys - mod_keys)[:5]} | "
         f"extra: {sorted(mod_keys - ckpt_keys)[:5]}"
     )
 
@@ -107,7 +107,7 @@ def test_strict_load_and_latent_shape(loaded_vae):
 
 
 def test_round_trip_psnr_threshold(loaded_vae):
-    """encode → decode on a smooth image — the trained VAE clears 40 dB
+    """encode → decode on a smooth image: the trained VAE clears 40 dB
     comfortably on this kind of input (~49 dB observed); 40 leaves enough
     headroom that fp32-reduction noise on different hardware won't trip it."""
     img = _gradient_image(256, 256)
@@ -146,9 +146,8 @@ def comfy_vae():
     except ImportError as e:
         # ComfyUI pulls in native deps (comfy_aimdo, comfy_kitchen) at import
         # time that live only in its own interpreter, so this always skips
-        # under the app venv. Skip rather than fail — the round-trip and
-        # key-match tests still verify correctness without the oracle — but
-        # say how to actually run it, or nobody ever will.
+        # under the app venv. Skip (the round-trip and key-match tests still
+        # cover correctness), but say how to run it.
         pytest.skip(
             f"ComfyUI import failed ({e}). This test needs ComfyUI's own "
             f"interpreter; from the diffucore root run:\n"

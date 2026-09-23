@@ -1,9 +1,6 @@
-"""Neural-network backbones, implemented from their original publications.
-
-Text encoders (CLIP ViT-L/14, OpenCLIP bigG, Qwen3), the SD1.5/SDXL UNet, the
-AutoencoderKL and Qwen-Image VAEs, and the Anima DiT (+ its LLM-Adapter). Each
-is strict-loadable from real checkpoints and verified on CUDA against HF
-oracles — see ``docs/ROADMAP.md``.
+"""Neural-network backbones, implemented from their original publications:
+text encoders, the SD UNet, the VAEs, and the Anima and FLUX DiTs. Each is
+strict-loadable from real checkpoints.
 """
 
 from ._norm import RMSNorm

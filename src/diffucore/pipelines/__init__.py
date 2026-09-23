@@ -1,4 +1,4 @@
-"""High-level pipelines — the user-facing glue."""
+"""High-level pipelines: the user-facing glue."""
 
 from ._base import PipelineInfo
 from ._anima import anima_calibrate_oss, anima_calibrate_teacache

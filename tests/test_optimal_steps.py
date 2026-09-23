@@ -31,7 +31,7 @@ def test_optimal_step_schedule_endpoints_and_length():
 
 def test_optimal_step_schedule_no_worse_than_uniform():
     # The DP is optimal by construction, so its total cost must be <= any other
-    # valid path's — in particular the evenly-strided ("uniform") one.
+    # valid path's, including the evenly strided one.
     torch.manual_seed(1)
     K, num_steps = 40, 8
     cost = torch.rand(K, K).triu(1) + 0.01

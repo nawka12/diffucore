@@ -92,7 +92,7 @@ def test_append_dims():
 # --- flow matching (CONST) -------------------------------------------------
 
 def test_flow_matching_scalings_are_const():
-    """c_skip = 1, c_in = 1, c_out = -σ for all σ — the CONST convention."""
+    """c_skip = 1, c_in = 1, c_out = -σ for all σ (the CONST convention)."""
     s = P.FlowMatchingConstScaling()
     sigma = torch.tensor([0.05, 0.5, 0.99])
     c_skip, c_out, c_in = s.scalings(sigma)
@@ -102,7 +102,7 @@ def test_flow_matching_scalings_are_const():
 
 
 def test_flow_matching_model_input_is_identity():
-    """The model sees the raw noisy latent — no input scaling."""
+    """The model sees the raw noisy latent, unscaled."""
     s = P.FlowMatchingConstScaling()
     x = torch.randn(1, 4, 8, 8)
     sigma = torch.tensor(0.7)
@@ -111,7 +111,7 @@ def test_flow_matching_model_input_is_identity():
 
 def test_flow_matching_denoise_recovers_x0_from_velocity():
     """If the model returns the true velocity v = ε − x0, ``Scaling.denoise``
-    must produce the exact x0 — algebraically, ``x_t − σ·v = x0``."""
+    must produce the exact x0: ``x_t − σ·v = x0``."""
     s = P.FlowMatchingConstScaling()
     torch.manual_seed(0)
     x_0 = torch.randn(1, 4, 4, 4)
@@ -127,7 +127,7 @@ def test_flow_matching_denoise_recovers_x0_from_velocity():
 def test_flow_matching_euler_with_x0_oracle_lands_on_x0():
     """A perfect x0 oracle plus the existing Euler sampler should drive a
     flow-matching trajectory back to the true x0 (Euler integration of the
-    rectified-flow ODE is exact for any constant x0 estimate — the last step
+    rectified-flow ODE is exact for any constant x0 estimate; the last step
     is closed-form). This exercises the parameterization + schedule + sampler
     end-to-end without a real backbone."""
     from diffucore.sampling import (
