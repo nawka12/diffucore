@@ -255,7 +255,7 @@ def test_secant_registered_in_sampler_table():
 
 
 @pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
-                                  "lumen", "gradient_estimation", "stork2", "infinity",
+                                  "gradient_estimation", "stork2", "infinity",
                                   "lms", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2"])
 @pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
 def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
@@ -522,68 +522,6 @@ def test_secant_anneal_registered_in_sampler_table():
     assert K.get_sampler("secant_anneal") is K.sample_secant_anneal
 
 
-# ── DPM++(2M)-ANNEAL ──────────────────────────────────────────────────
-
-
-def test_dpmpp_2m_anneal_flow_only():
-    with pytest.raises(ValueError):
-        K.sample_dpmpp_2m_anneal(
-            const_denoiser(torch.zeros(1, 4, 4, 4)), torch.randn(1, 4, 4, 4),
-            S.flow_matching_schedule(8, shift=3.0), model_type="ve",
-        )
-
-
-def test_dpmpp_2m_anneal_constant_x0_ends_clean():
-    # The final step snaps to the constant prediction.
-    target = torch.full((1, 16, 4, 4), 0.1)
-    sigmas = S.flow_matching_schedule(16, shift=3.0)
-    x_init = torch.randn(1, 16, 4, 4)
-    out = K.sample_dpmpp_2m_anneal(
-        const_denoiser(target), x_init.clone(), sigmas,
-        generator=torch.Generator().manual_seed(0),
-    )
-    assert torch.isfinite(out).all()
-    assert torch.allclose(out, target, atol=1e-4)
-
-
-def test_dpmpp_2m_anneal_eta_max_zero_equals_dpmpp_2m_sde_flow():
-    # eta_max=0 is exactly dpmpp_2m_sde with eta=0 (σ-dependent denoiser so the
-    # 2nd-order term runs).
-    torch.manual_seed(2)
-    target = torch.randn(1, 4, 8, 8)
-    model = _anneal_sigma_dependent_model(target)
-    sigmas = S.flow_matching_schedule(16, shift=3.0)
-    x_init = torch.randn(1, 4, 8, 8)
-
-    sde0 = _last_nonzero_latent(K.sample_dpmpp_2m_sde, model, x_init, sigmas,
-                                eta=0.0, model_type="flow", shift=3.0)
-    anz = _last_nonzero_latent(K.sample_dpmpp_2m_anneal, model, x_init, sigmas,
-                               eta_max=0.0, model_type="flow", shift=3.0)
-    assert torch.isfinite(anz).all()
-    assert torch.allclose(anz, sde0, atol=1e-4)
-
-
-def test_dpmpp_2m_anneal_seed_reproducible_and_stochastic():
-    # Same seed reproduces; the burn-in must change the trajectory.
-    target = torch.zeros(1, 8, 4, 4)
-    sigmas = S.flow_matching_schedule(12, shift=3.0)
-    x_init = torch.randn(1, 8, 4, 4)
-
-    def run(**kw):
-        return _last_nonzero_latent(K.sample_dpmpp_2m_anneal, const_denoiser(target),
-                                    x_init, sigmas, model_type="flow", shift=3.0, **kw)
-
-    a = run(generator=torch.Generator().manual_seed(3))
-    b = run(generator=torch.Generator().manual_seed(3))
-    det = run(eta_max=0.0)
-    assert torch.equal(a, b)
-    assert not torch.allclose(a, det, atol=1e-5)
-
-
-def test_dpmpp_2m_anneal_registered_in_sampler_table():
-    assert K.get_sampler("dpmpp_2m_anneal") is K.sample_dpmpp_2m_anneal
-
-
 # ── EXP-HEUN-2-x0 ─────────────────────────────────────────────────────
 
 
@@ -742,110 +680,6 @@ def test_uni_pc_variants_registered():
         assert fn.keywords == {"variant": variant}
 
 
-# ── UniPC-ANNEAL ──────────────────────────────────────────────────────
-
-
-def test_uni_pc_anneal_flow_only():
-    with pytest.raises(ValueError):
-        K.sample_uni_pc_anneal(
-            const_denoiser(torch.zeros(1, 4, 4, 4)), torch.randn(1, 4, 4, 4),
-            S.flow_matching_schedule(8, shift=3.0), model_type="ve",
-        )
-
-
-def test_uni_pc_anneal_bad_args_raise():
-    sigmas = S.flow_matching_schedule(8, shift=3.0)
-    x = torch.randn(1, 4, 4, 4)
-    with pytest.raises(ValueError):
-        K.sample_uni_pc_anneal(const_denoiser(torch.zeros(1, 4, 4, 4)), x, sigmas, variant="bh3")
-    with pytest.raises(ValueError):
-        K.sample_uni_pc_anneal(const_denoiser(torch.zeros(1, 4, 4, 4)), x, sigmas, order=0)
-
-
-def test_uni_pc_anneal_constant_x0_ends_clean():
-    # The final step snaps to the constant prediction.
-    target = torch.full((1, 16, 4, 4), 0.1)
-    sigmas = S.flow_matching_schedule(16, shift=3.0)
-    x_init = torch.randn(1, 16, 4, 4)
-    out = K.sample_uni_pc_anneal(
-        const_denoiser(target), x_init.clone(), sigmas,
-        generator=torch.Generator().manual_seed(0),
-    )
-    assert torch.isfinite(out).all()
-    assert torch.allclose(out, target, atol=1e-4)
-
-
-def test_uni_pc_anneal_eta_max_zero_equals_uni_pc_bh2():
-    # eta_max=0 is deterministic UniPC (bh2) bit-for-bit, with the higher-order
-    # residual exercised.
-    torch.manual_seed(2)
-    target = torch.randn(1, 4, 8, 8)
-    model = _unipc_sigma_dependent_model(target)
-    sigmas = S.flow_matching_schedule(16, shift=3.0)
-    x_init = torch.randn(1, 4, 8, 8)
-
-    upc = _last_nonzero_latent(K.sample_uni_pc, model, x_init, sigmas,
-                               variant="bh2", model_type="flow", shift=3.0)
-    anz = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
-                               eta_max=0.0, variant="bh2", model_type="flow", shift=3.0)
-    assert torch.isfinite(anz).all()
-    assert torch.allclose(anz, upc, atol=1e-6)
-
-
-def test_uni_pc_anneal_seed_reproducible_and_stochastic():
-    # Same seed reproduces; the burn-in must change the trajectory.
-    target = torch.zeros(1, 8, 4, 4)
-    sigmas = S.flow_matching_schedule(12, shift=3.0)
-    x_init = torch.randn(1, 8, 4, 4)
-
-    def run(**kw):
-        return _last_nonzero_latent(K.sample_uni_pc_anneal, const_denoiser(target),
-                                    x_init, sigmas, model_type="flow", shift=3.0, **kw)
-
-    a = run(generator=torch.Generator().manual_seed(3))
-    b = run(generator=torch.Generator().manual_seed(3))
-    det = run(eta_max=0.0)
-    assert torch.equal(a, b)
-    assert not torch.allclose(a, det, atol=1e-5)
-
-
-def test_uni_pc_anneal_high_eta_stays_finite_with_order_ramp():
-    # The order ramp keeps eta_max=1.0 on a σ-dependent denoiser bounded, and the
-    # burn-in must change the trajectory.
-    torch.manual_seed(5)
-    target = torch.randn(1, 4, 8, 8)
-    model = _unipc_sigma_dependent_model(target)
-    sigmas = S.flow_matching_schedule(16, shift=3.0)
-    x_init = torch.randn(1, 4, 8, 8)
-
-    hi = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
-                              eta_max=1.0, model_type="flow", shift=3.0,
-                              generator=torch.Generator().manual_seed(0))
-    det = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
-                               eta_max=0.0, model_type="flow", shift=3.0)
-    assert torch.isfinite(hi).all()
-    assert hi.abs().max() < 1e3            # bounded, not amplifying to garbage
-    assert not torch.allclose(hi, det, atol=1e-4)
-
-
-def test_uni_pc_anneal_order_ramp_inactive_when_deterministic():
-    # The ramp is gated on η > 0, so eta_max=0 stays bit-for-bit UniPC (bh2).
-    torch.manual_seed(6)
-    target = torch.randn(1, 4, 8, 8)
-    model = _unipc_sigma_dependent_model(target)
-    sigmas = S.flow_matching_schedule(20, shift=3.0)
-    x_init = torch.randn(1, 4, 8, 8)
-    upc = _last_nonzero_latent(K.sample_uni_pc, model, x_init, sigmas,
-                               variant="bh2", model_type="flow", shift=3.0)
-    anz = _last_nonzero_latent(K.sample_uni_pc_anneal, model, x_init, sigmas,
-                               eta_max=0.0, variant="bh2", model_type="flow", shift=3.0)
-    assert torch.allclose(anz, upc, atol=1e-6)
-
-
-def test_uni_pc_anneal_registered_in_sampler_table():
-    assert K.get_sampler("uni_pc_anneal") is K.sample_uni_pc_anneal
-
-
 # ── COGENT ────────────────────────────────────────────────────────────
 # Coherence-gated exponential multistep; see sample_cogent / _coherence_gate.
 
@@ -888,9 +722,9 @@ def test_coherence_gate_is_per_sample_and_scale_invariant():
     assert torch.allclose(psi[1:], K._coherence_gate(a2, b, _TINY_H)[1:], atol=1e-5)
 
 
-def test_cogent_gate_of_one_equals_dpmpp_2m_anneal(monkeypatch):
-    # psi ≡ 1 is exactly the DPM++(2M) annealed multistep: the gate is the only
-    # thing cogent adds.
+def test_cogent_gate_of_one_equals_dpmpp_2m_sde_flow(monkeypatch):
+    # psi ≡ 1 is the DPM++(2M) flow multistep: the gate is the only thing
+    # cogent adds.
     torch.manual_seed(5)
     target = torch.randn(1, 4, 8, 8)
     model = _anneal_sigma_dependent_model(target)
@@ -901,10 +735,10 @@ def test_cogent_gate_of_one_equals_dpmpp_2m_anneal(monkeypatch):
         d.shape[0], *([1] * (d.ndim - 1))))
     got = _last_nonzero_latent(K.sample_cogent, model, x_init, sigmas,
                                eta_max=0.0, model_type="flow", shift=3.0)
-    want = _last_nonzero_latent(K.sample_dpmpp_2m_anneal, model, x_init, sigmas,
-                                eta_max=0.0, model_type="flow", shift=3.0)
+    want = _last_nonzero_latent(K.sample_dpmpp_2m_sde, model, x_init, sigmas,
+                                eta=0.0, model_type="flow", shift=3.0)
     assert torch.isfinite(got).all()
-    assert torch.equal(got, want)          # bit-for-bit, not merely close
+    assert torch.allclose(got, want, atol=1e-4)
 
 
 def test_cogent_step_size_floor_keeps_the_correction_alive(monkeypatch):
@@ -1706,100 +1540,6 @@ def test_infinity_omega_registered_in_sampler_table():
     assert K.get_sampler("infinity_omega") is K.sample_infinity_omega
 
 
-# ── INFINITY NANO ─────────────────────────────────────────────────────
-# galpt/infinity-diffusion `nano` @355b792: omega without AVN and DoG, on the
-# older `sigmas[0] < 8` NQVP gate.
-
-
-def test_infinity_nano_is_omega_without_avn_and_dog():
-    # nano must equal omega with AVN and DoG skipped, and differ from omega.
-    sigmas = S.karras_schedule(16, 0.0292, 14.6146)
-    torch.manual_seed(3)
-    x_init = torch.randn(1, 4, 16, 16)
-    model = lambda x, sg: 0.3 * torch.tanh(x) + 0.1 * x
-    nano = K.sample_infinity_nano(model, x_init.clone(), sigmas)
-    ref = K._sample_infinity_pyramid(model, x_init.clone(), sigmas, name="ref",
-                                     nqvp_sigma_min=K._NQVP_SIGMA_MIN_NANO,
-                                     avn=False, dog=False)
-    assert torch.equal(nano, ref)
-    assert not torch.allclose(nano, K.sample_infinity_omega(model, x_init.clone(), sigmas),
-                              atol=1e-5)
-
-
-def test_infinity_nano_and_omega_now_differ_on_flow_too():
-    # AVN is live on flow in omega only, so they differ by more than DoG.
-    sigmas = S.flow_matching_schedule(20, shift=3.0)
-    torch.manual_seed(11)
-    x_init = torch.randn(1, 4, 16, 16)
-    model = lambda x, sg: 0.2 * torch.tanh(x) + 0.1 * x
-
-    nano = K.sample_infinity_nano(model, x_init.clone(), sigmas)
-    omega = K.sample_infinity_omega(model, x_init.clone(), sigmas)
-    # ... and by more than the DoG term alone accounts for.
-    dog_only = K._sample_infinity_pyramid(model, x_init.clone(), sigmas, name="ref",
-                                          nqvp_sigma_min=K._NQVP_SIGMA_MIN_NANO,
-                                          avn=False, dog=True)
-    assert (omega - nano).abs().max() > 5.0 * (dog_only - nano).abs().max()
-
-
-def test_infinity_nano_keeps_the_older_nqvp_gate_constant():
-    # The NQVP gates (8.0 vs 5.0) only disagree between those sigmas.
-    assert K._NQVP_SIGMA_MIN_NANO == 8.0 and K._NQVP_SIGMA_MIN_OMEGA == 5.0
-    sigmas = S.karras_schedule(20, 0.0292, 14.6146)
-    sigmas = sigmas[sigmas < 7.0]                      # sigma_max now in [5, 8)
-    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)]) if sigmas[-1] != 0 else sigmas
-    assert 5.0 <= float(sigmas[0]) < 8.0
-    calls = []
-    real = K._quantile_variance_preserve
-    for fn, tag in ((K.sample_infinity_nano, "nano"), (K.sample_infinity_omega, "omega")):
-        n = [0]
-
-        def spy(*a, _n=n, **kw):
-            _n[0] += 1
-            return real(*a, **kw)
-
-        K._quantile_variance_preserve = spy
-        try:
-            torch.manual_seed(3)
-            fn(lambda x, sg: 0.2 * torch.tanh(x), torch.randn(1, 4, 16, 16), sigmas)
-        finally:
-            K._quantile_variance_preserve = real
-        calls.append((tag, n[0]))
-    assert calls[0][1] == 0 and calls[1][1] > 0        # nano gate shut, omega's open
-
-
-def test_infinity_nano_low_step_count_is_exactly_euler():
-    torch.manual_seed(0)
-    x_init = torch.randn(1, 4, 8, 8)
-    model = lambda x, sg: 0.3 * torch.tanh(x)
-    sigmas = S.flow_matching_schedule(6, shift=3.0)
-    assert torch.equal(K.sample_infinity_nano(model, x_init.clone(), sigmas),
-                       K.sample_euler(model, x_init.clone(), sigmas))
-
-
-def test_infinity_nano_rejects_non_4d_latents():
-    model = lambda x, sg: 0.3 * torch.tanh(x)
-    sigmas = S.flow_matching_schedule(12, shift=3.0)
-    with pytest.raises(ValueError, match="4-D"):
-        K.sample_infinity_nano(model, torch.randn(1, 256, 64), sigmas)
-
-
-def test_infinity_nano_runs_in_fp16_and_is_deterministic():
-    sigmas = S.flow_matching_schedule(16, shift=3.0).half()
-    torch.manual_seed(1)
-    x_init = torch.randn(1, 4, 16, 16, dtype=torch.float16)
-    model = lambda x, sg: (0.3 * torch.tanh(x.float())).half()
-    a = K.sample_infinity_nano(model, x_init.clone(), sigmas)
-    b = K.sample_infinity_nano(model, x_init.clone(), sigmas)
-    assert torch.equal(a, b)
-    assert a.dtype == torch.float16
-    assert torch.isfinite(a).all()
-
-
-def test_infinity_nano_registered_in_sampler_table():
-    assert K.get_sampler("infinity_nano") is K.sample_infinity_nano
-
-
 # ── INFINITY (realism branch) ─────────────────────────────────────────
 # Upstream's @21084d9 rewrite: the first-order x0 step plus a per-channel
 # variance stabiliser; deterministic and no longer family-restricted.
@@ -2258,66 +1998,3 @@ def test_cogent3_gate_stats_collection_does_not_perturb_output():
                     "bootstrap", "step", "sigma", "sigma_next", "h"):
             assert key in entry
         assert entry["bootstrap"] is False
-
-
-# ── LUMEN ─────────────────────────────────────────────────────────────
-# galpt/infinity-diffusion's geometric solver: res_multistep's correction plus
-# three guards (damping, an Euler tail, a magnitude fallback).
-
-
-def _lumen_curved_model():
-    # σ- and x-dependent x0 so the correction and damping both run.
-    def model(x, sigma):
-        s = sigma.reshape(-1, *([1] * (x.ndim - 1)))
-        return torch.tanh(0.7 * x) / (1.0 + s) + 0.1 * torch.sin(x + s)
-    return model
-
-
-def test_lumen_core_equals_res_multistep():
-    # With the guards off LUMEN is the RES step (float64: round-off, not tolerance).
-    sigmas = S.karras_schedule(12, 0.0292, 14.6146, dtype=torch.float64)
-    x_init = torch.randn(1, 4, 8, 8, dtype=torch.float64) * sigmas[0]
-    model = _lumen_curved_model()
-    got = K.sample_lumen(model, x_init.clone(), sigmas,
-                         tau=float("inf"), tail_euler=0, guard_ratio=float("inf"))
-    want = K.sample_res_multistep(model, x_init.clone(), sigmas)
-    assert torch.allclose(got, want, rtol=0, atol=1e-12)
-
-
-@pytest.mark.parametrize("guard_off", [
-    {"tau": 0.0},                       # kappa == 0, the correction is scaled away
-    {"tail_euler": 12},                 # every non-terminal step is in the tail
-    {"guard_ratio": 0.0},               # no correction ever passes the magnitude test
-])
-def test_lumen_each_guard_falls_back_to_euler(guard_off):
-    sigmas = S.karras_schedule(12, 0.0292, 14.6146, dtype=torch.float64)
-    x_init = torch.randn(1, 4, 8, 8, dtype=torch.float64) * sigmas[0]
-    model = _lumen_curved_model()
-    got = K.sample_lumen(model, x_init.clone(), sigmas, **guard_off)
-    want = K.sample_euler(model, x_init.clone(), sigmas)
-    assert torch.allclose(got, want, rtol=0, atol=1e-12)
-
-
-def test_lumen_damping_shrinks_on_a_jumping_x0():
-    d = torch.randn(2, 4, 8, 8)
-    smooth = K._lumen_damping(d, d + 1e-3 * torch.randn_like(d), K.LUMEN_TAU)
-    jumpy = K._lumen_damping(d, d + 4.0 * torch.randn_like(d), K.LUMEN_TAU)
-    assert torch.allclose(smooth, torch.ones(2))         # saturates at 1 when D barely moves
-    assert (jumpy < 0.5).all()
-    # Scale-invariant: both mean|·| terms scale with the latent.
-    assert torch.allclose(jumpy, K._lumen_damping(7.0 * d, 7.0 * (d + 4.0 * torch.randn_like(d)),
-                                                  K.LUMEN_TAU), atol=0.1)
-
-
-def test_lumen_guards_are_active_at_the_shipped_defaults():
-    # Sanity that the defaults are not a no-op wrapper around res_multistep.
-    sigmas = S.karras_schedule(12, 0.0292, 14.6146, dtype=torch.float64)
-    x_init = torch.randn(1, 4, 8, 8, dtype=torch.float64) * sigmas[0]
-    model = _lumen_curved_model()
-    got = K.sample_lumen(model, x_init.clone(), sigmas)
-    assert not torch.allclose(got, K.sample_res_multistep(model, x_init.clone(), sigmas))
-    assert not torch.allclose(got, K.sample_euler(model, x_init.clone(), sigmas))
-
-
-def test_lumen_registered_in_sampler_table():
-    assert K.get_sampler("lumen") is K.sample_lumen

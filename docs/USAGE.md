@@ -20,7 +20,7 @@ supported models, and performance numbers. For install and status, see the
   zero-terminal-SNR (ZTSNR) + CFG-rescale handled for you.
 - **LoRA & LoKr** adapters fuse into the weights at load time (kohya/A1111,
   PEFT, and Anima naming conventions).
-- **40+ samplers, multiple schedulers**: Euler/Heun, the DPM++ family, ER-SDE,
+- **35+ samplers, multiple schedulers**: Euler/Heun, the DPM++ family, ER-SDE,
   SECANT, and more (full list under [Usage](#choosing-samplers--schedulers)). The
   DPM++, ER-SDE, and SECANT samplers are flow-aware, so they drive Anima too.
 - **Runs on modest GPUs**: sequential CPU offload + tiled VAE fit SDXL into
@@ -52,19 +52,13 @@ image = TextToImage(model)(
   `secant_anneal` (Anima only: σ-annealed ancestral burn-in at high σ handing
   off to `secant`'s 2nd-order x0 refinement as σ→0; spans `euler_ancestral_anneal`
   at `curvature=0` and deterministic `secant` at `eta_max=0`), and
-  `dpmpp_2m_anneal` (Anima only, the "good and fast" sibling: `euler_ancestral_anneal`'s
-  same σ-annealed burn-in (`eta = eta_max·σ`) but with the DPM++(2M) flow multistep
-  as the deterministic core instead of plain Euler / the secant. The 2M core stays
-  genuinely 2nd-order at low step counts, where the secant self-gates back to Euler,
-  so it reaches the same quality in fewer steps; `eta_max=0` is the deterministic
-  2M flow solver. Pair with `beta`/`flow` like its siblings), and
-  `cogent` (all families: the same σ-annealed burn-in and DPM++(2M) exponential
-  core as `dpmpp_2m_anneal`, but the 2nd-order correction is scaled by a *measured*
+  `cogent` (all families: `euler_ancestral_anneal`'s σ-annealed burn-in on a
+  DPM++(2M) exponential core, with the 2nd-order correction scaled by a *measured*
   weight `psi = max((1 + 2·rho)/3, 1 − e^−h)` instead of a hardcoded σ heuristic:
   `rho` is the coherence of consecutive x0 differences, giving a Wiener shrinkage
   that damps itself on an imperfect model and stays undamped on a clean one, and
   `1 − e^−h` is the integrator's own phi-weight as a step-size floor. `eta_max=0`
-  is deterministic; `psi ≡ 1` is exactly `dpmpp_2m_anneal`. Prefer 24+ steps),
+  is deterministic. Prefer 24+ steps),
   and `cogent3` (all families: cogent's measured 2nd-order gate plus a second
   gate `psi_2 = (2 + 3·rho_2)/5` on the 3rd-order DPM-Solver++(3M) term, where
   `rho_2` is the coherence of consecutive *second* differences of the x0

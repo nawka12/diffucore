@@ -37,19 +37,19 @@ _ANIMA_SAMPLERS = {
     "euler", "heun", "heunpp2", "euler_ancestral", "euler_ancestral_anneal", "er_sde",
     "dpm_2", "dpm_2_ancestral", "dpmpp_2s_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde",
     "dpmpp_2m_sde_heun", "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep",
-    "res_multistep_ancestral", "lumen", "gradient_estimation", "stork2", "infinity",
-    "infinity_realism", "infinity_nano", "infinity_omega", "infinity_aether",
+    "res_multistep_ancestral", "gradient_estimation", "stork2", "infinity",
+    "infinity_realism", "infinity_omega", "infinity_aether",
     "lms", "lcm",
     "sa_solver", "sa_solver_pece",
     "secant", "secant_anneal",
-    "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
+    "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
-    "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "dpmpp_2m_anneal",
-    "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
+    "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
+    "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
     "sa_solver", "sa_solver_pece",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
@@ -320,13 +320,11 @@ def anima_text_to_image(
                 # aether is stochastic but takes no model_type/shift.
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
-                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
+                if sampler in ("euler_ancestral_anneal", "secant_anneal", "cogent", "cogent3", "cogent3_pump",
                                "cogent3_pump_rate"):
                     kwargs["eta_max"] = eta_max
                 if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
                     kwargs["gate_reduce"] = gate_reduce
-                # uni_pc_anneal keeps its baked-in eta_max (0.2); the shared 1.0
-                # panel default over-softens it.
                 with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
@@ -510,12 +508,11 @@ def anima_img2img(
             # aether is stochastic but takes no model_type/shift.
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
-            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
+            if sampler in ("euler_ancestral_anneal", "secant_anneal", "cogent", "cogent3", "cogent3_pump",
                            "cogent3_pump_rate"):
                 kwargs["eta_max"] = eta_max
             if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
                 kwargs["gate_reduce"] = gate_reduce
-            # uni_pc_anneal keeps its baked-in eta_max (see t2i).
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 

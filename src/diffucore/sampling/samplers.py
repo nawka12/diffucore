@@ -41,12 +41,10 @@ __all__ = [
     "sample_ipndm_v",
     "sample_res_multistep",
     "sample_res_multistep_ancestral",
-    "sample_lumen",
     "sample_gradient_estimation",
     "sample_stork2",
     "sample_infinity",
     "sample_infinity_realism",
-    "sample_infinity_nano",
     "sample_infinity_omega",
     "sample_infinity_aether",
     "sample_lms",
@@ -56,8 +54,6 @@ __all__ = [
     "sample_sa_solver_pece",
     "sample_secant",
     "sample_secant_anneal",
-    "sample_dpmpp_2m_anneal",
-    "sample_uni_pc_anneal",
     "sample_cogent",
     "sample_cogent3",
     "get_sampler",
@@ -629,19 +625,12 @@ def sample_exp_heun_2_x0(
 
 
 def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
-                      sigma_t, lambda_t, s_in, order, variant,
-                      *, eta: float = 0.0, s_noise: float = 1.0,
-                      generator: Optional[torch.Generator] = None):
+                      sigma_t, lambda_t, s_in, order, variant):
     """One UniPC predictor + corrector step in x0 form; returns ``(x_t, model_t)``.
 
     ``model_prev`` holds the last ``order`` x0 estimates, newest last. ``model_t``
     (the corrector's evaluation at ``sigma_t``) is reused as the next step's
-    newest history. ``variant`` is the ``B(h)`` type (``"bh1"``/``"bh2"``).
-
-    ``eta > 0`` makes the step stochastic like :func:`sample_dpmpp_2m_sde`: the
-    phi/B(h) terms use ``hh = -h·(1+η)`` (the ``rks`` ratios stay on ``h``), the
-    carry is contracted by ``e^{-h·η}``, and noise is re-injected after the
-    corrector. ``eta=0`` is the deterministic step, bit-for-bit."""
+    newest history. ``variant`` is the ``B(h)`` type (``"bh1"``/``"bh2"``)."""
     device = x.device
     m0 = model_prev[-1]
     sigma_prev_0 = sigma_prev[-1]
@@ -656,7 +645,7 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
     rks.append(torch.ones((), device=device, dtype=h.dtype))
     rks = torch.stack(rks)
 
-    hh = -h * (1.0 + eta)                    # x0 form, η-folded
+    hh = -h                                  # x0 form
     h_phi_1 = hh.expm1()                     # e^{hh} - 1 == hh·phi_1(hh)
     h_phi_k = h_phi_1 / hh - 1
     B_h = hh if variant == "bh1" else hh.expm1()
@@ -677,8 +666,8 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
         rr = rhos.to(D.dtype).view(1, -1, *([1] * (D.ndim - 2)))
         return (rr * D).sum(dim=1)
 
-    # Predictor. ``e^{-h·η}`` contracts the carry (η=0: factor 1).
-    x_t_ = (sigma_t / sigma_prev_0) * (-h * eta).exp() * x - alpha_t * h_phi_1 * m0
+    # Predictor.
+    x_t_ = (sigma_t / sigma_prev_0) * x - alpha_t * h_phi_1 * m0
     if D1s is not None:
         if order == 2:                       # closed form for 2nd order
             rhos_p = torch.tensor([0.5], device=device, dtype=b.dtype)
@@ -697,10 +686,6 @@ def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
     corr_res = combine(rhos_c[:-1], D1s) if D1s is not None else 0.0
     D1_t = model_t - m0
     x_t = x_t_ - alpha_t * B_h * (corr_res + rhos_c[-1] * D1_t)
-
-    if eta > 0 and s_noise > 0:
-        std = (-2.0 * h * eta).expm1().neg().sqrt()
-        x_t = x_t + _noise_like(x, generator) * sigma_t * std * s_noise
     return x_t, model_t
 
 
@@ -759,87 +744,6 @@ def sample_uni_pc(
         x, model_t = _uni_pc_bh_update(
             model, x, model_prev, sigma_prev, lambda_prev,
             sigma_t, lambda_fn(sigma_t), s_in, cur_order, variant,
-        )
-        if callback is not None:
-            callback(step, sigma_t, x, model_t)
-        push(sigma_t, model_t)
-    return x
-
-
-def sample_uni_pc_anneal(
-    model: Denoiser,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    eta_max: float = 0.2,
-    s_noise: float = 1.0,
-    generator: Optional[torch.Generator] = None,
-    callback: Callback = None,
-    order: int = 3,
-    variant: str = "bh2",
-    lower_order_final: bool = True,
-    model_type: str = "flow",
-    shift: float = 1.0,
-) -> torch.Tensor:
-    """UniPC (:func:`sample_uni_pc`) with the ``*_anneal`` family's σ-annealed
-    ancestral noise, ``eta_i = eta_max·σ_i`` (flow only).
-
-    Noise is folded in as in :func:`_uni_pc_bh_update`; ``eta_max=0`` is
-    deterministic UniPC, bit-for-bit. While η > 0 the order is ramped up with
-    decreasing σ (near 1 at high σ, ``order`` as σ→0), because the high-order
-    divided differences amplify the injected noise. The ramp keeps high
-    ``eta_max`` from collapsing the image, but quality is still best near 0,
-    hence the low default.
-    """
-    if model_type != "flow":
-        raise ValueError("uni_pc_anneal is rectified-flow only (model_type='flow')")
-    if len(sigmas) <= 1:
-        return x
-    if variant not in ("bh1", "bh2"):
-        raise ValueError("variant must be 'bh1' or 'bh2'")
-    if order < 1:
-        raise ValueError("order must be >= 1")
-    s_in = x.new_ones([x.shape[0]])
-    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
-    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
-    n = len(sigmas) - 1
-
-    model_prev, sigma_prev, lambda_prev = [], [], []
-
-    def push(sig, m):
-        sigma_prev.append(sig)
-        lambda_prev.append(lambda_fn(sig))
-        model_prev.append(m)
-        if len(model_prev) > order:
-            sigma_prev.pop(0)
-            lambda_prev.pop(0)
-            model_prev.pop(0)
-
-    m0 = model(x, sigmas[0] * s_in)
-    if callback is not None:
-        callback(0, sigmas[0], x, m0)
-    push(sigmas[0], m0)
-
-    for step in range(1, n + 1):
-        sigma_t = sigmas[step]
-        if bool(sigma_t == 0):           # land on the x0 estimate
-            x = model_prev[-1]
-            break
-        # σ_cur is where x currently lives: the newest history sigma.
-        sigma_cur = float(sigma_prev[-1].clamp(0.0, 1.0))
-        eta = eta_max * sigma_cur
-        cur_order = min(order, len(model_prev))
-        if lower_order_final:
-            cur_order = min(cur_order, n - step)
-        # Order ramp-up: divided differences amplify the injected noise, so while
-        # η > 0 hold the order low at high σ. η/η_max = σ, so the ramp tracks
-        # trajectory position, and η = 0 keeps full order (exact UniPC).
-        if eta > 0:
-            cur_order = min(cur_order, 1 + int((1.0 - sigma_cur) * order))
-        x, model_t = _uni_pc_bh_update(
-            model, x, model_prev, sigma_prev, lambda_prev,
-            sigma_t, lambda_fn(sigma_t), s_in, cur_order, variant,
-            eta=eta, s_noise=s_noise, generator=generator,
         )
         if callback is not None:
             callback(step, sigma_t, x, model_t)
@@ -962,61 +866,6 @@ def sample_secant_anneal(
     return x
 
 
-def sample_dpmpp_2m_anneal(
-    model: Denoiser,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    eta_max: float = 1.0,
-    s_noise: float = 1.0,
-    generator: Optional[torch.Generator] = None,
-    callback: Callback = None,
-    model_type: str = "flow",
-    shift: float = 1.0,
-) -> torch.Tensor:
-    """DPM-Solver++(2M) with σ-annealed ancestral noise (flow only).
-
-    :func:`sample_secant_anneal` with the DPM++(2M) flow exponential integrator
-    as the deterministic core. The σ-secant gates itself off as steps get
-    sparse; the 2M core stays 2nd-order there, which is where the step savings
-    come from.
-
-    ``eta_max=0`` is bit-identical to ``dpmpp_2m_sde`` with ``eta=0`` (flow
-    half-logSNR, midpoint form), not to ``dpmpp_2m``, which applies the VE map
-    to flow as-is."""
-    if model_type != "flow":
-        raise ValueError("dpmpp_2m_anneal is rectified-flow only (model_type='flow')")
-    if len(sigmas) <= 1:
-        return x
-    s_in = x.new_ones([x.shape[0]])
-    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
-    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
-    old_denoised = None
-    h, h_last = None, None
-    for i in range(len(sigmas) - 1):
-        sigma, sigma_next = sigmas[i], sigmas[i + 1]
-        denoised = model(x, sigma * s_in)
-        if callback is not None:
-            callback(i, sigma, x, denoised)
-        if bool(sigma_next == 0):
-            x = denoised
-        else:
-            eta = eta_max * float(sigma.clamp(max=1.0))
-            lambda_s, lambda_t = lambda_fn(sigma), lambda_fn(sigma_next)
-            h = lambda_t - lambda_s
-            h_eta = h * (eta + 1)
-            alpha_t = sigma_next * lambda_t.exp()
-            x = sigma_next / sigma * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
-            if old_denoised is not None:
-                rr = h_last / h
-                x = x + 0.5 * alpha_t * (-h_eta).expm1().neg() * (1 / rr) * (denoised - old_denoised)
-            if eta > 0 and s_noise > 0:
-                x = x + _noise_like(x, generator) * sigma_next * (-2 * h * eta).expm1().neg().sqrt() * s_noise
-        old_denoised = denoised
-        h_last = h
-    return x
-
-
 def _validate_gate_reduce(reduce: str) -> None:
     """Validate the reduction mode shared by cogent's two gates."""
     if reduce not in ("all", "per_channel"):
@@ -1101,8 +950,8 @@ def sample_cogent(
     on a noisy or imperfect model and keeps it on a clean one. Prefers 24+ steps
     and the ``flow`` / ``simple`` / ``sgm_uniform`` schedulers.
 
-    ``eta_max=0`` is deterministic; ``psi ≡ 1`` reproduces
-    :func:`sample_dpmpp_2m_anneal` bit-for-bit. ``gate_reduce`` is ``"all"`` or
+    ``eta_max=0`` is deterministic, and with ``psi ≡ 1`` it is
+    :func:`sample_dpmpp_2m_sde` (``eta=0``, flow). ``gate_reduce`` is ``"all"`` or
     the default-off ``"per_channel"``. ``σ_frac`` is σ on flow and ``σ/(1+σ)``
     on VE (both ``sigmoid(-lambda)``); ``shift`` offsets the first flow σ.
     """
@@ -1134,8 +983,6 @@ def sample_cogent(
             x = sigma_next / sigma * (-h * eta).exp() * x + alpha_t * (-h_eta).expm1().neg() * denoised
             if diff is not None:
                 psi = _coherence_gate(diff, old_diff, h, reduce=gate_reduce)
-                # Same operand order as sample_dpmpp_2m_anneal, so psi == 1
-                # reproduces it bit-for-bit.
                 rr = h_last / h
                 x = x + psi * (0.5 * alpha_t * (-h_eta).expm1().neg() * (1 / rr) * diff)
             if eta > 0 and s_noise > 0:
@@ -1599,85 +1446,6 @@ def sample_res_multistep_ancestral(
                           callback=callback, model_type=model_type)
 
 
-# LUMEN's guards, frozen upstream: damping scale, Euler steps before the
-# terminal one, and the correction/Euler ratio above which a step falls back to
-# Euler. They're sample_lumen arguments only so tests can pin each reduction.
-LUMEN_TAU = 0.8
-LUMEN_TAIL_EULER = 2
-LUMEN_GUARD_RATIO = 0.4
-_LUMEN_EPS = 1e-8
-
-
-def _lumen_damping(denoised: torch.Tensor, old_denoised: torch.Tensor,
-                   tau: float) -> torch.Tensor:
-    """LUMEN's damping ``kappa = min(1, tau·mean|D| / mean|D - D_prev|)``, per
-    batch sample (upstream reduces over the batch too; identical at batch 1).
-    Unlike :func:`_coherence_gate` it reads only the magnitude of the change and
-    is step-size-blind.
-    """
-    dims = tuple(range(1, denoised.ndim))
-    num = denoised.float().abs().mean(dim=dims) + _LUMEN_EPS
-    den = (denoised - old_denoised).float().abs().mean(dim=dims) + _LUMEN_EPS
-    return (tau * num / den).clamp(0.0, 1.0).to(denoised.dtype)
-
-
-def sample_lumen(
-    model: Denoiser,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    callback: Callback = None,
-    tau: float = LUMEN_TAU,
-    tail_euler: int = LUMEN_TAIL_EULER,
-    guard_ratio: float = LUMEN_GUARD_RATIO,
-) -> torch.Tensor:
-    """LUMEN geometric solver (galpt/infinity-diffusion, MIT; branch
-    ``sampler/lumen-geometric-solver`` @5e545eb). Deterministic, one evaluation
-    per step, all families.
-
-    Its correction is exactly :func:`sample_res_multistep`'s (with the guards
-    off the two agree to float64 round-off, pinned by
-    ``test_lumen_core_equals_res_multistep``). It adds three guards:
-
-    * **Damping** (:func:`_lumen_damping`) scales the correction by ``kappa``.
-    * **Euler tail**: the ``tail_euler`` steps before the terminal one are Euler.
-    * **Magnitude guard**: a step whose damped correction exceeds ``guard_ratio``
-      of its Euler displacement falls back to Euler.
-
-    Upstream rejects flow checkpoints, but this port only sees an x0 denoiser,
-    and rectified flow satisfies the same ``dx/dσ = (x - x0)/σ``.
-    """
-    s_in = x.new_ones([x.shape[0]])
-    steps = len(sigmas) - 1
-    old_denoised = None
-    for i in range(steps):
-        sigma, sigma_next = sigmas[i], sigmas[i + 1]
-        denoised = model(x, sigma * s_in)
-        if callback is not None:
-            callback(i, sigma, x, denoised)
-        if bool(sigma_next == 0):
-            x = denoised
-        else:
-            rho = sigma_next / sigma
-            x_euler = rho * x + (1.0 - rho) * denoised
-            h_prev = (sigma / sigmas[i - 1]).log() if i > 0 else sigma.new_zeros(())
-            in_tail = steps - 1 - tail_euler <= i < steps - 1
-            # No history, the Euler tail, or a repeated sigma (no slope): Euler.
-            if old_denoised is None or in_tail or bool(h_prev == 0):
-                x = x_euler
-            else:
-                kappa = _lumen_damping(denoised, old_denoised, tau)
-                corr = (denoised - old_denoised) * ((rho - rho.log() - 1.0) / h_prev)
-                corr = corr * append_dims(kappa, x.ndim)
-                dims = tuple(range(1, x.ndim))
-                ratio = (corr.float().abs().mean(dim=dims)
-                         / ((x_euler - x).float().abs().mean(dim=dims) + _LUMEN_EPS))
-                keep = append_dims((ratio <= guard_ratio).to(x.dtype), x.ndim)
-                x = x_euler - keep * corr
-        old_denoised = denoised
-    return x
-
-
 def sample_gradient_estimation(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *,
                                callback: Callback = None, ge_gamma: float = 2.0) -> torch.Tensor:
     """Gradient-estimation sampler (Liu et al., openreview o2ND9v0CeK): Euler
@@ -1995,12 +1763,8 @@ def _adaptive_velocity_normalize(v: torch.Tensor, ema_std: Optional[torch.Tensor
     return (centered * corr + mean).to(v.dtype), new_ema
 
 
-# Both pyramid branches skip NQVP below a sigma_max threshold, with different
-# constants. ``nano`` (@355b792) calls it split-resume detection; ``omega``
-# (@8d81e76) calls it what it is, ``is_flow = sigma_max < 5``. Either way NQVP
-# runs only on VE models (SD/SDXL start at 14.6, flow at 1.0). The constants
-# only disagree on a partial-denoise SD img2img; both are ported literally.
-_NQVP_SIGMA_MIN_NANO = 8.0
+# omega (@8d81e76) skips NQVP when ``is_flow = sigma_max < 5``, so NQVP runs
+# only on VE models (SD/SDXL start at 14.6, flow at 1.0).
 _NQVP_SIGMA_MIN_OMEGA = 5.0
 
 
@@ -2015,8 +1779,8 @@ def _sample_infinity_pyramid(
     dog: bool,
     callback: Callback = None,
 ) -> torch.Tensor:
-    """Shared loop for the pyramid branches: ``nano`` is upstream's ``omega``
-    without AVN and DoG and with the older NQVP gate constant."""
+    """The ``omega`` loop. ``avn``/``dog`` and the gate constant are arguments so
+    tests can pin each piece."""
     if x.ndim != 4:
         raise ValueError(
             f"{name} needs a 4-D [B, C, H, W] latent (its band decomposition is "
@@ -2065,23 +1829,6 @@ def _sample_infinity_pyramid(
 
         x = x + (macro + meso + gain * nano).to(x.dtype) * dt
     return x
-
-
-def sample_infinity_nano(
-    model: Denoiser,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    callback: Callback = None,
-) -> torch.Tensor:
-    """Infinity Diffusion, ``nano`` branch (galpt/infinity-diffusion, MIT;
-    upstream @355b792, 2026-07-24): :func:`sample_infinity_omega` without AVN
-    and the DoG term, and with the older ``σ_max < 8`` NQVP gate. On flow NQVP
-    is off, so nano there is the band filter on Euler with no stabilizer.
-    Deterministic, one evaluation per step, 4-D latents only."""
-    return _sample_infinity_pyramid(model, x, sigmas, name="infinity_nano",
-                                    nqvp_sigma_min=_NQVP_SIGMA_MIN_NANO,
-                                    avn=False, dog=False, callback=callback)
 
 
 def sample_infinity_omega(
@@ -2631,12 +2378,10 @@ SAMPLERS: dict[str, Denoiser] = {
     "ipndm_v": sample_ipndm_v,
     "res_multistep": sample_res_multistep,
     "res_multistep_ancestral": sample_res_multistep_ancestral,
-    "lumen": sample_lumen,
     "gradient_estimation": sample_gradient_estimation,
     "stork2": sample_stork2,
     "infinity": sample_infinity,
     "infinity_realism": sample_infinity_realism,
-    "infinity_nano": sample_infinity_nano,
     "infinity_omega": sample_infinity_omega,
     "infinity_aether": sample_infinity_aether,
     "lms": sample_lms,
@@ -2646,11 +2391,9 @@ SAMPLERS: dict[str, Denoiser] = {
     "sa_solver_pece": sample_sa_solver_pece,
     "secant": sample_secant,
     "secant_anneal": sample_secant_anneal,
-    "dpmpp_2m_anneal": sample_dpmpp_2m_anneal,
     "exp_heun_2_x0": sample_exp_heun_2_x0,
     "uni_pc": partial(sample_uni_pc, variant="bh1"),
     "uni_pc_bh2": partial(sample_uni_pc, variant="bh2"),
-    "uni_pc_anneal": sample_uni_pc_anneal,
     "cogent": sample_cogent,
     "cogent3": sample_cogent3,
     "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),
