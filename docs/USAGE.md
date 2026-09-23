@@ -20,7 +20,7 @@ supported models, and performance numbers. For install and status, see the
   zero-terminal-SNR (ZTSNR) + CFG-rescale handled for you.
 - **LoRA & LoKr** adapters fuse into the weights at load time (kohya/A1111,
   PEFT, and Anima naming conventions).
-- **11 samplers, multiple schedulers**: Euler/Heun, the DPM++ family, ER-SDE,
+- **40+ samplers, multiple schedulers**: Euler/Heun, the DPM++ family, ER-SDE,
   SECANT, and more (full list under [Usage](#choosing-samplers--schedulers)). The
   DPM++, ER-SDE, and SECANT samplers are flow-aware, so they drive Anima too.
 - **Runs on modest GPUs**: sequential CPU offload + tiled VAE fit SDXL into
