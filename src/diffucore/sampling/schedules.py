@@ -36,6 +36,7 @@ __all__ = [
     "beta_schedule",
     "beta_mix_schedule",
     "pump_dual_schedule",
+    "pump_taper_schedule",
     "flow_table_schedule",
     "FlowSamplingView",
 ]
@@ -720,6 +721,85 @@ def pump_dual_schedule(schedule, steps: int, *, pump_end: float = 0.45,
     return append_zero(sigmas.to(device=device, dtype=dtype))
 
 
+def pump_taper_schedule(schedule, steps: int, *, pump_end: float = 0.45,
+                        taper: float = 0.25, tail_share: float = 0.13,
+                        top_sigma: float = 0.99,
+                        device: torch.device | str = "cpu",
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """``pump_dual`` for ~30 steps: the pumped band's steps start at the
+    50-step density where the image is being decided and widen toward the
+    pump's cutoff, and the refinement tail is cut to what detail needs.
+
+    Measured on ``cogent3_pump`` + ``pump_dual`` at 50 steps (AnimaFranken
+    v1.3, 1024×1536, CFG 4.5), which is the look this schedule is built to
+    reach in fewer steps:
+
+    * **The tail is cheap.** Replaying the 50-step run's first 42 steps and
+      swapping only the refinement tail, on the same scene: its 8 steps to
+      σ 0.058 vs 5 steps to 0.094 differ by RMSE ~5/255 (judged "almost
+      identical"), 4 steps by ~11, 3 by ~17; 2 steps visibly thickens and
+      darkens line art. ``tail_share`` 0.13 gives 4 tail steps at 30.
+    * **The band's work is top-heavy.** The per-λ change of the model's x0
+      prediction peaks where CFG switches on (σ ≈ 0.98), stays high through
+      σ ≈ 0.9 and falls roughly as ``e^(−0.87·λ)`` — about 10× slower by
+      σ 0.7–0.45. ``pump_dual`` spends its band uniformly in λ, so at 30
+      steps the top gets 0.19 λ per step against the 50-step run's 0.115.
+
+    So the band's λ-density is tilted by ``exp(−taper·λ)``: at the default
+    0.25 and 30 steps its first steps are 0.12 λ (the 50-step density) and
+    its last ones 0.35 λ. ``taper=0`` is a uniform band.
+
+    Layout, like ``pump_dual``: ``σ_max``, then ``steps − 1 − n_tail`` band
+    points from ``top_sigma`` (excluded — the first step is the family's
+    burn-in jump) down to exactly ``pump_end``, then ``n_tail =
+    max(1, round(tail_share·steps))`` λ-uniform points ending at ``flow``'s
+    terminus ``σ(t = 1/steps)``, then 0. When that terminus sits at or above
+    ``pump_end`` (few steps or a high ``shift``) there is no tail and the
+    tilted band runs to the terminus.
+
+    Pair with ``cogent3_pump_rate``: bigger band steps at the bottom mean
+    fewer pump injections there, and the rate-scaled pump keeps the injected
+    dose per λ at the 50-step value. With a step-fraction CFG interval the
+    tilt moves the CFG cutoff up in σ — at 30 steps an interval end of 0.75
+    stops CFG at σ ≈ 0.69, 0.8 at ≈ 0.54. Flow-only (``σ_max`` must be 1.0).
+    Returns ``steps + 1`` descending sigmas ending at 0."""
+    if steps < 3:
+        raise ValueError("steps must be >= 3")
+    if not 0.0 < tail_share < 1.0:
+        raise ValueError(f"tail_share must be in (0, 1); got {tail_share}")
+    if taper < 0:
+        raise ValueError(f"taper must be >= 0; got {taper}")
+    sigma_max = float(schedule.sigma_max)
+    sigma_min = float(schedule.sigma_min)
+    if not sigma_min < pump_end < sigma_max:
+        raise ValueError(f"pump_end {pump_end} must be in ({sigma_min}, {sigma_max})")
+    if not pump_end < top_sigma < sigma_max:
+        raise ValueError(f"top_sigma {top_sigma} must be in ({pump_end}, {sigma_max})")
+
+    def lam(sig: float) -> float:
+        return math.log(1.0 / sig - 1.0)  # flow half-logSNR log((1-σ)/σ)
+
+    def tilted(l0: float, l1: float, n: int) -> torch.Tensor:
+        # n points after l0, ending on l1, with λ-density ∝ exp(−taper·λ)
+        u = torch.arange(1, n + 1, dtype=torch.float64) / n
+        if taper == 0:
+            return l0 + (l1 - l0) * u
+        e0, e1 = math.exp(-taper * l0), math.exp(-taper * l1)
+        return -torch.log((1 - u) * e0 + u * e1) / taper
+
+    sigma_end = float(schedule.t_to_sigma(schedule.multiplier / steps))
+    lam_top, lam_fin, lam_knee = lam(top_sigma), lam(sigma_end), lam(pump_end)
+    if lam_fin - lam_knee <= 1e-6:
+        lamv = tilted(lam_top, lam_fin, steps - 1)      # one band, pumped throughout
+    else:
+        n_tail = min(max(1, round(tail_share * steps)), steps - 2)
+        n_band = steps - 1 - n_tail
+        tail = lam_knee + (lam_fin - lam_knee) * torch.arange(1, n_tail + 1, dtype=torch.float64) / n_tail
+        lamv = torch.cat([tilted(lam_top, lam_knee, n_band), tail])
+    sigmas = torch.cat([torch.tensor([sigma_max], dtype=torch.float64), (-lamv).sigmoid()])
+    return append_zero(sigmas.to(device=device, dtype=dtype))
+
+
 # Flow ("table"-style) schedulers addressable through a FlowSamplingView. ``flow``
 # / ``flow_dyn`` / ``oss`` are computed directly in the pipelines; everything else
 # routes here so the flow pipelines share one dispatch. ``ddim_uniform`` is absent
@@ -736,6 +816,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "beta": beta_schedule,
     "beta_mix": beta_mix_schedule,
     "pump_dual": pump_dual_schedule,
+    "pump_taper": pump_taper_schedule,
 }
 
 
@@ -752,14 +833,14 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
     evaluating them against a :class:`FlowSamplingView` of the rectified-flow
     model. Handles ``sgm_uniform``, ``simple``, ``normal``, ``infinity``,
     ``infinity_htds``, ``linear_quadratic``, ``smoothstep``, ``beta``,
-    ``beta_mix``, ``pump_dual`` and ``kl_optimal``.
+    ``beta_mix``, ``pump_dual``, ``pump_taper`` and ``kl_optimal``.
 
     ``alpha``/``beta`` tune the ``beta`` scheduler's Beta(α, β) endpoint
     density; ``bm_*`` tune the ``beta_mix`` two-Beta mixture;
     ``threshold_noise`` tunes ``linear_quadratic``'s linear/quadratic knee;
     ``pump_end``/``pump_share`` tune ``pump_dual``'s band join and the pumped
-    band's share of steps. All are ignored by the schedulers that don't take
-    them."""
+    band's share of steps (``pump_end`` also sets ``pump_taper``'s knee). All
+    are ignored by the schedulers that don't take them."""
     view = FlowSamplingView(shift, device=device, dtype=dtype)
     if scheduler == "kl_optimal":
         return kl_optimal_schedule(steps, float(view.sigma_min), float(view.sigma_max),
@@ -778,4 +859,6 @@ def flow_table_schedule(scheduler: str, shift: float, steps: int, *,
         extra = {"threshold_noise": threshold_noise}
     elif scheduler == "pump_dual":
         extra = {"pump_end": pump_end, "pump_share": pump_share}
+    elif scheduler == "pump_taper":
+        extra = {"pump_end": pump_end}
     return fn(view, steps, device=device, dtype=dtype, **extra)

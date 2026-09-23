@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -1286,6 +1288,50 @@ def test_cogent3_pump_registered_in_sampler_table():
     fn = K.get_sampler("cogent3_pump")
     assert fn.func is K.sample_cogent3
     assert fn.keywords["pump_strength"] > 0
+
+
+def _pump_increment(sigmas, **kw):
+    """The pump's contribution to one run: with eta_max=0 the pump is the only
+    noise drawn, so (pumped − unpumped) under one generator seed isolates it."""
+    target = torch.full((1, 4, 8, 8), 0.1)
+    x_init = torch.randn(1, 4, 8, 8, generator=torch.Generator().manual_seed(5))
+    run = lambda **k: K.sample_cogent3(
+        const_denoiser(target), x_init.clone(), sigmas, model_type="flow", shift=1.0,
+        eta_max=0.0, pump_end=0.0, generator=torch.Generator().manual_seed(6), **k)
+    return run(pump_strength=0.08, **kw) - run()
+
+
+def test_pump_rate_law_scales_injection_by_step_size():
+    # eta_max=0 ⇒ V(h) = h, so each injection scales by sqrt(h / h_ref). Both
+    # steps pump (no trailing 0) and share one λ-step h, so the whole pump
+    # contribution scales by the same factor.
+    h = 0.2
+    lam0 = math.log(0.1 / 0.9)
+    sigmas = torch.tensor([1.0 / (1.0 + math.exp(lam0 + k * h)) for k in range(3)])
+    fixed = _pump_increment(sigmas)
+    assert fixed.abs().max() > 1e-3                          # the pump fired
+    same = _pump_increment(sigmas, pump_h_ref=h)
+    quarter = _pump_increment(sigmas, pump_h_ref=h / 4)
+    assert torch.allclose(same, fixed, rtol=1e-4, atol=1e-7)          # h == h_ref ⇒ plain amplitude
+    assert torch.allclose(quarter, 2 * fixed, rtol=1e-4, atol=1e-7)   # h = 4·h_ref ⇒ 2×
+
+
+def test_ou_step_var_limits():
+    assert K._ou_step_var(0.3, 0.0) == 0.3                   # Brownian when eta → 0
+    assert abs(K._ou_step_var(0.3, 1e-10) - 0.3) < 1e-9
+    assert abs(K._ou_step_var(50.0, 1.0) - 0.5) < 1e-12      # saturates at 1/(2·eta)
+    v = [K._ou_step_var(h, 0.9) for h in (0.1, 0.2, 0.4)]
+    assert v[0] < v[1] < v[2] and v[2] < 2 * v[1]            # monotone, sub-linear
+
+
+def test_cogent3_pump_rate_registered_in_sampler_table():
+    fn = K.get_sampler("cogent3_pump_rate")
+    assert fn.func is K.sample_cogent3
+    assert fn.keywords["pump_strength"] == K.get_sampler("cogent3_pump").keywords["pump_strength"]
+    # calibrated to pump_dual@50's band step, so the two agree there
+    sig = S.flow_table_schedule("pump_dual", 3.0, 50)
+    lam = [math.log((1 - float(v)) / float(v)) for v in sig[1:30]]
+    assert abs((lam[1] - lam[0]) - fn.keywords["pump_h_ref"]) < 1e-5
 
 
 # ── sampler allowlist consistency ─────────────────────────────────────

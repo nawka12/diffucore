@@ -52,13 +52,13 @@ _ANIMA_SAMPLERS = {
     "sa_solver", "sa_solver_pece",
     "secant", "secant_anneal",
     "dpmpp_2m_anneal", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "uni_pc_anneal",
-    "cogent", "cogent3", "cogent3_pump",
+    "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm", "dpmpp_2m_anneal",
-    "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump",
+    "uni_pc_anneal", "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
     "sa_solver", "sa_solver_pece",
 }
 # "ddim_uniform" is intentionally omitted: it starts below σ_max, which clashes
@@ -66,7 +66,7 @@ _FLOW_AWARE_SAMPLERS = {
 _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
     "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
-    "smoothstep", "beta", "beta_mix", "pump_dual",
+    "smoothstep", "beta", "beta_mix", "pump_dual", "pump_taper",
 )
 
 if TYPE_CHECKING:
@@ -370,9 +370,10 @@ def anima_text_to_image(
                 # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
-                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
+                if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
+                               "cogent3_pump_rate"):
                     kwargs["eta_max"] = eta_max
-                if sampler in ("cogent", "cogent3", "cogent3_pump"):
+                if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
                     kwargs["gate_reduce"] = gate_reduce
                 # uni_pc_anneal intentionally omitted: even with its order-ramp the
                 # shared 1.0 panel default over-softens it (deterministic stays
@@ -577,9 +578,10 @@ def anima_img2img(
             # model_type/shift, so it is not in _FLOW_AWARE_SAMPLERS.
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
-            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump"):
+            if sampler in ("euler_ancestral_anneal", "secant_anneal", "dpmpp_2m_anneal", "cogent", "cogent3", "cogent3_pump",
+                           "cogent3_pump_rate"):
                 kwargs["eta_max"] = eta_max
-            if sampler in ("cogent", "cogent3", "cogent3_pump"):
+            if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
                 kwargs["gate_reduce"] = gate_reduce
             # uni_pc_anneal intentionally omitted: see the t2i path — it ships a
             # low baked-in eta_max (0.2) instead of the shared 1.0 panel default.

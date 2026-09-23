@@ -1503,6 +1503,23 @@ def _cogent3_curvature_gate(second_diff: torch.Tensor,
     return psi.view(*psi.shape, *([1] * (second_diff.ndim - psi.ndim)))
 
 
+# The pumped band's λ-step of ``pump_dual`` at 50 steps (pump_share 0.85 of
+# σ 0.99 → 0.45). The fixed per-step pump (0.08) was judged there, so
+# ``cogent3_pump_rate`` scales to it: a step of this size gets exactly 0.08.
+PUMP_H_REF = (math.log(0.55 / 0.45) - math.log(0.01 / 0.99)) / (0.85 * 49)
+
+
+def _ou_step_var(h: float, eta: float) -> float:
+    """Variance an Ornstein-Uhlenbeck process with unit diffusion and mean
+    reversion ``eta`` accumulates over a λ-step ``h`` from zero:
+    ``(1 − e^(−2·eta·h)) / (2·eta)``, which tends to ``h`` (plain Brownian) as
+    ``eta → 0``. This is the pump's step-size law: excess noise injected into
+    the latent decays at the ancestral rate, so a per-step injection with this
+    variance leaves the same excess at every step count."""
+    z = 2.0 * eta * h
+    return h if z < 1e-8 else -math.expm1(-z) / (2.0 * eta)
+
+
 def sample_cogent3(
     model: Denoiser,
     x: torch.Tensor,
@@ -1513,6 +1530,7 @@ def sample_cogent3(
     pump_strength: float = 0.0,
     pump_end: float = 0.45,
     pump_span: float = 0.25,
+    pump_h_ref: Optional[float] = None,
     generator: Optional[torch.Generator] = None,
     callback: Callback = None,
     model_type: str = "ve",
@@ -1641,6 +1659,20 @@ def sample_cogent3(
     appear to occupy different scales rather than fight, which is why they
     compose — but that is a measurement on toys, not a proof.
 
+    **Step-size law** (``pump_h_ref``; registered as ``cogent3_pump_rate``).
+    The pump adds a fixed amplitude *per step*, so its dose grows with the step
+    count: the excess noise a model call sees settles where each injection
+    balances the ancestral decay, ``r² = p²/(1 − e^(−2·eta·h))``, and ``pump_dual``
+    at 30 steps delivers about 0.8× the 50-step run's. With ``pump_h_ref`` set,
+    each injection is scaled by ``sqrt(V(h)/V(pump_h_ref))`` with
+    ``V(h) = (1 − e^(−2·eta·h))/(2·eta)`` (:func:`_ou_step_var`; ``V → h`` as
+    ``eta → 0``), which makes that excess the same at every step size — the
+    pump becomes a diffusion term integrated exactly like the ancestral noise.
+    A step of exactly ``pump_h_ref`` gets the plain per-step amplitude; the
+    burn-in jump from σ_max (``h`` ≈ 9) gets ~2.2× it, the steady-state value
+    the fixed pump only reaches a few steps later. ``None`` (default) is the
+    fixed per-step pump, bit-for-bit.
+
     Defaults pump at full strength above ``sigma_frac`` 0.70, ramp to zero at
     0.45, off below — roughly 17 pumped / 5 ramping / 9 clean steps on a
     30-step ``smoothstep`` flow schedule. Raise ``pump_strength`` or lower
@@ -1768,6 +1800,8 @@ def sample_cogent3(
                     ramp = 0.0
                 if ramp > 0:
                     nu = pump_strength * float(sigma_next) * ramp
+                    if pump_h_ref is not None:
+                        nu *= math.sqrt(_ou_step_var(float(h), eta) / _ou_step_var(pump_h_ref, eta))
                     # Read off the denoised prediction, not the velocity: at low
                     # sigma the velocity is mostly residual noise and its
                     # coherence map says nothing about committed structure.
@@ -3523,6 +3557,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "cogent": sample_cogent,
     "cogent3": sample_cogent3,
     "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),
+    "cogent3_pump_rate": partial(sample_cogent3, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
 }
 
 

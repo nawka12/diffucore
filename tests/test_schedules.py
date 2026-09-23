@@ -358,7 +358,7 @@ def test_flow_table_schedule_dispatches_all_names():
     # flow table scheduler — see schedules._FLOW_TABLE_SCHEDULERS.
     for name in ("sgm_uniform", "simple", "normal", "infinity", "infinity_htds",
                  "linear_quadratic", "smoothstep", "beta", "beta_mix",
-                 "pump_dual", "kl_optimal"):
+                 "pump_dual", "pump_taper", "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name
@@ -617,3 +617,80 @@ def test_pump_dual_invalid_args_raise():
         S.pump_dual_schedule(view, 20, pump_end=0.0)
     with pytest.raises(ValueError):
         S.pump_dual_schedule(view, 20, pump_end=1.0)
+
+
+# ── pump_taper ────────────────────────────────────────────────────────
+
+def _lam_list(sig):
+    return [math.log((1.0 - float(v)) / float(v)) for v in sig]
+
+
+def test_pump_taper_endpoints_descent_and_terminus():
+    view = _flow_view()
+    for steps in (8, 16, 24, 30, 50, 64):
+        sig = S.pump_taper_schedule(view, steps)
+        assert sig.shape[0] == steps + 1
+        assert sig[-1].item() == 0.0
+        assert torch.all(sig[:-1] > sig[1:]), steps          # strictly descending
+        assert abs(sig[0].item() - 1.0) < 1e-6               # pure-noise init
+        # terminates where `flow` (and pump_dual) do: σ(t = 1/steps)
+        ref = S.flow_matching_schedule(steps, shift=3.0)
+        assert abs(sig[-2].item() - ref[-2].item()) < 2e-6, steps
+
+
+def test_pump_taper_30_step_layout():
+    # The measured design point: burn-in, 25 band points ending exactly on the
+    # 0.45 cutoff, a 4-step tail. The band opens at the 50-step pump_dual density
+    # (~0.115 λ) and widens toward the knee; the tail is λ-uniform.
+    view = _flow_view()
+    sig = S.pump_taper_schedule(view, 30)
+    band, tail = sig[1:26], sig[26:30]
+    assert abs(float(band[-1]) - 0.45) < 1e-6
+    assert all(float(v) < 0.45 for v in tail)
+    lb = _lam_list(torch.cat([torch.tensor([0.99]), band]))
+    h = [lb[i + 1] - lb[i] for i in range(len(lb) - 1)]
+    assert all(h[i] < h[i + 1] for i in range(len(h) - 1))   # tapering
+    assert 0.10 < h[0] < 0.13 and 0.30 < h[-1] < 0.40
+    lt = _lam_list(sig[25:30])
+    ht = [lt[i + 1] - lt[i] for i in range(4)]
+    assert max(ht) - min(ht) < 1e-4
+
+
+def test_pump_taper_zero_taper_is_uniform_band():
+    view = _flow_view()
+    sig = S.pump_taper_schedule(view, 30, taper=0.0)
+    lb = _lam_list(torch.cat([torch.tensor([0.99]), sig[1:26]]))
+    h = [lb[i + 1] - lb[i] for i in range(len(lb) - 1)]
+    assert max(h) - min(h) < 1e-4                            # float32 output
+
+
+def test_pump_taper_tail_count_follows_share():
+    view = _flow_view()
+    for steps, want in ((12, 2), (20, 3), (30, 4), (50, 6)):
+        sig = S.pump_taper_schedule(view, steps)
+        assert sum(1 for v in sig[1:-1] if float(v) < 0.45 - 1e-6) == want, steps
+
+
+def test_pump_taper_degrades_to_one_band_without_room():
+    # When flow's terminus sits at or above the cutoff there is no refinement
+    # band; the whole run is the tapered band, pumped end to end.
+    view = S.FlowSamplingView(9.0)
+    sig = S.pump_taper_schedule(view, 8)
+    assert torch.all(sig[:-1] > sig[1:])
+    ref = S.flow_matching_schedule(8, shift=9.0)
+    assert float(ref[-2]) >= 0.45
+    assert abs(sig[-2].item() - ref[-2].item()) < 2e-6
+
+
+def test_pump_taper_invalid_args_raise():
+    import pytest
+
+    view = _flow_view()
+    with pytest.raises(ValueError):
+        S.pump_taper_schedule(view, 2)
+    with pytest.raises(ValueError):
+        S.pump_taper_schedule(view, 20, tail_share=0.0)
+    with pytest.raises(ValueError):
+        S.pump_taper_schedule(view, 20, taper=-0.1)
+    with pytest.raises(ValueError):
+        S.pump_taper_schedule(view, 20, pump_end=1.0)
