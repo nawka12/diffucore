@@ -59,6 +59,7 @@ class Inpaint(_Pipeline):
         teacache_forecast: str = "hermite",
         teacache_rule: str = "drift",
         teacache_uncond_scale: float = 1.0,
+        teacache_sigma_floor: float = 0.0,
         deepcache_interval: int = 1,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
@@ -90,6 +91,7 @@ class Inpaint(_Pipeline):
                 teacache_forecast=teacache_forecast,
                 teacache_rule=teacache_rule,
                 teacache_uncond_scale=teacache_uncond_scale,
+                teacache_sigma_floor=teacache_sigma_floor,
                 progress_callback=progress_callback, preview_callback=preview_callback,
                 return_info=return_info,
             )

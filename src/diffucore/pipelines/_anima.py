@@ -88,7 +88,7 @@ _EASY_WARMUP = 3
 
 def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: float,
                    forecast: str = "hermite", rule: str = "drift",
-                   uncond_scale: float = 1.0):
+                   uncond_scale: float = 1.0, sigma_floor: float = 0.0):
     """Build the per-CFG-branch TeaCache streams, or ``(None, None)`` when off;
     no uncond stream without CFG.
 
@@ -97,12 +97,14 @@ def _make_teacache(thresh: float, coeffs: "Sequence[float] | None", cfg_scale: f
     ``"easy"`` (EasyCache; ``thresh`` is its τ and ``coeffs`` are dropped).
     ``uncond_scale`` > 1 loosens the uncond stream's threshold. That is a knob
     to measure, not a free win: at CFG s an uncond error enters the guided
-    velocity with weight |1 − s| (3.5 at s = 4.5). Applies under both rules."""
+    velocity with weight |1 − s| (3.5 at s = 4.5). Applies under both rules.
+    ``sigma_floor`` > 0 makes both streams compute every step below that σ."""
     if thresh <= 0:
         return None, None
     if rule not in ("drift", "easy"):
         raise ValueError(f"teacache_rule must be 'drift' or 'easy'; got {rule!r}")
     kwargs: dict = {} if coeffs is None or rule == "easy" else {"coefficients": coeffs}
+    kwargs["sigma_floor"] = sigma_floor
     if rule == "easy":
         kwargs.update(rule="easy", warmup=_EASY_WARMUP)
     if forecast == "hermite":
@@ -162,6 +164,7 @@ def anima_text_to_image(
     teacache_forecast: str = "hermite",
     teacache_rule: str = "drift",
     teacache_uncond_scale: float = 1.0,
+    teacache_sigma_floor: float = 0.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -177,8 +180,8 @@ def anima_text_to_image(
     ``oss_sigmas``) or any flow table scheduler.
 
     ``teacache_thresh`` > 0 enables TeaCache (arXiv:2411.19108); see
-    :func:`_make_teacache` for ``teacache_forecast``, ``teacache_rule`` and
-    ``teacache_uncond_scale``.
+    :func:`_make_teacache` for ``teacache_forecast``, ``teacache_rule``,
+    ``teacache_uncond_scale`` and ``teacache_sigma_floor``.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -250,7 +253,7 @@ def anima_text_to_image(
         # One TeaCache stream per CFG branch; their modulated inputs coincide.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
-                                            teacache_uncond_scale)
+                                            teacache_uncond_scale, teacache_sigma_floor)
         # staged() outside inference_mode: weights moved under inference mode
         # become inference tensors that break later in-place LoRA.
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
@@ -373,6 +376,7 @@ def anima_img2img(
     teacache_forecast: str = "hermite",
     teacache_rule: str = "drift",
     teacache_uncond_scale: float = 1.0,
+    teacache_sigma_floor: float = 0.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -465,7 +469,7 @@ def anima_img2img(
         # One TeaCache stream per CFG branch.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
-                                            teacache_uncond_scale)
+                                            teacache_uncond_scale, teacache_sigma_floor)
         # staged() outside inference_mode (see t2i).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             # Adapter once per generation, cached across repeats (shared with t2i).

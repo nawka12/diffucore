@@ -450,6 +450,9 @@ class TeaCache:
       TeaCache). ``basis="taylor"`` (TaylorSeer, arXiv:2503.06923) uses
       ``k^i``; ``"hermite"`` (HiCache, arXiv:2508.16984) uses damped Hermite
       ``σ^i · H_i(σk)``, which at ``sigma = 2**-0.5`` and order 1 equals taylor.
+    * **Floor.** Below noise level ``sigma_floor`` every step computes, under
+      either rule. Late steps drift least, so an unguarded accumulator skips
+      exactly the calls that clear the last injected noise.
 
     One instance per stream: CFG's cond and uncond passes have near-identical
     modulated inputs, so a shared accumulator would read zero drift.
@@ -460,7 +463,7 @@ class TeaCache:
     def __init__(self, rel_l1_thresh: float, coefficients: Sequence[float] = (1.0, 0.0),
                  *, record: bool = False, max_order: int = 1,
                  basis: str = "taylor", sigma: float = 0.5,
-                 rule: str = "drift", warmup: int = 3):
+                 rule: str = "drift", warmup: int = 3, sigma_floor: float = 0.0):
         if basis not in ("taylor", "hermite"):
             raise ValueError(f"basis must be 'taylor' or 'hermite'; got {basis!r}")
         if rule not in ("drift", "easy"):
@@ -473,6 +476,7 @@ class TeaCache:
         self.max_order = int(max_order)
         self.basis = basis
         self.sigma = float(sigma)
+        self.sigma_floor = float(sigma_floor)
         self.prev_modulated: Optional[torch.Tensor] = None
         self.accumulated = 0.0
         self.calls = 0   # forwards seen
@@ -500,10 +504,14 @@ class TeaCache:
             out = out * x + c
         return out
 
-    def should_compute(self, modulated: torch.Tensor) -> bool:
+    def _below_floor(self, sigma: Optional[float]) -> bool:
+        return sigma is not None and sigma < self.sigma_floor
+
+    def should_compute(self, modulated: torch.Tensor, sigma: Optional[float] = None) -> bool:
         """Decide whether this step runs the blocks, folding ``modulated`` into
-        the accumulator; the first call always computes. ``record`` mode computes
-        every step and logs the raw rel-L1 for calibration.
+        the accumulator; the first call and any call below ``sigma_floor``
+        always compute. ``record`` mode computes every step and logs the raw
+        rel-L1 for calibration.
         """
         self.calls += 1
         if self.prev_modulated is None:
@@ -518,6 +526,10 @@ class TeaCache:
             self.rel_history.append(rel)
             self.last_computed = True
             return True
+        if self._below_floor(sigma):
+            self.accumulated = 0.0
+            self.last_computed = True
+            return True
         self.accumulated += self._rescale(rel)
         if self.accumulated < self.rel_l1_thresh:
             self.skips += 1
@@ -527,9 +539,10 @@ class TeaCache:
         self.last_computed = True
         return True
 
-    def should_compute_easy(self, x: torch.Tensor) -> bool:
+    def should_compute_easy(self, x: torch.Tensor, sigma: Optional[float] = None) -> bool:
         """EasyCache decision on the padded ``(B, C, T, H, W)`` model input. The
-        first ``warmup`` calls always compute (``k`` needs two outputs).
+        first ``warmup`` calls (``k`` needs two outputs) and any call below
+        ``sigma_floor`` always compute.
         """
         self.calls += 1
         x = x.detach().to(torch.float32, copy=True)
@@ -542,8 +555,9 @@ class TeaCache:
         dx = (x - self.prev_x).abs().mean().item()   # mean-abs, as in the reference
         self.prev_x = x
         self.pending_dx = dx
-        if self.calls <= self.warmup or self.k is None or self.prev_out is None:
-            decision = True                          # warm-up / rate not measurable
+        if (self.calls <= self.warmup or self.k is None or self.prev_out is None
+                or self._below_floor(sigma)):
+            decision = True                          # warm-up / rate not measurable / floor
         else:
             v_norm = self.prev_out.abs().mean().item()
             self.accumulated += self.k * dx / max(v_norm, 1e-8)
@@ -680,14 +694,18 @@ class CosmosDiT(nn.Module):
 
         # TeaCache: on a low-drift step reuse the cached block residual. The
         # timestep embedding and final layer always run. Only "drift" pays for
-        # the block-0 modulation probe.
+        # the block-0 modulation probe. σ is read (a host sync) only when a floor
+        # is set.
+        sigma = (float(timesteps.flatten()[0])
+                 if teacache is not None and teacache.sigma_floor > 0 else None)
         if teacache is None:
             compute = True
         elif teacache.rule == "easy":
-            compute = teacache.should_compute_easy(x)
+            compute = teacache.should_compute_easy(x, sigma)
         else:
             compute = teacache.should_compute(
-                self.blocks[0].modulated_self_attn_input(x_B_T_H_W_D, emb_B_T_D, adaln_lora_B_T_3D)
+                self.blocks[0].modulated_self_attn_input(x_B_T_H_W_D, emb_B_T_D, adaln_lora_B_T_3D),
+                sigma,
             )
 
         if not compute:

@@ -406,3 +406,50 @@ def test_drift_rule_unchanged():
     assert old.skips == new.skips > 0        # the scenario must actually skip
     assert old.accumulated == new.accumulated
     assert new.prev_x is None and new.k is None   # the easy state stays untouched
+
+
+# --------------------------------------------------------------------------- #
+# sigma floor
+# --------------------------------------------------------------------------- #
+
+def test_sigma_floor_forces_compute_below_it():
+    """An identical input would skip under a huge threshold; below the floor the
+    blocks run anyway and match the plain forward exactly, and the accumulator
+    resets. Above the floor the rule is untouched."""
+    dit, cfg = _tiny()
+    torch.manual_seed(14)
+    x = torch.randn(1, cfg.in_channels, 1, 8, 8)
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels)
+    hi, lo = torch.tensor([0.7]), torch.tensor([0.3])
+    tc = TeaCache(rel_l1_thresh=1e9, sigma_floor=0.5)
+    with torch.no_grad():
+        dit(x, hi, ctx, teacache=tc)                  # first call computes
+        dit(x, hi, ctx, teacache=tc)                  # above the floor -> skips
+        assert tc.skips == 1
+        assert torch.equal(dit(x, lo, ctx), dit(x, lo, ctx, teacache=tc))
+    assert (tc.calls, tc.skips, tc.accumulated) == (3, 1, 0.0)
+
+
+def test_sigma_floor_under_easy_rule():
+    """The floor overrides the EasyCache decision too, without disturbing its
+    rate bookkeeping."""
+    tc = TeaCache(rel_l1_thresh=1e9, rule="easy", warmup=1, sigma_floor=0.5)
+    x = torch.zeros(4)
+    tc.should_compute_easy(x, 0.9)
+    tc.record_output(torch.zeros(4))
+    x = x + 1.0
+    tc.should_compute_easy(x, 0.8)                     # k unknown -> computes
+    tc.record_output(torch.full((4,), 2.0))
+    assert tc.should_compute_easy(x + 0.1, 0.7) is False
+    assert tc.should_compute_easy(x + 0.2, 0.4) is True
+    assert tc.pending_dx > 0 and tc.accumulated == 0.0
+
+
+def test_make_teacache_sigma_floor():
+    """The floor reaches both streams; the default leaves it off."""
+    from diffucore.pipelines._anima import _make_teacache
+
+    cond, uncond = _make_teacache(0.2, None, 4.0, "hermite", "drift")
+    assert cond.sigma_floor == uncond.sigma_floor == 0.0
+    cond, uncond = _make_teacache(0.2, None, 4.0, "hermite", "easy", 1.0, 0.45)
+    assert cond.sigma_floor == uncond.sigma_floor == 0.45
