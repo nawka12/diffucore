@@ -74,12 +74,14 @@ class AttnBlock(nn.Module):
         h = self.norm(x)
         q, k, v = self.q(h), self.k(h), self.v(h)
         b, c, height, width = q.shape
-        # [B, C, H, W] -> [B, HW, C] so each spatial location is a token.
-        q = q.reshape(b, c, height * width).transpose(1, 2)
-        k = k.reshape(b, c, height * width).transpose(1, 2)
-        v = v.reshape(b, c, height * width).transpose(1, 2)
+        # [B, C, H, W] -> [B, 1, HW, C] so each spatial location is a token.
+        # 4-D and contiguous so SDPA can take the memory-efficient kernel;
+        # otherwise it falls back to math and its full fp32 (HW)² matrix.
+        q = q.reshape(b, c, height * width).transpose(1, 2).unsqueeze(1).contiguous()
+        k = k.reshape(b, c, height * width).transpose(1, 2).unsqueeze(1).contiguous()
+        v = v.reshape(b, c, height * width).transpose(1, 2).unsqueeze(1).contiguous()
         h = F.scaled_dot_product_attention(q, k, v)  # scale = 1/sqrt(c)
-        h = h.transpose(1, 2).reshape(b, c, height, width)
+        h = h.squeeze(1).transpose(1, 2).reshape(b, c, height, width)
         return x + self.proj_out(h)
 
 

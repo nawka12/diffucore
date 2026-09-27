@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 
 from ..models.anima_dit import TeaCache
-from ..runtime import perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
+from ..runtime import fp32_accumulation, perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
 from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
     append_zero,
@@ -66,12 +66,12 @@ if TYPE_CHECKING:
 
 def _qwen_encode(qwen3, ids, mask, device, dtype):
     """Run the Qwen text encoder and return its last hidden state in ``dtype``,
-    under ``no_grad``: the Qwen3.5 encoder's unrolled SSM scan would otherwise
-    retain enough per-step state to OOM by itself."""
+    under ``no_grad`` (the Qwen3.5 encoder's unrolled SSM scan would otherwise
+    retain enough per-step state to OOM by itself) and fp32 accumulation."""
     ids = ids.to(device)
     if mask is not None:
         mask = mask.to(device)
-    with torch.no_grad():
+    with torch.no_grad(), fp32_accumulation():
         out = qwen3(ids, attention_mask=None)   # causal-only; padding handles the mask
     return out.to(dtype)
 
@@ -260,8 +260,9 @@ def anima_text_to_image(
             # Run the LLM-Adapter once per generation (both contexts come off the
             # cache on a hit) and feed the DiT the prepared context.
             if cached_ctx is None:
-                cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
-                uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+                with fp32_accumulation():
+                    cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+                    uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
                 if cache is not None:
                     cache.put(cache_key, {"cond_ctx": cond_ctx.detach().to("cpu"),
                                           "uncond_ctx": uncond_ctx.detach().to("cpu")})
@@ -474,8 +475,9 @@ def anima_img2img(
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             # Adapter once per generation, cached across repeats (shared with t2i).
             if cached_ctx is None:
-                cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
-                uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+                with fp32_accumulation():
+                    cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+                    uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
                 if cache is not None:
                     cache.put(cache_key, {"cond_ctx": cond_ctx.detach().to("cpu"),
                                           "uncond_ctx": uncond_ctx.detach().to("cpu")})
@@ -585,8 +587,9 @@ def anima_calibrate_oss(
         # staged() outside inference_mode (see t2i).
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             # Adapter once per calibration.
-            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
-            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+            with fp32_accumulation():
+                cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+                uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
 
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
@@ -660,8 +663,9 @@ def anima_calibrate_teacache(
         backbone = model.backbone
         with staged([backbone], device, policy.offload_unet), torch.inference_mode():
             # Adapter once per calibration.
-            cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
-            uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
+            with fp32_accumulation():
+                cond_ctx = backbone.preprocess_text_embeds(cond_hidden, cond_t5)
+                uncond_ctx = backbone.preprocess_text_embeds(uncond_hidden, uncond_t5)
             total = len(sigmas) - 1
             with _step_progress(total, progress_callback) as on_step:
                 for i in range(total):

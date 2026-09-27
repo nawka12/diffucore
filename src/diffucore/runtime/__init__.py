@@ -176,6 +176,23 @@ def perf_context(policy: "DevicePolicy"):
 
 
 @contextmanager
+def fp32_accumulation():
+    """Suspend ``fp16_accumulation`` for the duration. For once-per-prompt
+    stages (text encoders, the Anima LLM-Adapter): the speedup there is
+    negligible, but the error lands in the conditioning every step reads.
+    """
+    matmul = torch.backends.cuda.matmul
+    if not getattr(matmul, "allow_fp16_accumulation", False):
+        yield
+        return
+    matmul.allow_fp16_accumulation = False
+    try:
+        yield
+    finally:
+        matmul.allow_fp16_accumulation = True
+
+
+@contextmanager
 def staged(modules, device, offload):
     """Bring ``modules`` onto ``device`` for the duration when ``offload`` is on,
     parking them on CPU afterward. No-op otherwise."""
@@ -382,13 +399,16 @@ def _tile_starts(size: int, tile: int, step: int) -> list[int]:
     return starts
 
 
-# Per-VAE decode activation cost in bytes per output pixel, with headroom,
-# calibrated on an RTX 2060: AutoencoderKL ~3.5 GB at 1024² (3.3 KB/px raw,
-# 6 KB/px set); QwenImageVAE ~2.25 GB at 1024×1536 (1.5 KB/px raw, 3.5 KB/px
-# set). Unknown classes use the conservative SDXL value.
+# Per-VAE decode activation cost in bytes per output pixel, by weight dtype:
+# the peak measured on an RTX 2060 (flat from 1024² to 1536²) with ~1.3x
+# headroom. Raw: AutoencoderKL 3072 fp32 / 2183 fp16, QwenImageVAE 2347 /
+# 1933. fp16 saves only 18-29%, not half. Unknown classes use a conservative
+# default.
 _VAE_BYTES_PER_PX = {
-    "AutoencoderKL": 6 * 1024,
-    "QwenImageVAE": 3584,
+    ("AutoencoderKL", torch.float32): 4096,
+    ("AutoencoderKL", torch.float16): 2816,
+    ("QwenImageVAE", torch.float32): 3072,
+    ("QwenImageVAE", torch.float16): 2560,
 }
 _VAE_BYTES_PER_PX_DEFAULT = 6 * 1024
 _DECODE_FREE_VRAM_MARGIN = 0.85
@@ -418,11 +438,9 @@ def can_decode_untiled(
         free_bytes, _ = torch.cuda.mem_get_info(index)
     _, _, h_lat, w_lat = latent_shape
     px = (w_lat * 8) * (h_lat * 8)
-    bytes_per_px = _VAE_BYTES_PER_PX.get(type(vae).__name__, _VAE_BYTES_PER_PX_DEFAULT)
-    # The constants were calibrated on fp32 decodes; fp16 halves them.
     param = next(vae.parameters(), None)
-    if param is not None and param.dtype == torch.float16:
-        bytes_per_px //= 2
+    dtype = param.dtype if param is not None else torch.float32
+    bytes_per_px = _VAE_BYTES_PER_PX.get((type(vae).__name__, dtype), _VAE_BYTES_PER_PX_DEFAULT)
     need = px * bytes_per_px
     budget = free_bytes * _DECODE_FREE_VRAM_MARGIN
     fits = need < budget
@@ -449,13 +467,20 @@ def vae_fallback_to_fp32(vae: torch.nn.Module, policy: "DevicePolicy") -> None:
 
 
 def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
-    """Decode ``latent`` (already in the VAE's dtype), tiled when forced or when
-    free VRAM is short, retrying in fp32 on a non-finite fp16 result. Returns
-    ``(image, "tiled" | "untiled")``. Call with the VAE staged on the device.
+    """Decode ``latent`` (already in the VAE's dtype), tiled when forced, when
+    free VRAM is short, or when an untiled attempt runs out of memory; retried
+    in fp32 on a non-finite fp16 result. Returns ``(image, "tiled" |
+    "untiled")``. Call with the VAE staged on the device.
     """
     def _decode(z):
-        tile = policy.vae_tile or not can_decode_untiled(vae, z.shape, policy.device)
-        return (tiled_vae_decode(vae, z) if tile else vae.decode(z)), tile
+        if not policy.vae_tile and can_decode_untiled(vae, z.shape, policy.device):
+            try:
+                return vae.decode(z), False
+            except torch.OutOfMemoryError:
+                print("[vae-decode] untiled decode ran out of memory; retrying tiled", flush=True)
+            # Outside the handler, so the failed attempt's tensors are released.
+            torch.cuda.empty_cache()
+        return tiled_vae_decode(vae, z), True
 
     image, tile = _decode(latent)
     if latent.dtype == torch.float16 and not torch.isfinite(image).all():
@@ -464,4 +489,4 @@ def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
     return image, ("tiled" if tile else "untiled")
 
 
-__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "fp32_accumulation", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]

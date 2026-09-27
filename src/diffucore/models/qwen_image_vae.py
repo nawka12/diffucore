@@ -142,9 +142,12 @@ class AttentionBlock(nn.Module):
         x = self.norm(x)
         q, k, v = self.to_qkv(x).chunk(3, dim=1)
         # Single-head attention: treat (H·W) as the sequence and C as head_dim.
-        q = rearrange(q, "n c h w -> n 1 (h w) c")
-        k = rearrange(k, "n c h w -> n 1 (h w) c")
-        v = rearrange(v, "n c h w -> n 1 (h w) c")
+        # Contiguous so SDPA can take the memory-efficient kernel; a strided
+        # last dim falls back to math, which materializes the full fp32
+        # (H·W)² matrix (5.2 GiB at 1024x1536).
+        q = rearrange(q, "n c h w -> n 1 (h w) c").contiguous()
+        k = rearrange(k, "n c h w -> n 1 (h w) c").contiguous()
+        v = rearrange(v, "n c h w -> n 1 (h w) c").contiguous()
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "n 1 (h w) c -> n c h w", h=h, w=w)
         x = self.proj(x)

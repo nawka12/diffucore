@@ -181,6 +181,41 @@ def test_cond_cache_skips_reencode_and_adapter(pipe, monkeypatch):
         pipe.model.cond_cache = None
 
 
+def test_fp16_accumulation_spares_the_conditioning(pipe, monkeypatch):
+    """Under ``fp16_accumulation`` the text encoder and LLM-Adapter run with it
+    suspended (once per prompt, so it buys nothing there), while every DiT
+    forward keeps it."""
+    matmul = torch.backends.cuda.matmul
+    if not hasattr(matmul, "allow_fp16_accumulation"):
+        pytest.skip("torch < 2.7 has no fp16 accumulation flag")
+    from diffucore.models.anima_dit import AnimaDiT, CosmosDiT
+
+    seen = {"encoder": [], "adapter": [], "dit": []}
+
+    def spy(kind, orig):
+        def wrapped(self, *a, **k):
+            seen[kind].append(matmul.allow_fp16_accumulation)
+            return orig(self, *a, **k)
+        return wrapped
+
+    encoder_cls = type(pipe.model.text_encoder)
+    monkeypatch.setattr(encoder_cls, "forward", spy("encoder", encoder_cls.forward))
+    monkeypatch.setattr(AnimaDiT, "preprocess_text_embeds",
+                        spy("adapter", AnimaDiT.preprocess_text_embeds))
+    monkeypatch.setattr(CosmosDiT, "forward", spy("dit", CosmosDiT.forward))
+    policy = pipe.model.policy
+    prev = policy.fp16_accumulation
+    policy.fp16_accumulation = True
+    try:
+        _gen(pipe, seed=0, steps=2)
+    finally:
+        policy.fp16_accumulation = prev
+    assert seen["encoder"] and not any(seen["encoder"])
+    assert seen["adapter"] and not any(seen["adapter"])
+    assert seen["dit"] and all(seen["dit"])
+    assert matmul.allow_fp16_accumulation is False   # perf_context restored it
+
+
 def test_cond_cache_bit_identical(pipe):
     """A warm-cache generation is byte-identical to the uncached one: the cached
     tensors are the exact fp16 values, round-tripped losslessly through CPU."""

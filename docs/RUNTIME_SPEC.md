@@ -171,6 +171,12 @@ tile regardless of output resolution.
   after a sampling loop with the backbone resident, torch holds GBs of freed-but-
   cached blocks that `mem_get_info` counts as used — skipping it understates free
   VRAM and over-tiles (e.g. Anima at ≤1024²).
+- The estimates are per VAE class *and* weight dtype, measured (fp16 saves only
+  18-29%, not half). They are linear in pixels only because the bottleneck
+  attention hands SDPA 4-D contiguous q/k/v; a strided or 3-D input falls back
+  to the math kernel, whose fp32 (H·W)² matrix made the peak quadratic.
+- `vae_decode_safe` retries tiled if an untiled attempt still runs out of
+  memory, so an estimate miss costs one failed pass, not the generation.
 
 Put this as a function in `runtime/` (e.g. `tiled_vae_decode(vae, latent, tile,
 overlap)`) and have the pipeline call it instead of `vae.decode` when the policy
@@ -289,7 +295,7 @@ opt in only:
 |---|---|---|---|---|
 | `cudnn_benchmark` | **True** | Enables cuDNN's per-shape kernel autotune for the run | one-step autotune on first call | yes (kernel choice doesn't change values) |
 | `tf32` | False | TF32 matmul + cuDNN on Ampere+ for **fp32 paths only** | tiny precision loss in fp32 ops | no (~1e-3 relative) |
-| `fp16_accumulation` | False | cuBLAS accumulates fp16 matmuls in fp16 (torch ≥ 2.7; consumer tensor cores run fp16-accumulate at 2× the fp32-accumulate rate — ×1.6 on DiT-shaped GEMMs, ×1.17 end-to-end Anima, measured RTX 2060) | reduced accumulation precision in every fp16 matmul | no (trajectory diverges from step 1; quality on par in A/B) |
+| `fp16_accumulation` | False | cuBLAS accumulates fp16 matmuls in fp16 (torch ≥ 2.7; consumer tensor cores run fp16-accumulate at 2× the fp32-accumulate rate: ×1.6 on DiT-shaped GEMMs, ×1.17 end-to-end Anima, measured RTX 2060) | reduced accumulation precision in every fp16 matmul except Anima's text encoder and LLM-Adapter, which suspend it (`runtime.fp32_accumulation`): they run once per prompt, so it saved nothing there and 2.7× the conditioning error | no (trajectory diverges from step 1; quality on par in A/B) |
 | `channels_last` | False | Converts SD UNet + AutoencoderKL to NHWC | one layout reorder at load + per-step input reorder | within fp16 tolerance (different kernel paths) |
 | `compile` | False | Wraps the backbone with `torch.compile(dynamic=True)` | one-time warmup ~30-180 s, paid at load | within fp16 tolerance (Inductor codegen) |
 | `cuda_graphs` | False | Switches compile to `mode="reduce-overhead", dynamic=False` — Inductor captures a CUDA Graph and replays it each step | re-records on any shape change (resolution, LPW chunk count); incompatible with TeaCache (its cached tensors live in the graph's static buffers); tensors read after a subsequent replay must be cloned first (Anima's sequential-CFG `v_cond` is) | within fp16 tolerance — *more* deterministic than compile alone (54.7 dB vs 29 dB on Anima) |

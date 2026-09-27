@@ -11,9 +11,12 @@ import pytest
 import torch
 
 from diffucore.models import AutoencoderKL, VAEConfig
+from diffucore.models.qwen_image_vae import AttentionBlock as QwenAttentionBlock
+from diffucore.models.vae import AttnBlock
 from diffucore.runtime import (
     DevicePolicy,
     can_decode_untiled,
+    fp32_accumulation,
     maybe_compile_backbone,
     on_device,
     perf_context,
@@ -98,18 +101,19 @@ def test_can_decode_untiled_qwen_uses_lower_per_pixel_cost():
     cuda = torch.device("cuda")
     qwen_stub = type("QwenImageVAE", (torch.nn.Module,), {})()
     sdxl_stub = type("AutoencoderKL", (torch.nn.Module,), {})()
-    # 1024² latent (128×128 latent → 1024×1024 px). SDXL needs 6 GB, Qwen 5 GB.
-    # Pick free = 6.5 GB so the 0.85 margin (≈5.5 GB) lands between the two.
-    free = (13 * 1024**3) // 2  # 6.5 GB
+    # 1024² latent (128×128 latent → 1024×1024 px), parameterless stubs count
+    # as fp32: SDXL needs 4 GB, Qwen 3 GB. Pick free = 4.25 GB so the 0.85
+    # margin (≈3.6 GB) lands between the two.
+    free = (17 * 1024**3) // 4  # 4.25 GB
     shape = (1, 16, 128, 128)
     assert can_decode_untiled(sdxl_stub, shape, cuda, free_bytes=free) is False
     assert can_decode_untiled(qwen_stub, shape, cuda, free_bytes=free) is True
 
 
-def test_can_decode_untiled_fp16_halves_estimate():
-    """An fp16 VAE's decode activations all halve, so the (fp32-calibrated)
-    per-pixel estimate is halved: at a budget where the fp32 decode would tile,
-    the same VAE in fp16 must go untiled."""
+def test_can_decode_untiled_fp16_uses_its_own_estimate():
+    """fp16 decodes are costed from their own measurement (2816 vs 4096 B/px for
+    AutoencoderKL), not a blanket halving: at a budget where the fp32 decode
+    would tile, the same VAE in fp16 goes untiled."""
     cuda = torch.device("cuda")
 
     def stub(dtype):
@@ -117,11 +121,35 @@ def test_can_decode_untiled_fp16_halves_estimate():
         vae.register_parameter("w", torch.nn.Parameter(torch.zeros(1, dtype=dtype)))
         return vae
 
-    # 1024² needs 6 GB in fp32, 3 GB in fp16; free = 6.5 GB → budget ≈ 5.5 GB.
-    free = (13 * 1024**3) // 2
+    # 1024² needs 4 GB in fp32, 2.75 GB in fp16; free = 4 GB → budget 3.4 GB.
+    free = 4 * 1024**3
     shape = (1, 16, 128, 128)
     assert can_decode_untiled(stub(torch.float32), shape, cuda, free_bytes=free) is False
     assert can_decode_untiled(stub(torch.float16), shape, cuda, free_bytes=free) is True
+
+
+@pytest.mark.parametrize("make_block, x_shape", [
+    (lambda: AttnBlock(64), (1, 64, 12, 10)),
+    (lambda: QwenAttentionBlock(64), (1, 64, 1, 12, 10)),
+])
+def test_vae_attention_feeds_sdpa_a_fused_kernel_layout(monkeypatch, make_block, x_shape):
+    """The VAE bottleneck attention must hand SDPA 4-D, contiguous q/k/v. A 3-D
+    or strided input silently falls back to the math kernel, whose full fp32
+    (H·W)² matrix made decode memory quadratic (5.2 GiB at 1024x1536)."""
+    seen = []
+    real_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def spy(q, k, v, *a, **kw):
+        seen.append(all(t.dim() == 4 and t.is_contiguous() for t in (q, k, v)))
+        return real_sdpa(q, k, v, *a, **kw)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
+    block = make_block().eval()
+    x = torch.randn(*x_shape)
+    with torch.no_grad():
+        out = block(x)
+    assert seen == [True]
+    assert out.shape == x.shape
 
 
 # --- fp16 VAE non-finite fallback (vae_decode_safe) -- CPU-runnable ----------
@@ -154,6 +182,50 @@ def test_vae_decode_safe_fp16_nan_falls_back_to_fp32():
     assert vae.decodes == 2                      # failed fp16 + fp32 retry
     assert policy.vae_dtype == torch.float32
     assert next(vae.parameters()).dtype == torch.float32
+
+
+class _OOMUntiledVAE(torch.nn.Module):
+    """Runs out of memory on any latent larger than one 64-px tile."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1))
+        self.decodes = 0
+
+    def decode(self, z):
+        self.decodes += 1
+        if z.shape[-1] > 64 or z.shape[-2] > 64:
+            raise torch.OutOfMemoryError("CUDA out of memory (simulated)")
+        return torch.zeros(z.shape[0], 3, z.shape[-2] * 8, z.shape[-1] * 8)
+
+
+def test_vae_decode_safe_oom_falls_back_to_tiled():
+    """An untiled decode the estimate let through but that runs out of memory
+    must be retried tiled, not crash the generation after sampling."""
+    vae = _OOMUntiledVAE()
+    policy = DevicePolicy(device=torch.device("cpu"))
+    image, mode = vae_decode_safe(vae, torch.randn(1, 4, 96, 96), policy)
+    assert mode == "tiled"
+    assert image.shape == (1, 3, 768, 768)
+    assert vae.decodes > 1                      # the failed attempt + the tiles
+
+
+def test_fp32_accumulation_suspends_and_restores_the_flag():
+    matmul = torch.backends.cuda.matmul
+    if not hasattr(matmul, "allow_fp16_accumulation"):
+        pytest.skip("torch < 2.7 has no fp16 accumulation flag")
+    prev = matmul.allow_fp16_accumulation
+    try:
+        matmul.allow_fp16_accumulation = True
+        with fp32_accumulation():
+            assert matmul.allow_fp16_accumulation is False
+        assert matmul.allow_fp16_accumulation is True
+        matmul.allow_fp16_accumulation = False
+        with fp32_accumulation():
+            assert matmul.allow_fp16_accumulation is False
+        assert matmul.allow_fp16_accumulation is False
+    finally:
+        matmul.allow_fp16_accumulation = prev
 
 
 def test_vae_decode_safe_fp16_clean_path_keeps_fp16():
