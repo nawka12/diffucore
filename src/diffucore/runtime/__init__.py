@@ -53,9 +53,10 @@ class DevicePolicy:
     # 2.7), 2x the tensor-core rate on consumer GPUs. Not bit-exact.
     fp16_accumulation: bool = False
     # ``attention`` (Anima + FLUX): "sdpa" (default, bit-exact), "fa2_turing"
-    # (locally built sm75 FlashAttention-2 port; raises at load if unusable) or
-    # "auto" (fa2_turing when usable, else sdpa). Not bit-exact; incompatible
-    # with ``compile``.
+    # (locally built sm75 FlashAttention-2 port; raises at load if unusable),
+    # "int8_turing" (in-tree sm75 INT8-QK kernel, JIT-built at load; approximate,
+    # self-attention only) or "auto" (fa2_turing when usable, else sdpa). The
+    # non-SDPA backends are not bit-exact and are incompatible with ``compile``.
     attention: str = "sdpa"
     # ``compile`` wraps the backbone with torch.compile(dynamic=True) at load
     # (10-60 s warmup). Incompatible with offload modes that move the backbone.
@@ -74,9 +75,9 @@ class DevicePolicy:
             raise ValueError(
                 f"stream_blocks_per_group must be >= 1; got {self.stream_blocks_per_group}"
             )
-        if self.attention not in ("sdpa", "auto", "fa2_turing"):
+        if self.attention not in ("sdpa", "auto", "fa2_turing", "int8_turing"):
             raise ValueError(
-                f"attention must be 'sdpa', 'auto', or 'fa2_turing'; "
+                f"attention must be 'sdpa', 'auto', 'fa2_turing', or 'int8_turing'; "
                 f"got {self.attention!r}"
             )
 
