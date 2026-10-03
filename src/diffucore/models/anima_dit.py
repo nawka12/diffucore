@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 
+from . import _fused
 from ._attention import attention_blhd
 from ._norm import RMSNorm
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
@@ -276,11 +277,17 @@ class _Attention(nn.Module):
         self.output_proj = nn.Linear(inner, query_dim, bias=False)
         self.q_norm = RMSNorm(head_dim, eps=eps)
         self.k_norm = RMSNorm(head_dim, eps=eps)
-        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in.
+        # Kernel choice; the loader stamps "fa2_turing" / "int8_turing" when the
+        # policy opts in.
         self.attn_backend = "sdpa"
+        self.fused_glue = False
 
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor], rope_emb: Optional[torch.Tensor]) -> torch.Tensor:
         ctx = x if context is None else context
+        if self.fused_glue and _fused.usable(x, ctx):
+            out = self._forward_fused(x, ctx, rope_emb)
+            if out is not None:
+                return out
         q = rearrange(self.q_proj(x), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
         k = rearrange(self.k_proj(ctx), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
         v = rearrange(self.v_proj(ctx), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
@@ -289,9 +296,27 @@ class _Attention(nn.Module):
         if self.is_selfattn and rope_emb is not None:
             q = _apply_rope(q, rope_emb)
             k = _apply_rope(k, rope_emb)
-        # SDPA by default; "fa2_turing" swaps in the sm75 FlashAttention-2 port.
+        # SDPA by default; "fa2_turing" / "int8_turing" swap in the sm75 kernels.
         out = attention_blhd(q, k, v, self.attn_backend)
         return self.output_proj(out)
+
+    def _forward_fused(self, x, ctx, rope_emb):
+        """q/k RMSNorm and RoPE in one Triton pass each; None when a kernel
+        can't take these inputs (the caller then runs eager)."""
+        freqs = None
+        if self.is_selfattn and rope_emb is not None:
+            freqs = rope_emb.reshape(-1, self.head_dim // 2, 2, 2)
+            if freqs.dtype != torch.float32 or not freqs.is_contiguous():
+                return None
+        qp, kp = self.q_proj(x), self.k_proj(ctx)
+        if not (_fused.qk_ok(qp, self.n_heads, self.head_dim) and _fused.qk_ok(kp, self.n_heads, self.head_dim)):
+            return None
+        q = _fused.qk_norm_rope(qp, self.q_norm.weight, self.q_norm.eps, self.n_heads, self.head_dim, freqs)
+        k = _fused.qk_norm_rope(kp, self.k_norm.weight, self.k_norm.eps, self.n_heads, self.head_dim, freqs)
+        if q is None or k is None:
+            return None
+        v = rearrange(self.v_proj(ctx), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
+        return self.output_proj(attention_blhd(q, k, v, self.attn_backend))
 
 
 class _GPT2FeedForward(nn.Module):
@@ -339,6 +364,7 @@ class _Block(nn.Module):
         self.adaln_modulation_self_attn = _AdaLNLoRA(d, r)
         self.adaln_modulation_cross_attn = _AdaLNLoRA(d, r)
         self.adaln_modulation_mlp = _AdaLNLoRA(d, r)
+        self.fused_glue = False
 
     def forward(
         self,
@@ -348,6 +374,11 @@ class _Block(nn.Module):
         rope_emb: torch.Tensor,         # ((T·H·W), head_dim/2, 2, 2)
         adaln_lora: torch.Tensor,       # (B, T, 3·D)
     ) -> torch.Tensor:
+        if (self.fused_glue and _fused.usable(x) and x.dtype == torch.float32
+                and emb.dtype == torch.float16):
+            out = self._forward_fused(x, emb, ctx, rope_emb, adaln_lora)
+            if out is not None:
+                return out
         residual_dtype = x.dtype
         compute_dtype = emb.dtype
         sa = self.adaln_modulation_self_attn(emb) + adaln_lora
@@ -382,6 +413,42 @@ class _Block(nn.Module):
         h = self.mlp(h.to(compute_dtype)).to(residual_dtype)
         x = x + ml_g.to(residual_dtype) * h
         return x
+
+    def _forward_fused(self, x, emb, ctx, rope_emb, adaln_lora):
+        """:meth:`forward` with each stage's residual add, LayerNorm, modulation
+        and casts fused into one row pass. Never writes into ``x``, so a None
+        (kernel unusable) lets the caller rerun the block eagerly."""
+        B, T, H, W, D = x.shape
+        BT, rpm, N = B * T, H * W, B * T * H * W
+        x2 = x.reshape(N, D)
+        if not _fused.rows_ok(x2):
+            return None
+
+        def mods(v):
+            s, sc, g = v.chunk(3, dim=-1)
+            # 1 + scale rounds to fp16 first, as in eager.
+            return (s.reshape(BT, D).contiguous(), (1 + sc).reshape(BT, D).contiguous(),
+                    g.reshape(BT, D).contiguous())
+        sa_s, sa_sc1, sa_g = mods(self.adaln_modulation_self_attn(emb) + adaln_lora)
+        ca_s, ca_sc1, ca_g = mods(self.adaln_modulation_cross_attn(emb) + adaln_lora)
+        ml_s, ml_sc1, ml_g = mods(self.adaln_modulation_mlp(emb) + adaln_lora)
+
+        h = _fused.ln_mod(x2, sa_sc1, sa_s, rpm, self.layer_norm_self_attn.eps)
+        if h is None:
+            return None
+        h = self.self_attn(h.view(B, T * H * W, D), None, rope_emb)
+        xn = torch.empty_like(x2)
+        h = _fused.res_ln_mod(x2, h.reshape(N, D), sa_g, ca_sc1, ca_s, rpm, self.layer_norm_cross_attn.eps, xn)
+        if h is None:
+            return None
+        h = self.cross_attn(h.view(B, T * H * W, D), ctx, None)
+        h = _fused.res_ln_mod(xn, h.reshape(N, D), ca_g, ml_sc1, ml_s, rpm, self.layer_norm_mlp.eps, xn)
+        if h is None:
+            return None
+        h = self.mlp(h.view(B, T * H * W, D))
+        if _fused.res(xn, h.reshape(N, D), ml_g, rpm, xn) is None:
+            return None
+        return xn.view(B, T, H, W, D)
 
     def modulated_self_attn_input(
         self, x: torch.Tensor, emb: torch.Tensor, adaln_lora: torch.Tensor

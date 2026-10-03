@@ -58,6 +58,10 @@ class DevicePolicy:
     # self-attention only) or "auto" (fa2_turing when usable, else sdpa). The
     # non-SDPA backends are not bit-exact and are incompatible with ``compile``.
     attention: str = "sdpa"
+    # ``fused_glue`` (Anima): run each block's residual/LayerNorm/modulation
+    # chain and the q/k RMSNorm + RoPE as fused Triton kernels (CUDA only;
+    # within ~1 fp16 ulp of eager, not bit-exact). Skipped under ``compile``.
+    fused_glue: bool = False
     # ``compile`` wraps the backbone with torch.compile(dynamic=True) at load
     # (10-60 s warmup). Incompatible with offload modes that move the backbone.
     compile: bool = False

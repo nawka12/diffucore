@@ -22,6 +22,7 @@ from .models import (
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
 )
 from .models._attention import resolve_attention_backend, set_attention_backend
+from .models._fused import fused_glue_available, set_fused_glue
 from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
@@ -223,6 +224,9 @@ def load_anima_checkpoint(
     if attn_backend != "sdpa":
         set_attention_backend(backbone, attn_backend)
         _stage(f"attention backend: {attn_backend}")
+    if policy.fused_glue and fused_glue_available(policy.device):
+        set_fused_glue(backbone, True)
+        _stage("fused glue: on")
 
     if policy.compile:
         _stage("compiling backbone (torch.compile warmup, may take minutes)")

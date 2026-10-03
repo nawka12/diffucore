@@ -13,6 +13,7 @@ __version__ = "0.1.1"
 from .bundle import ModelBundle, load_anima_checkpoint, load_checkpoint, load_flux_checkpoint
 from .lora import LoraReport, apply_lora, clear_loras, remove_lora
 from .models._attention import fa2_turing_available, int8_turing_available
+from .models._fused import fused_glue_available
 from .runtime import ConditioningCache
 from .pipelines import (
     ImageToImage, Inpaint, PipelineInfo, TextToImage,
@@ -23,6 +24,7 @@ __all__ = [
     "__version__", "ModelBundle", "ConditioningCache",
     "fa2_turing_available",
     "int8_turing_available",
+    "fused_glue_available",
     "load_checkpoint", "load_anima_checkpoint", "load_flux_checkpoint",
     "apply_lora", "remove_lora", "clear_loras", "LoraReport",
     "ImageToImage", "Inpaint", "PipelineInfo", "TextToImage",
