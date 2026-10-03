@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._attention import attention_bhld
+
 
 @dataclass
 class UNetConfig:
@@ -127,6 +129,8 @@ class CrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(0.0))
+        # Kernel choice; the loader stamps "fa2_turing" when the policy opts in.
+        self.attn_backend = "sdpa"
 
     def forward(self, x: torch.Tensor, context: torch.Tensor | None = None) -> torch.Tensor:
         context = x if context is None else context
@@ -137,8 +141,7 @@ class CrossAttention(nn.Module):
             return t.view(b, -1, self.heads, self.dim_head).transpose(1, 2)
 
         q, k, v = split(q), split(k), split(v)
-        out = F.scaled_dot_product_attention(q, k, v)  # scale = 1/sqrt(dim_head)
-        out = out.transpose(1, 2).reshape(b, -1, self.heads * self.dim_head)
+        out = attention_bhld(q, k, v, self.attn_backend)  # scale = 1/sqrt(dim_head)
         return self.to_out(out)
 
 

@@ -52,10 +52,11 @@ class DevicePolicy:
     # ``fp16_accumulation``: cuBLAS accumulates fp16 matmuls in fp16 (torch >=
     # 2.7), 2x the tensor-core rate on consumer GPUs. Not bit-exact.
     fp16_accumulation: bool = False
-    # ``attention`` (Anima + FLUX): "sdpa" (default, bit-exact), "fa2_turing"
-    # (locally built sm75 FlashAttention-2 port; raises at load if unusable),
-    # "int8_turing" (in-tree sm75 INT8-QK kernel, JIT-built at load; approximate,
-    # self-attention only) or "auto" (fa2_turing when usable, else sdpa). The
+    # ``attention`` (Anima, FLUX, SD/SDXL UNet): "sdpa" (default, bit-exact),
+    # "fa2_turing" (locally built sm75 FlashAttention-2 port; raises at load if
+    # unusable), "int8_turing" (in-tree sm75 INT8-QK kernel, JIT-built at load;
+    # approximate, self-attention with head_dim 128 only, so not SDXL) or "auto"
+    # (fa2_turing when usable, else sdpa). The
     # non-SDPA backends are not bit-exact and are incompatible with ``compile``.
     attention: str = "sdpa"
     # ``fused_glue`` (Anima): run each block's residual/LayerNorm/modulation

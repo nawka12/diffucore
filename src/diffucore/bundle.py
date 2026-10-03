@@ -119,6 +119,11 @@ def load_checkpoint(
     else:
         backbone = backbone.to(unet_target, policy.compute_dtype).eval()
 
+    # "sdpa" (default) stamps nothing; the modules already use it.
+    attn_backend = resolve_attention_backend(policy)
+    if attn_backend != "sdpa":
+        set_attention_backend(backbone, attn_backend)
+
     # NHWC for the conv backbones when opted in.
     if policy.channels_last:
         backbone = to_channels_last(backbone)

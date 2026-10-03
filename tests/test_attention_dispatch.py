@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from diffucore.models._attention import (
     attention_bhld,
     attention_blhd,
+    fa2_turing_available,
     int8_turing_available,
     resolve_attention_backend,
     set_attention_backend,
@@ -210,3 +211,47 @@ def test_int8_falls_back_for_other_head_dims():
     torch.manual_seed(0)
     q = torch.randn(1, 256, 2, 64, device="cuda").half()
     assert torch.equal(attention_blhd(q, q, q, "int8_turing"), attention_blhd(q, q, q, "sdpa"))
+
+
+# --- SD/SDXL UNet --------------------------------------------------------------
+
+def test_unet_attention_sdpa_unchanged():
+    """The UNet's default path is the pre-dispatch code, bit for bit."""
+    from diffucore.models.unet import CrossAttention
+
+    torch.manual_seed(0)
+    attn = CrossAttention(query_dim=64, context_dim=32, heads=2, dim_head=32).eval()
+    x, ctx = torch.randn(2, 40, 64), torch.randn(2, 7, 32)
+    with torch.no_grad():
+        def split(t):
+            return t.view(2, -1, 2, 32).transpose(1, 2)
+        q, k, v = split(attn.to_q(x)), split(attn.to_k(ctx)), split(attn.to_v(ctx))
+        ref = attn.to_out(F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(2, -1, 64))
+        assert torch.equal(attn(x, ctx), ref)
+
+
+def test_stamp_reaches_unet_attention():
+    from diffucore.models.unet import CrossAttention
+
+    attn = CrossAttention(query_dim=64, context_dim=32, heads=2, dim_head=32)
+    assert attn.attn_backend == "sdpa"
+    assert set_attention_backend(attn, "fa2_turing") == 1
+    assert attn.attn_backend == "fa2_turing"
+
+
+@pytest.mark.skipif(not fa2_turing_available(), reason="needs flash_attn_turing on an sm75 GPU")
+def test_unet_attention_fa2_matches_sdpa():
+    """SDXL's head_dim 64 at its 64x64-latent level (4096 tokens, 10 heads)."""
+    from diffucore.models.unet import CrossAttention
+
+    torch.manual_seed(0)
+    attn1 = CrossAttention(query_dim=640, context_dim=640, heads=10, dim_head=64).cuda().half().eval()
+    attn2 = CrossAttention(query_dim=640, context_dim=2048, heads=10, dim_head=64).cuda().half().eval()
+    x = torch.randn(1, 4096, 640, device="cuda").half()
+    ctx = torch.randn(1, 77, 2048, device="cuda").half()
+    with torch.no_grad():
+        ref_self, ref_cross = attn1(x), attn2(x, ctx)
+        set_attention_backend(torch.nn.ModuleList([attn1, attn2]), "fa2_turing")
+        out_self, out_cross = attn1(x), attn2(x, ctx)
+    for out, ref in ((out_self, ref_self), (out_cross, ref_cross)):
+        assert float((out.float() - ref.float()).norm() / ref.float().norm()) < 2e-3
