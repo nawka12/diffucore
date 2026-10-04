@@ -151,6 +151,17 @@ def test_resolve_explicit_int8_raises_with_compile():
         resolve_attention_backend(policy)
 
 
+def test_int8_toolchain_needs_host_compiler(monkeypatch):
+    from torch.utils import cpp_extension
+    from diffucore.models import _attention
+    monkeypatch.setattr(cpp_extension, "CUDA_HOME", "/opt/cuda")
+    monkeypatch.setattr(cpp_extension, "is_ninja_available", lambda: True)
+    monkeypatch.setattr(_attention.shutil, "which", lambda name: None)
+    assert not _attention._toolchain_available()
+    monkeypatch.setattr(_attention.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert _attention._toolchain_available()
+
+
 def test_int8_stamps_self_attention_only():
     """Anima cross-attention keeps an exact backend; FLUX's joint attention and
     Anima self-attention get the INT8 kernel."""

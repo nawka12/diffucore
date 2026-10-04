@@ -12,12 +12,14 @@ fp16-accumulate tensor cores, ~×1.5 over FA2-Turing on an RTX 2060. It is
 approximate (per-call error ~0.4% vs ~0.02% for FA2), so ``auto`` never picks it
 and it only replaces self-attention: Anima's cross-attention (512 text keys, the
 largest INT8 error, ~1% of the attention time) keeps the exact backend. It is
-JIT-built with torch's cpp_extension (nvcc + ninja) when a model first selects it.
+JIT-built with torch's cpp_extension (nvcc + ninja + a C++ compiler) when a model
+first selects it.
 """
 
 from __future__ import annotations
 
 import functools
+import shutil
 from pathlib import Path
 
 import torch
@@ -53,7 +55,9 @@ def fa2_turing_available(device=None) -> bool:
 
 def _toolchain_available() -> bool:
     from torch.utils import cpp_extension
-    return cpp_extension.CUDA_HOME is not None and cpp_extension.is_ninja_available()
+    # The host compiler too: without it (MSVC's cl on Windows) the build fails at load.
+    return (cpp_extension.CUDA_HOME is not None and cpp_extension.is_ninja_available()
+            and shutil.which(cpp_extension.get_cxx_compiler()) is not None)
 
 
 def int8_turing_available(device=None) -> bool:
@@ -103,7 +107,7 @@ def _int8_requirements(policy):
     """(message, satisfied) pairs for the INT8 kernel; builds it only when
     everything else holds."""
     checks = list(_common_requirements(policy, "the INT8 kernel targets sm_75 only"))
-    checks.append(("no CUDA toolchain to build the INT8 kernel (needs nvcc and ninja)",
+    checks.append(("no CUDA toolchain to build the INT8 kernel (needs nvcc, ninja and a C++ compiler)",
                    _toolchain_available()))
     yield from checks
     if all(ok for _, ok in checks):
