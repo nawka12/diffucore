@@ -17,7 +17,7 @@ from .conditioning import AnimaTokenizer, CLIPTokenizer, FluxTokenizer, Flux2Tok
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header
 from .models import (
     AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig,
-    AnimaDiT, QwenImageVAE, Qwen3TextEncoder, Qwen3Config,
+    AnimaDiT, CosmosDiTConfig, QwenImageVAE, Qwen3TextEncoder, Qwen3Config,
     Qwen35TextEncoder, Qwen35Config,
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
 )
@@ -209,8 +209,12 @@ def load_anima_checkpoint(
     # ``model.diffusion_model.*``.
     _stage("loading DiT weights (largest file)")
     sd_dit = _extract_component(load_state_dict(dit_path, device="cpu"), _ANIMA_DIT_LEAF)
-    _stage("building DiT backbone (2B params)")
-    backbone = AnimaDiT()
+    # Depth varies (Anima-2.9B is a 40-block layer expansion of the 28-block
+    # base). Some exports also save the RoPE range buffers, which we recompute.
+    num_blocks = 1 + max(int(k.split(".")[1]) for k in sd_dit if k.startswith("blocks."))
+    sd_dit = {k: v for k, v in sd_dit.items() if not k.startswith("pos_embedder.")}
+    _stage(f"building DiT backbone ({num_blocks} blocks)")
+    backbone = AnimaDiT(CosmosDiTConfig(num_blocks=num_blocks))
     backbone.load_state_dict(sd_dit, strict=True)
     if policy.offload_stream:
         # Keep block 0 resident: TeaCache probes it outside the block's
