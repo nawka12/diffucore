@@ -15,6 +15,7 @@ Keys: SD1.5 / SDXL use kohya's ``lora_unet_`` / ``lora_te_`` / ``lora_te1_`` /
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import torch
@@ -46,14 +47,24 @@ _SUFFIXES = [
     (".alpha", "alpha"),
 ]
 
+# Anima-2.9B is anima-base with 12 blocks interleaved at these indices; the
+# other 28 are base's blocks in order, bit-identical (CircleStone's 28->40
+# expand manifest, verified against the weights). A 28-block LoRA maps onto
+# those; the inserted blocks get no delta.
+_ANIMA_INSERTED_BLOCKS = {40: (2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36)}
+_ANIMA_BASE_BLOCKS = 28
+_ANIMA_BLOCK_KEY = re.compile(r"^(diffusion_model\.blocks\.|lora_unet_blocks_)(\d+)(?=[._])")
+
 
 @dataclass
 class LoraReport:
     """Outcome of :func:`apply_lora`: modules fused, and LoRA module names with no
-    target (unsupported variants or a wrong-arch file)."""
+    target (unsupported variants or a wrong-arch file). ``remapped`` is set when
+    a 28-block Anima LoRA was mapped onto an expanded (e.g. 2.9B) model."""
 
     applied: int
     unmatched: list[str]
+    remapped: bool = False
 
 
 def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
@@ -64,7 +75,7 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
     """
     state = _lora_state(bundle)
     targets = _build_targets(bundle)
-    report = _fuse(path, multiplier, targets, state["base"])
+    report = _fuse(path, multiplier, targets, state["base"], _anima_depth(bundle))
     state["stack"].append((path, multiplier))
     return report
 
@@ -90,10 +101,13 @@ def clear_loras(bundle) -> None:
     state["stack"].clear()
 
 
-def _fuse(path: str, multiplier: float, targets, base) -> LoraReport:
+def _fuse(path: str, multiplier: float, targets, base, anima_depth: int | None = None) -> LoraReport:
     """Add the LoRA's scaled deltas into ``targets``, snapshotting each weight
     into ``base`` before its first modification."""
     groups = _group(load_state_dict(path, device="cpu"))
+    remapped = False
+    if anima_depth in _ANIMA_INSERTED_BLOCKS:
+        groups, remapped = _remap_anima_blocks(groups, anima_depth)
     applied, unmatched = 0, []
     for name, factors in groups.items():
         target = targets.get(name)
@@ -111,7 +125,27 @@ def _fuse(path: str, multiplier: float, targets, base) -> LoraReport:
             view.add_(delta.to(view.device, view.dtype))
         applied += 1
 
-    return LoraReport(applied=applied, unmatched=unmatched)
+    return LoraReport(applied=applied, unmatched=unmatched, remapped=remapped)
+
+
+def _anima_depth(bundle) -> int | None:
+    """Block count of an Anima backbone, else ``None``."""
+    if getattr(bundle.spec, "architecture", None) != "anima":
+        return None
+    return len(_eager(bundle.backbone).blocks)
+
+
+def _remap_anima_blocks(groups, depth: int):
+    """Rename a 28-block Anima LoRA's block indices onto the base blocks'
+    positions in a ``depth``-block expansion. A LoRA that already reaches past
+    block 27 is native to the expanded model and passes through."""
+    indices = [int(m.group(2)) for k in groups if (m := _ANIMA_BLOCK_KEY.match(k))]
+    if not indices or max(indices) >= _ANIMA_BASE_BLOCKS:
+        return groups, False
+    inserted = _ANIMA_INSERTED_BLOCKS[depth]
+    positions = [i for i in range(depth) if i not in inserted]
+    rename = lambda m: f"{m.group(1)}{positions[int(m.group(2))]}"
+    return {_ANIMA_BLOCK_KEY.sub(rename, k): v for k, v in groups.items()}, True
 
 
 def _refuse(bundle) -> None:
@@ -119,8 +153,9 @@ def _refuse(bundle) -> None:
     state = _lora_state(bundle)
     _restore(state["base"])
     targets = _build_targets(bundle)
+    depth = _anima_depth(bundle)
     for path, multiplier in state["stack"]:
-        _fuse(path, multiplier, targets, state["base"])
+        _fuse(path, multiplier, targets, state["base"], depth)
 
 
 def _snapshot(base, weight) -> None:

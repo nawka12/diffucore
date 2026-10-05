@@ -310,6 +310,73 @@ def test_anima_kohya_mangled_lokr(tmp_path):
     torch.testing.assert_close(target.weight - before, torch.kron(w1, w2))
 
 
+def _tiny_anima_bundle(num_blocks):
+    dit = CosmosDiT(CosmosDiTConfig(model_channels=48, num_blocks=num_blocks, num_heads=2,
+                                    head_dim=24, crossattn_emb_channels=12,
+                                    adaln_lora_dim=4, mlp_ratio=2.0,
+                                    max_img_h=16, max_img_w=16, max_frames=1))
+    spec = ModelSpec(architecture="anima", prediction="flow", zero_terminal_snr=False,
+                     latent_channels=16, context_dim=1024)
+    return dit, ModelBundle(spec=spec, schedule=None, tokenizer=None, text_encoder=None,
+                            backbone=dit, vae=None)
+
+
+def _q_proj_lora(tmp_path, names, gen):
+    """A lora_A/lora_B file touching ``q_proj`` (48x48) under each name; returns
+    (path, {name: ΔW})."""
+    tensors, deltas = {}, {}
+    for name in names:
+        down = torch.randn(4, 48, generator=gen)
+        up = torch.randn(48, 4, generator=gen)
+        tensors[f"{name}.lora_A.weight"] = down
+        tensors[f"{name}.lora_B.weight"] = up
+        deltas[name] = up @ down
+    path = str(tmp_path / "anima_lora.safetensors")
+    save_file(tensors, path)
+    return path, deltas
+
+
+def test_anima_28_block_lora_remaps_onto_2_9b(tmp_path):
+    """On the 40-block Anima-2.9B, a 28-block LoRA's block i lands on base block
+    i's new position (both key styles); the inserted blocks are untouched."""
+    dit, bundle = _tiny_anima_bundle(40)
+    before = [b.self_attn.q_proj.weight.detach().clone() for b in dit.blocks]
+    gen = torch.Generator().manual_seed(10)
+    path, deltas = _q_proj_lora(tmp_path, [
+        "diffusion_model.blocks.0.self_attn.q_proj",
+        "diffusion_model.blocks.2.self_attn.q_proj",
+        "lora_unet_blocks_14_self_attn_q_proj",
+        "diffusion_model.blocks.27.self_attn.q_proj",
+    ], gen)
+
+    report = apply_lora(bundle, path)
+    assert report.applied == 4 and report.unmatched == [] and report.remapped
+    expected = {0: "diffusion_model.blocks.0.self_attn.q_proj",
+                3: "diffusion_model.blocks.2.self_attn.q_proj",
+                20: "lora_unet_blocks_14_self_attn_q_proj",
+                39: "diffusion_model.blocks.27.self_attn.q_proj"}
+    for i, block in enumerate(dit.blocks):
+        got = block.self_attn.q_proj.weight - before[i]
+        want = deltas[expected[i]] if i in expected else torch.zeros_like(got)
+        torch.testing.assert_close(got, want)
+
+
+def test_anima_native_40_block_lora_is_not_remapped(tmp_path):
+    dit, bundle = _tiny_anima_bundle(40)
+    before = [b.self_attn.q_proj.weight.detach().clone() for b in dit.blocks]
+    gen = torch.Generator().manual_seed(11)
+    path, deltas = _q_proj_lora(tmp_path, [
+        "diffusion_model.blocks.2.self_attn.q_proj",
+        "diffusion_model.blocks.39.self_attn.q_proj",
+    ], gen)
+
+    report = apply_lora(bundle, path)
+    assert report.applied == 2 and not report.remapped
+    for i in (2, 39):
+        torch.testing.assert_close(dit.blocks[i].self_attn.q_proj.weight - before[i],
+                                   deltas[f"diffusion_model.blocks.{i}.self_attn.q_proj"])
+
+
 def test_unmatched_keys_reported_not_applied(tmp_path):
     unet = _tiny_unet()
     bundle = _bundle(unet, None)
