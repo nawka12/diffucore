@@ -127,6 +127,65 @@ def test_process_in_out_roundtrips_exactly(loaded_vae):
     assert torch.allclose(z, z2, atol=1e-6)
 
 
+def _to_qwen2d(sd3d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Build a Qwen2D-style checkpoint (diffusers names, temporal axis dropped)
+    from a 3-D state dict, walking the module layout independently of the loader."""
+    sub = {"residual.0": "norm1", "residual.2": "conv1", "residual.3": "norm2",
+           "residual.6": "conv2", "shortcut": "conv_shortcut"}
+    top = {"conv1": "conv_in", "head.0": "norm_out", "head.2": "conv_out"}
+    out = {}
+    for k, v in sd3d.items():
+        if ".time_conv." in k:
+            continue
+        head, _, leaf = k.rpartition(".")
+        if head in ("conv1", "conv2"):
+            name = {"conv1": "quant_conv", "conv2": "post_quant_conv"}[head]
+        else:
+            part, rest = head.split(".", 1)
+            if rest in top:
+                name = f"{part}.{top[rest]}"
+            else:
+                group, idx, inner = rest.split(".", 2)
+                inner = sub.get(inner, inner)
+                i = int(idx)
+                if group == "middle":
+                    block = {0: "resnets.0", 1: "attentions.0", 2: "resnets.1"}[i]
+                    name = f"{part}.mid_block.{block}.{inner}"
+                elif group == "downsamples":
+                    name = f"{part}.down_blocks.{i}.{inner}"
+                else:
+                    blk, pos = divmod(i, 4)
+                    slot = "upsamplers.0" if pos == 3 else f"resnets.{pos}"
+                    name = f"{part}.up_blocks.{blk}.{slot}.{inner}"
+        if v.dim() == 5:
+            v = v[:, :, -1]
+        elif leaf == "gamma" and v.dim() == 4:
+            v = v.squeeze(-1)
+        out[f"{name}.{leaf}"] = v.clone()
+    return out
+
+
+def test_qwen2d_checkpoint_reproduces_the_3d_vae():
+    """A Qwen2D checkpoint converts onto the 3-D module and matches it at T=1,
+    where a causal conv only sees the frame through its last temporal tap."""
+    from diffucore.models.qwen_image_vae import convert_qwen2d_state_dict
+
+    torch.manual_seed(0)
+    src = QwenImageVAE().eval()
+    for name, p in src.named_parameters():
+        if name.endswith("gamma"):
+            p.data.uniform_(0.5, 1.5)
+    dst = QwenImageVAE().eval()
+    dst.load_state_dict(
+        convert_qwen2d_state_dict(_to_qwen2d(src.state_dict()), dst.state_dict()), strict=True,
+    )
+    img = _gradient_image(32, 32)
+    with torch.no_grad():
+        z = src.encode(img)
+        torch.testing.assert_close(dst.encode(img), z, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(dst.decode(z), src.decode(z), rtol=1e-5, atol=1e-5)
+
+
 # --- 3. numerical agreement vs ComfyUI (GPL, tests-only) ---------------------
 
 def _comfy_available() -> bool:

@@ -23,6 +23,7 @@ from .models import (
 )
 from .models._attention import resolve_attention_backend, set_attention_backend
 from .models._fused import fused_glue_available, set_fused_glue
+from .models.qwen_image_vae import convert_qwen2d_state_dict
 from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
@@ -184,7 +185,10 @@ def load_anima_checkpoint(
 
     _stage("loading VAE weights")
     vae = QwenImageVAE()
-    vae.load_state_dict(load_state_dict(vae_path, device="cpu"), strict=True)
+    vae_sd = load_state_dict(vae_path, device="cpu")
+    if "decoder.conv_in.weight" in vae_sd:
+        vae_sd = convert_qwen2d_state_dict(vae_sd, vae.state_dict())
+    vae.load_state_dict(vae_sd, strict=True)
     vae = vae.to(idle_target, policy.vae_dtype).eval()
 
     # Stock Anima uses Qwen3-0.6B; the experimental cosmos-qwen3.5 swap (4B, or

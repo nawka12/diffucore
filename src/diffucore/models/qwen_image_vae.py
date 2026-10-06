@@ -11,6 +11,8 @@ Latent normalization is per-channel (Wan2.1 stats) via :meth:`process_in` /
 
 from __future__ import annotations
 
+import re
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -294,3 +296,54 @@ class QwenImageVAE(nn.Module):
     def process_out(self, latents: torch.Tensor) -> torch.Tensor:
         """DiT-space → VAE latent."""
         return latents * self.latents_std.to(latents) + self.latents_mean.to(latents)
+
+
+_QWEN2D_RESNET = {"norm1": "residual.0", "conv1": "residual.2", "norm2": "residual.3",
+                  "conv2": "residual.6", "conv_shortcut": "shortcut"}
+
+
+def _qwen2d_key(k: str) -> str:
+    k = re.sub(r"^quant_conv\.", "conv1.", k)
+    k = re.sub(r"^post_quant_conv\.", "conv2.", k)
+    k = re.sub(r"^(encoder|decoder)\.conv_in\.", r"\1.conv1.", k)
+    k = re.sub(r"^(encoder|decoder)\.norm_out\.", r"\1.head.0.", k)
+    k = re.sub(r"^(encoder|decoder)\.conv_out\.", r"\1.head.2.", k)
+    k = re.sub(r"\.mid_block\.resnets\.(\d)\.", lambda m: f".middle.{2 * int(m[1])}.", k)
+    k = re.sub(r"\.mid_block\.attentions\.0\.", ".middle.1.", k)
+    k = re.sub(r"^encoder\.down_blocks\.", "encoder.downsamples.", k)
+    # Each decoder up block is 3 resnets + 1 upsampler in the flat Wan list.
+    k = re.sub(r"^decoder\.up_blocks\.(\d+)\.resnets\.(\d+)\.",
+               lambda m: f"decoder.upsamples.{4 * int(m[1]) + int(m[2])}.", k)
+    k = re.sub(r"^decoder\.up_blocks\.(\d+)\.upsamplers\.0\.",
+               lambda m: f"decoder.upsamples.{4 * int(m[1]) + 3}.", k)
+    return re.sub(r"(\.(?:downsamples|upsamples|middle)\.\d+)\.(norm1|conv1|norm2|conv2|conv_shortcut)\.",
+                  lambda m: f"{m[1]}.{_QWEN2D_RESNET[m[2]]}.", k)
+
+
+def convert_qwen2d_state_dict(
+    sd: dict[str, torch.Tensor], like: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Map a Qwen2D checkpoint (Anzhc's image-only Qwen-Image VAE and its tunes,
+    https://github.com/Anzhc: diffusers names, temporal axis dropped) onto the
+    3-D layout of ``like`` (a :class:`QwenImageVAE` state dict).
+    """
+    out = {}
+    for k, v in sd.items():
+        name = _qwen2d_key(k)
+        if name not in like:
+            raise ValueError(f"unexpected Qwen2D VAE key {k!r}")
+        ref = like[name]
+        if v.dim() == 4 and ref.dim() == 5:
+            # Causal padding means a single frame only meets the last temporal tap.
+            w = v.new_zeros(ref.shape)
+            w[:, :, -1] = v
+            v = w
+        elif v.dim() == 3 and ref.dim() == 4:
+            v = v.unsqueeze(-1)
+        if v.shape != ref.shape:
+            raise ValueError(f"Qwen2D VAE key {k!r}: shape {tuple(v.shape)} != {tuple(ref.shape)}")
+        out[name] = v
+    for name, ref in like.items():
+        if name not in out and ".time_conv." in name:
+            out[name] = torch.zeros_like(ref)
+    return out
