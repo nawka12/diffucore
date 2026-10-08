@@ -3,13 +3,16 @@
 // GeForce Turing runs fp16 MMA with fp32 accumulation at half rate, which is what
 // FlashAttention-2 uses for both GEMMs. Measured on an RTX 2060: fp32-acc HMMA
 // 24 TFLOPS, fp16-acc HMMA 49, INT8 IMMA 98. So:
-//   * S = Q K^T runs on INT8 IMMA. Q is quantized per token and K per 64-key block,
-//     after subtracting K's per-channel mean (softmax ignores per-row constants).
-//     softmax_scale * log2(e) is folded into the Q scales.
+//   * S = Q K^T runs on INT8 IMMA. Q is quantized per token (inside the attention kernel)
+//     and K per 64-key block, after subtracting K's per-channel mean (softmax ignores
+//     per-row constants). softmax_scale * log2(e) is folded into the Q scales.
 //   * P V runs on fp16-accumulate HMMA. The fp16 partials hold at most
 //     FLUSH_EVERY * 64 keys before being added into fp32 accumulators.
 //   * The row max is taken on the int32 scores, and int32 -> float is a magic-number
 //     add folded into the exp2 argument (no I2F per score).
+//   * P is formed as p * 2^kp, kp chosen per head so no fp16 partial can overflow, and
+//     the exp2 argument carries an extra -112: the fp32 result's bits shifted left by 3
+//     are then P's fp16 bits, so P is packed with integer ops instead of F2F.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -23,45 +26,14 @@ constexpr int BR = 128;   // query rows per CTA (8 warps x 16)
 constexpr int BC = 64;    // keys per tile
 constexpr int NW = 8;
 constexpr int NT = NW * 32;
-// fp16 partials sum at most FLUSH_EVERY * 64 terms p * v with p <= 1. Anima's V
-// reaches |v| ~ 136, so 2 keeps the worst case (128 * 136) far below 65504.
+// fp16 partials sum at most FLUSH_EVERY * 64 terms P * v; kv_stats_kernel bounds them per head.
 constexpr int FLUSH_EVERY = 2;
 constexpr float LOG2E = 1.4426950408889634f;
+constexpr float LSCALE = 0x1p112f;    // row sums hold sum(P) * 2^-112
 constexpr int MAGIC_I = 0x4B400000;   // bits of 1.5 * 2^23
 constexpr float MAGIC_F = 12582912.f;
 
 // ------------------------------------------------------------------ prep
-
-// Per-(b,h,d) sum of K over tokens; block = 256 threads = 16 rows x 16 chunks.
-__global__ void k_sum_kernel(const half* __restrict__ k, float* __restrict__ ksum, int L, int H,
-                             int64_t sb, int64_t sl, int64_t sh, int rows_per_block) {
-  const int b = blockIdx.z, h = blockIdx.y;
-  const int ch = threadIdx.x & 15, rg = threadIdx.x >> 4;
-  const half* base = k + b * sb + h * sh + ch * 8;
-  float acc[8] = {};
-  const int r0 = blockIdx.x * rows_per_block;
-  const int r1 = min(L, r0 + rows_per_block);
-  for (int r = r0 + rg; r < r1; r += 16) {
-    uint4 u = *reinterpret_cast<const uint4*>(base + r * sl);
-    const half2* hv = reinterpret_cast<const half2*>(&u);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      float2 f = __half22float2(hv[i]);
-      acc[2 * i] += f.x;
-      acc[2 * i + 1] += f.y;
-    }
-  }
-  __shared__ float red[16][129];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) red[rg][ch * 8 + i] = acc[i];
-  __syncthreads();
-  if (threadIdx.x < D) {
-    float s = 0.f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) s += red[i][threadIdx.x];
-    atomicAdd(ksum + (b * H + h) * D + threadIdx.x, s);
-  }
-}
 
 // K - mean, int8 per 64-token block. One CTA per (tile, h, b); 256 threads x 4 chunks of 8.
 __global__ void k_quant_kernel(const half* __restrict__ k, const float* __restrict__ ksum,
@@ -118,32 +90,61 @@ __global__ void k_quant_kernel(const half* __restrict__ k, const float* __restri
   }
 }
 
-// Q per-token int8; the stored scale also carries softmax_scale * log2(e).
-__global__ void q_quant_kernel(const half* __restrict__ q, int8_t* __restrict__ qi, float* __restrict__ qs,
-                               int L, int H, int Lpad, int64_t sb, int64_t sl, int64_t sh, float scale_log2,
-                               int64_t ntok) {
-  const int64_t w = (int64_t)blockIdx.x * NW + (threadIdx.x >> 5);
-  if (w >= ntok) return;
-  const int lane = threadIdx.x & 31;
-  const int l = w % Lpad;
-  const int64_t bh = w / Lpad;
-  const int b = bh / H, h = bh % H;
-  float f[4] = {0.f, 0.f, 0.f, 0.f};
-  if (l < L) {
-    uint2 raw = *reinterpret_cast<const uint2*>(q + b * sb + l * sl + h * sh + lane * 4);
-    const half2* hv = reinterpret_cast<const half2*>(&raw);
-    float2 a = __half22float2(hv[0]), c = __half22float2(hv[1]);
-    f[0] = a.x; f[1] = a.y; f[2] = c.x; f[3] = c.y;
-  }
-  float amax = fmaxf(fmaxf(fabsf(f[0]), fabsf(f[1])), fmaxf(fabsf(f[2]), fabsf(f[3])));
+// Per (b, h): per-window K column sums (for the mean) and a bound on any fp16 PV partial, the
+// max over FLUSH_EVERY*64-key windows and channels of sum |v|. One CTA per (window, h, b); 256
+// threads = 16 row groups x 16 chunks of 8 channels. The K sums are reduced over windows in a
+// fixed order by k_sum_kernel: float atomics would make every call (and so every seed) differ.
+__global__ void kv_stats_kernel(const half* __restrict__ k, const half* __restrict__ v, float* __restrict__ kpart,
+                                float* __restrict__ vb, int L, int H, int64_t k_sb, int64_t k_sl, int64_t k_sh,
+                                int64_t v_sb, int64_t v_sl, int64_t v_sh) {
+  constexpr int WIN = FLUSH_EVERY * BC;
+  const int b = blockIdx.z, h = blockIdx.y;
+  const int ch = threadIdx.x & 15, rg = threadIdx.x >> 4;
+  const half* kb = k + b * k_sb + h * k_sh + ch * 8;
+  const half* vbase = v + b * v_sb + h * v_sh + ch * 8;
+  float ak[8] = {}, av[8] = {};
+  const int r0 = blockIdx.x * WIN, r1 = min(L, r0 + WIN);
+  for (int r = r0 + rg; r < r1; r += 16) {
+    const uint4 uk = *reinterpret_cast<const uint4*>(kb + r * k_sl);
+    const uint4 uv = *reinterpret_cast<const uint4*>(vbase + r * v_sl);
+    const half2* hk = reinterpret_cast<const half2*>(&uk);
+    const half2* hv = reinterpret_cast<const half2*>(&uv);
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
-  const float inv = amax > 0.f ? 127.f / amax : 0.f;
-  char4 r;
-  r.x = (int8_t)__float2int_rn(f[0] * inv); r.y = (int8_t)__float2int_rn(f[1] * inv);
-  r.z = (int8_t)__float2int_rn(f[2] * inv); r.w = (int8_t)__float2int_rn(f[3] * inv);
-  reinterpret_cast<char4*>(qi + w * D)[lane] = r;
-  if (lane == 0) qs[w] = amax / 127.f * scale_log2;
+    for (int i = 0; i < 4; ++i) {
+      const float2 fk = __half22float2(hk[i]), fv = __half22float2(hv[i]);
+      ak[2 * i] += fk.x;
+      ak[2 * i + 1] += fk.y;
+      av[2 * i] += fabsf(fv.x);
+      av[2 * i + 1] += fabsf(fv.y);
+    }
+  }
+  __shared__ float red[2][16][129];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    red[0][rg][ch * 8 + i] = ak[i];
+    red[1][rg][ch * 8 + i] = av[i];
+  }
+  __syncthreads();
+  if (threadIdx.x < D) {
+    float sk = 0.f, sv = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      sk += red[0][i][threadIdx.x];
+      sv += red[1][i][threadIdx.x];
+    }
+    kpart[((int64_t)(b * H + h) * gridDim.x + blockIdx.x) * D + threadIdx.x] = sk;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sv = fmaxf(sv, __shfl_xor_sync(0xffffffff, sv, o));
+    if ((threadIdx.x & 31) == 0) atomicMax(reinterpret_cast<int*>(vb) + b * H + h, __float_as_int(sv));
+  }
+}
+
+// ksum[bh][d] = sum over windows of kpart[bh][w][d]. One CTA of D threads per (b, h).
+__global__ void k_sum_kernel(const float* __restrict__ kpart, float* __restrict__ ksum, int nwin) {
+  const float* src = kpart + (int64_t)blockIdx.x * nwin * D + threadIdx.x;
+  float s = 0.f;
+  for (int w = 0; w < nwin; ++w) s += src[w * D];
+  ksum[blockIdx.x * D + threadIdx.x] = s;
 }
 
 // ------------------------------------------------------------------ attention
@@ -174,18 +175,26 @@ __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
   return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// a, b = P * 2^-112, so (bits << 3) are fp16 bits in the upper half; + 0x8000 rounds to nearest.
+// Values below fp16's normal range were already flushed by ex2.ftz.
+__device__ __forceinline__ uint32_t pack_p(float a, float b) {
+  const uint32_t ua = (__float_as_uint(a) << 3) + 0x8000u, ub = (__float_as_uint(b) << 3) + 0x8000u;
+  return __byte_perm(ua, ub, 0x7632);
+}
+
 struct Params {
-  const int8_t* qi; const int8_t* ki; const half* v; half* o;
-  const float* qs; const float* ks;
-  int Lq, Lk, Lq_pad, Lk_pad, H;
-  int64_t v_sb, v_sl, v_sh, o_sb, o_sl, o_sh;
+  const half* q; const int8_t* ki; const half* v; half* o;
+  const float* ks; const float* vb;
+  int Lq, Lk, Lk_pad, H;
+  float scale_log2;
+  int64_t q_sb, q_sl, q_sh, v_sb, v_sl, v_sh, o_sb, o_sl, o_sh;
 };
 
 template <bool TAIL>
 __device__ __forceinline__ void tile_step(const Params& p, int tile, int lane, uint32_t sK, uint32_t sV,
                                           const uint32_t (&qf)[2][8], const float (&cq)[2], float ksc,
                                           float (&m)[2], float (&lsum)[2], float (&o)[16][4],
-                                          uint32_t (&acc)[16][2], float (&beta)[2], bool flush) {
+                                          uint32_t (&acc)[16][2], float (&beta)[2], bool flush, float pbias) {
   const int t4 = lane & 3, rr = lane & 7, mi = lane >> 3;
   int s[2][8][2];
 #pragma unroll
@@ -254,7 +263,7 @@ __device__ __forceinline__ void tile_step(const Params& p, int tile, int lane, u
     }
   }
 #pragma unroll
-  for (int rg = 0; rg < 2; ++rg) bias[rg] = fmaf(MAGIC_F, c[rg], m[rg]);
+  for (int rg = 0; rg < 2; ++rg) bias[rg] = fmaf(MAGIC_F, c[rg], m[rg] + pbias);
 
   // j-outer PV into fp16 accumulators that persist for FLUSH_EVERY tiles before being flushed to fp32.
   float ls[2] = {0.f, 0.f};
@@ -270,7 +279,7 @@ __device__ __forceinline__ void tile_step(const Params& p, int tile, int lane, u
         if (tile * BC + j * 8 + 2 * t4 + 1 >= p.Lk) e1 = 0.f;
       }
       ls[rg] += e0 + e1;
-      pf[rg] = pack_h2(e0, e1);
+      pf[rg] = pack_p(e0, e1);
     }
 #pragma unroll
     for (int pq = 0; pq < 4; ++pq) {
@@ -305,17 +314,54 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const Params p) {
   const uint32_t sbase = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
   const uint32_t sK = sbase, sV = sbase + BC * D;
 
-  // Q tile (128 x 128 int8 = 16 KB) staged through the same buffer.
+  // Q tile: each warp quantizes its own 16 rows to int8 per token (the scale also carries
+  // softmax_scale * log2(e)) into the shared buffer; two lanes per row, 64 channels each.
+  float cq[2];
   {
-    const int8_t* src = p.qi + ((int64_t)bh * p.Lq_pad + qt * BR) * D;
+    const int rl = lane >> 1, hf = lane & 1;
+    const int r = warp * 16 + rl, row = qt * BR + r;
+    float f[4][16];
+    float amax = 0.f;
 #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-      const int ci = tid + u * NT, r = ci >> 3, c = ci & 7;
-      uint4 val = reinterpret_cast<const uint4*>(src)[ci];
-      *reinterpret_cast<uint4*>(smem + r * 128 + ((c ^ (r & 7)) << 4)) = val;
+    for (int v = 0; v < 4; ++v) {
+      const int c8 = hf + 2 * v;
+      uint4 u[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};
+      if (row < p.Lq) {
+        const half* src = p.q + b * p.q_sb + row * p.q_sl + h * p.q_sh + c8 * 16;
+        u[0] = reinterpret_cast<const uint4*>(src)[0];
+        u[1] = reinterpret_cast<const uint4*>(src)[1];
+      }
+      const half2* hv = reinterpret_cast<const half2*>(u);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float2 x = __half22float2(hv[i]);
+        f[v][2 * i] = x.x;
+        f[v][2 * i + 1] = x.y;
+        amax = fmaxf(amax, fmaxf(fabsf(x.x), fabsf(x.y)));
+      }
     }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+    const float inv = amax > 0.f ? 127.f / amax : 0.f;
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+      uint32_t w[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t b0 = (uint8_t)(int8_t)__float2int_rn(f[v][4 * i] * inv);
+        const uint32_t b1 = (uint8_t)(int8_t)__float2int_rn(f[v][4 * i + 1] * inv);
+        const uint32_t b2 = (uint8_t)(int8_t)__float2int_rn(f[v][4 * i + 2] * inv);
+        const uint32_t b3 = (uint8_t)(int8_t)__float2int_rn(f[v][4 * i + 3] * inv);
+        w[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+      }
+      const int c8 = hf + 2 * v;
+      *reinterpret_cast<uint4*>(smem + r * 128 + ((c8 ^ (r & 7)) << 4)) = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+    const float qsv = amax / 127.f * p.scale_log2;
+    const int g = lane >> 2;
+    cq[0] = __shfl_sync(0xffffffff, qsv, 2 * g);
+    cq[1] = __shfl_sync(0xffffffff, qsv, 2 * g + 16);
   }
-  __syncthreads();
+  __syncwarp();
   uint32_t qf[2][8];
   {
     const int rr = lane & 7, mi = lane >> 3;
@@ -331,13 +377,6 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const Params p) {
         qf[f2 >> 3][f2 & 7] = r[m2];
       }
     }
-  }
-  float cq[2];
-  {
-    const int g = lane >> 2;
-    const float* qsrc = p.qs + (int64_t)bh * p.Lq_pad + qt * BR + warp * 16;
-    cq[0] = qsrc[g];
-    cq[1] = qsrc[g + 8];
   }
   __syncthreads();
 
@@ -384,15 +423,19 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const Params p) {
 
   const float* ksp = p.ks + (int64_t)bh * (p.Lk_pad / BC);
   const bool has_tail = (p.Lk % BC) != 0;
+  // P is formed as p * 2^kp: the largest kp <= 10 whose partials provably stay below 60000
+  // (2^10 covers the 2^-24 range fp16 subnormals gave). The floor keeps p = 1 representable.
+  const int kp = max(-8, min(10, (int)floorf(__log2f(60000.f / fmaxf(p.vb[bh], 1e-30f)))));
+  const float pbias = 112.f - (float)kp;
   for (int tile = 0; tile < ntiles; ++tile) {
     const bool more = tile + 1 < ntiles;
     if (more) gload(tile + 1);
     const float ksc = ksp[tile];
     const bool flush = !more || (tile % FLUSH_EVERY) == FLUSH_EVERY - 1;
     if (has_tail && !more)
-      tile_step<true>(p, tile, lane, sK, sV, qf, cq, ksc, m, lsum, o, acc, beta, flush);
+      tile_step<true>(p, tile, lane, sK, sV, qf, cq, ksc, m, lsum, o, acc, beta, flush, pbias);
     else
-      tile_step<false>(p, tile, lane, sK, sV, qf, cq, ksc, m, lsum, o, acc, beta, flush);
+      tile_step<false>(p, tile, lane, sK, sV, qf, cq, ksc, m, lsum, o, acc, beta, flush, pbias);
     __syncthreads();
     if (more) {
       sstore();
@@ -406,7 +449,7 @@ __global__ void __launch_bounds__(NT, 1) attn_kernel(const Params p) {
     lsum[rg] += __shfl_xor_sync(0xffffffff, lsum[rg], 2);
   }
   const int g = lane >> 2, t4 = lane & 3;
-  const float inv0 = 1.f / lsum[0], inv1 = 1.f / lsum[1];
+  const float inv0 = 1.f / (lsum[0] * LSCALE), inv1 = 1.f / (lsum[1] * LSCALE);
   const int row0 = qt * BR + warp * 16 + g, row1 = row0 + 8;
   half* obase = p.o + b * p.o_sb + h * p.o_sh + 2 * t4;
 #pragma unroll
@@ -439,29 +482,27 @@ torch::Tensor fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, double sm_s
   const int Lq_pad = (Lq + BR - 1) / BR * BR, Lk_pad = (Lk + BC - 1) / BC * BC;
   auto i8 = q.options().dtype(torch::kInt8);
   auto f32 = q.options().dtype(torch::kFloat32);
-  auto qi = torch::empty({B, H, Lq_pad, D}, i8);
   auto ki = torch::empty({B, H, Lk_pad, D}, i8);
-  auto qs = torch::empty({B, H, Lq_pad}, f32);
   auto ks = torch::empty({B, H, Lk_pad / BC}, f32);
-  auto ksum = torch::zeros({B, H, D}, f32);
+  const int nwin = (Lk + FLUSH_EVERY * BC - 1) / (FLUSH_EVERY * BC);
+  auto kpart = torch::empty({B, H, nwin, D}, f32);
+  auto ksum = torch::empty({B, H, D}, f32);
+  auto vb = torch::zeros({B, H}, f32);
   auto o = torch::empty({B, Lq, H, D}, q.options());
 
-  const int rpb = 256;
-  k_sum_kernel<<<dim3((Lk + rpb - 1) / rpb, H, B), 256, 0, stream>>>(
-      (const half*)k.data_ptr(), ksum.data_ptr<float>(), Lk, H, k.stride(0), k.stride(1), k.stride(2), rpb);
+  kv_stats_kernel<<<dim3(nwin, H, B), 256, 0, stream>>>(
+      (const half*)k.data_ptr(), (const half*)v.data_ptr(), kpart.data_ptr<float>(), vb.data_ptr<float>(), Lk, H,
+      k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2));
+  k_sum_kernel<<<B * H, D, 0, stream>>>(kpart.data_ptr<float>(), ksum.data_ptr<float>(), nwin);
   k_quant_kernel<<<dim3(Lk_pad / BC, H, B), NT, 0, stream>>>(
       (const half*)k.data_ptr(), ksum.data_ptr<float>(), ki.data_ptr<int8_t>(), ks.data_ptr<float>(), Lk, H, Lk_pad,
       k.stride(0), k.stride(1), k.stride(2));
-  const int64_t ntok = (int64_t)B * H * Lq_pad;
-  q_quant_kernel<<<(ntok + NW - 1) / NW, NT, 0, stream>>>(
-      (const half*)q.data_ptr(), qi.data_ptr<int8_t>(), qs.data_ptr<float>(), Lq, H, Lq_pad, q.stride(0), q.stride(1),
-      q.stride(2), (float)sm_scale * LOG2E, ntok);
-
   Params p;
-  p.qi = qi.data_ptr<int8_t>(); p.ki = ki.data_ptr<int8_t>();
+  p.q = (const half*)q.data_ptr(); p.ki = ki.data_ptr<int8_t>();
   p.v = (const half*)v.data_ptr(); p.o = (half*)o.data_ptr();
-  p.qs = qs.data_ptr<float>(); p.ks = ks.data_ptr<float>();
-  p.Lq = Lq; p.Lk = Lk; p.Lq_pad = Lq_pad; p.Lk_pad = Lk_pad; p.H = H;
+  p.ks = ks.data_ptr<float>(); p.vb = vb.data_ptr<float>();
+  p.Lq = Lq; p.Lk = Lk; p.Lk_pad = Lk_pad; p.H = H; p.scale_log2 = (float)sm_scale * LOG2E;
+  p.q_sb = q.stride(0); p.q_sl = q.stride(1); p.q_sh = q.stride(2);
   p.v_sb = v.stride(0); p.v_sl = v.stride(1); p.v_sh = v.stride(2);
   p.o_sb = o.stride(0); p.o_sl = o.stride(1); p.o_sh = o.stride(2);
   attn_kernel<<<dim3(Lq_pad / BR, H, B), NT, 0, stream>>>(p);

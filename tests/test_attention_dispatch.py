@@ -218,6 +218,18 @@ def test_int8_bhld_and_strided_inputs():
 
 
 @_needs_int8
+def test_int8_partials_cannot_overflow():
+    """Flat scores (every p = 1) with large same-sign V: 128 keys * 1000 would
+    overflow a fixed-scale fp16 partial; the per-head P scale keeps it finite."""
+    q = torch.zeros(1, 256, 2, 128, device="cuda").half()
+    k = torch.randn(1, 1024, 2, 128, device="cuda").half()
+    v = (torch.rand(1, 1024, 2, 128, device="cuda") * 200 + 900).half()
+    out = attention_blhd(q, k, v, "int8_turing")
+    assert torch.isfinite(out).all()
+    assert _rel_err(out, _ref_blhd(q.float(), k.float(), v.float())) < 1e-3
+
+
+@_needs_int8
 def test_int8_falls_back_for_other_head_dims():
     torch.manual_seed(0)
     q = torch.randn(1, 256, 2, 64, device="cuda").half()

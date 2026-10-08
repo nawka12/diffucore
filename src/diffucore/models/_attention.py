@@ -8,7 +8,7 @@ locally built optional extra; without it everything resolves to plain SDPA,
 and ``auto`` never picks it off sm75.
 
 ``int8_turing`` (``kernels/int8_attn_sm75.cu``) runs Q K^T on INT8 and P V on
-fp16-accumulate tensor cores, ~×1.5 over FA2-Turing on an RTX 2060. It is
+fp16-accumulate tensor cores, ~×1.75 over FA2-Turing on an RTX 2060. It is
 approximate (per-call error ~0.4% vs ~0.02% for FA2), so ``auto`` never picks it
 and it only replaces self-attention: Anima's cross-attention (512 text keys, the
 largest INT8 error, ~1% of the attention time) keeps the exact backend. It is
