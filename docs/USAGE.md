@@ -81,7 +81,7 @@ image = TextToImage(model)(
   `linear_quadratic` (SD/SDXL); `flow` (default), `flow_dyn`, `oss`,
   `sgm_uniform`, `simple`,
   `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep`, `beta`,
-  `beta_mix` (Anima); `flux` (default), `flow`,
+  `beta_mix`, `secant_tilt` (Anima); `flux` (default), `flow`,
   `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
   `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
   pipelines' σ_max = 1 init assumes).
@@ -109,6 +109,10 @@ image = TextToImage(model)(
   σ(t), over-pack the pure-noise σ≈1 end, and collide steps at the σ floor for
   step counts ≳40. Pair with a 2nd-order solver (`dpmpp_2m`, `heunpp2`) for
   best effect.
+  `secant_tilt` (Anima) is the pairing for `secant_anneal`: after `σ_max` it
+  spaces steps by the λ-density `0.6·exp(−0.4·λ) + 0.4·uniform` from σ 0.985
+  to 0.01, so steps gather where CFG shapes the layout (σ 0.98 to 0.9) and the
+  tail keeps a constant step ratio. It ignores `shift`.
 
 ### Anima (DiT)
 

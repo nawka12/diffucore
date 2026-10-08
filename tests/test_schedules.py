@@ -335,7 +335,7 @@ def test_flow_table_schedule_dispatches_all_names():
     # flow table scheduler (see schedules._FLOW_TABLE_SCHEDULERS).
     for name in ("sgm_uniform", "simple", "normal", "infinity", "infinity_htds",
                  "linear_quadratic", "smoothstep", "beta", "beta_mix",
-                 "pump_dual", "pump_taper", "kl_optimal"):
+                 "pump_dual", "pump_taper", "secant_tilt", "kl_optimal"):
         sig = S.flow_table_schedule(name, shift=3.0, steps=12)
         assert sig[-1].item() == 0.0
         assert torch.all(sig[:-1] >= sig[1:]), name
@@ -647,3 +647,88 @@ def test_pump_taper_invalid_args_raise():
         S.pump_taper_schedule(view, 20, taper=-0.1)
     with pytest.raises(ValueError):
         S.pump_taper_schedule(view, 20, pump_end=1.0)
+
+
+# ── secant_tilt ───────────────────────────────────────────────────────
+
+def _secant_weights(sig, curvature=0.25):
+    """secant_anneal's per-step secant weight curvature·(1 − r)·(1 − σ), with
+    r measured to σ_down at its default eta_max = 1 (eta = σ)."""
+    from diffucore.sampling.samplers import _rf_ancestral_step
+    out = []
+    for i in range(1, len(sig) - 2):
+        s, sn = sig[i].double(), sig[i + 1].double()
+        sd = _rf_ancestral_step(s, sn, float(s))[0]
+        r = min(1.0, float((s - sd) / s))
+        out.append(curvature * (1.0 - r) * (1.0 - float(s)))
+    return out
+
+
+def test_secant_tilt_endpoints_descent_and_terminus():
+    view = _flow_view()
+    for steps in (3, 8, 16, 24, 32, 50, 100):
+        sig = S.secant_tilt_schedule(view, steps)
+        assert sig.shape[0] == steps + 1
+        assert sig[-1].item() == 0.0
+        assert torch.all(sig[:-1] > sig[1:]), steps
+        assert abs(sig[0].item() - 1.0) < 1e-6
+        assert abs(sig[-2].item() - 0.01) < 1e-6, steps
+        assert sig[1].item() < 0.985, steps                  # skips the static top
+
+
+def test_secant_tilt_ignores_shift():
+    a = S.flow_table_schedule("secant_tilt", shift=3.0, steps=32)
+    assert torch.equal(a, S.flow_table_schedule("secant_tilt", shift=1.5, steps=32))
+
+
+def test_secant_tilt_zero_share_is_uniform_lambda():
+    view = _flow_view()
+    for kw in ({"tilt_share": 0.0}, {"tilt": 0.0}):
+        lv = _lam_list(S.secant_tilt_schedule(view, 32, **kw)[1:-1])
+        h = [lv[i + 1] - lv[i] for i in range(len(lv) - 1)]
+        assert max(h) - min(h) < 1e-4, kw
+
+
+def test_secant_tilt_keeps_the_secant_open_in_the_tail():
+    # beta_mix's widening tail shuts the secant off on its last steps; the
+    # uniform-λ component keeps the step ratio, and so the weight, steady.
+    view = _flow_view()
+    mine = _secant_weights(S.secant_tilt_schedule(view, 32))
+    theirs = _secant_weights(S.beta_mix_schedule(view, 32))
+    assert min(mine[-3:]) > 0.12
+    assert min(theirs[-3:]) < 0.05
+    lt = _lam_list([v for v in S.secant_tilt_schedule(view, 32)[1:-1] if float(v) < 0.3])
+    h = [lt[i + 1] - lt[i] for i in range(len(lt) - 1)]
+    assert max(h) / min(h) < 1.5
+
+
+def test_secant_tilt_32_step_layout():
+    # Steps move from the middle into the structure onset; under the
+    # (0.1, 0.75) step-fraction CFG interval the CFG band stays beta_mix's.
+    from diffucore.sampling.denoiser import guidance_interval_bounds
+    view = _flow_view()
+    sig, ref = S.secant_tilt_schedule(view, 32), S.beta_mix_schedule(view, 32)
+
+    def count(s, lo, hi):
+        return sum(1 for v in s[:-1] if lo < float(v) <= hi)
+    assert count(sig, 0.88, 0.98) >= count(ref, 0.88, 0.98) + 4
+    assert count(sig, 0.3, 0.75) < count(ref, 0.3, 0.75)
+    assert count(sig, 0.0, 0.3) == count(ref, 0.0, 0.3)
+    for a, b in zip(guidance_interval_bounds(sig, 0.1, 0.75), guidance_interval_bounds(ref, 0.1, 0.75)):
+        assert abs(a - b) < 0.02
+
+
+def test_secant_tilt_invalid_args_raise():
+    import pytest
+
+    view = _flow_view()
+    with pytest.raises(ValueError):
+        S.secant_tilt_schedule(view, 2)
+    with pytest.raises(ValueError):
+        S.secant_tilt_schedule(view, 20, tilt=-0.1)
+    with pytest.raises(ValueError):
+        S.secant_tilt_schedule(view, 20, tilt_share=1.5)
+    with pytest.raises(ValueError):
+        S.secant_tilt_schedule(view, 20, sigma_end=0.99)
+    with pytest.raises(ValueError):
+        S.secant_tilt_schedule(view, 20, top_sigma=1.0)

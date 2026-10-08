@@ -589,6 +589,54 @@ def pump_taper_schedule(schedule, steps: int, *, pump_end: float = 0.45,
     return append_zero(sigmas.to(device=device, dtype=dtype))
 
 
+def secant_tilt_schedule(schedule, steps: int, *, tilt: float = 0.4,
+                         tilt_share: float = 0.6, top_sigma: float = 0.985,
+                         sigma_end: float = 0.01,
+                         device: torch.device | str = "cpu",
+                         dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Schedule for ``secant_anneal``: ``σ_max``, then points uniform in the CDF
+    of the λ-density ``tilt_share·exp(−tilt·λ) + (1 − tilt_share)·uniform`` from
+    ``top_sigma`` to ``sigma_end``.
+
+    The tilt tracks the cube root of Anima's x0 change rate, which peaks where
+    CFG shapes the layout (σ 0.98 to 0.9), and skips the static σ > 0.985. The
+    uniform part holds the tail at a constant step ratio ``r``, so the secant
+    weight ``curvature·(1 − r)·(1 − σ)`` stays open to the last step instead of
+    collapsing like it does under ``beta_mix``'s widening tail. ``tilt_share=0``
+    is uniform in λ. Ignores ``shift``; flow-only.
+    """
+    if steps < 3:
+        raise ValueError("steps must be >= 3")
+    if tilt < 0:
+        raise ValueError(f"tilt must be >= 0; got {tilt}")
+    if not 0.0 <= tilt_share <= 1.0:
+        raise ValueError(f"tilt_share must be in [0, 1]; got {tilt_share}")
+    sigma_max = float(schedule.sigma_max)
+    if not 0.0 < sigma_end < top_sigma < sigma_max:
+        raise ValueError(f"need 0 < sigma_end < top_sigma < {sigma_max}; "
+                         f"got sigma_end={sigma_end}, top_sigma={top_sigma}")
+
+    lt = math.log(1.0 / top_sigma - 1.0)   # flow half-logSNR log((1-σ)/σ)
+    le = math.log(1.0 / sigma_end - 1.0)
+
+    def cdf(l: torch.Tensor) -> torch.Tensor:
+        uni = (l - lt) / (le - lt)
+        if tilt == 0:
+            return uni
+        et, ee = math.exp(-tilt * lt), math.exp(-tilt * le)
+        return tilt_share * (et - torch.exp(-tilt * l)) / (et - ee) + (1.0 - tilt_share) * uni
+
+    u = torch.linspace(0.0, 1.0, steps, dtype=torch.float64)
+    lo, hi = torch.full_like(u, lt), torch.full_like(u, le)
+    for _ in range(64):                    # bisection; the CDF is monotone
+        mid = 0.5 * (lo + hi)
+        below = cdf(mid) < u
+        lo, hi = torch.where(below, mid, lo), torch.where(below, hi, mid)
+    sigmas = (-0.5 * (lo + hi)).sigmoid()
+    sigmas[0] = sigma_max
+    return append_zero(sigmas.to(device=device, dtype=dtype))
+
+
 # Flow table schedulers, evaluated against a FlowSamplingView. ``flow`` /
 # ``flow_dyn`` / ``oss`` are computed in the pipelines. ``ddim_uniform`` is
 # SD-only: it starts below σ_max, and the flow pipelines init at σ_max == 1.
@@ -604,6 +652,7 @@ _FLOW_TABLE_SCHEDULERS = {
     "beta_mix": beta_mix_schedule,
     "pump_dual": pump_dual_schedule,
     "pump_taper": pump_taper_schedule,
+    "secant_tilt": secant_tilt_schedule,
 }
 
 
