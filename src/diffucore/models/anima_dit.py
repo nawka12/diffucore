@@ -345,6 +345,25 @@ class _AdaLNLoRA(nn.Sequential):
         )
 
 
+def _apply_carry(x: torch.Tensor, carry: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """``x + g * h`` for a deferred MLP residual (``h`` ``(N, D)``, ``g``
+    ``(B*T, D)``), rounded exactly as the eager block's residual add."""
+    h, g = carry
+    B, T, H, W, D = x.shape
+    return x + g.view(B, T, 1, 1, D).to(x.dtype) * h.view(B, T, H, W, D).to(x.dtype)
+
+
+def _finish_carry(x: torch.Tensor, carry: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """Apply the last block's deferred residual. ``x`` is that block's own
+    output buffer, so the fused kernel updates it in place."""
+    if _fused.usable(x):
+        H, W, D = x.shape[2:]
+        x2 = x.reshape(-1, D)
+        if _fused.res(x2, carry[0], carry[1], H * W, x2) is not None:
+            return x
+    return _apply_carry(x, carry)
+
+
 class _Block(nn.Module):
     """One adaLN-LoRA block. The layer norms have no affine params; the adaLN
     modulators provide all per-token affine shaping."""
@@ -373,12 +392,20 @@ class _Block(nn.Module):
         ctx: torch.Tensor,              # (B, L, ctx_dim)
         rope_emb: torch.Tensor,         # ((T·H·W), head_dim/2, 2, 2)
         adaln_lora: torch.Tensor,       # (B, T, 3·D)
-    ) -> torch.Tensor:
+        carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        defer: bool = False,
+    ):
+        """``carry`` is the previous block's deferred MLP residual ``(h, g)``:
+        the true input is ``x + g * h``. With ``defer`` the block returns
+        ``(x, carry)``; the fused path then leaves its own MLP residual to the
+        next block's first LayerNorm pass (eager returns ``(x, None)``)."""
         if (self.fused_glue and _fused.usable(x) and x.dtype == torch.float32
                 and emb.dtype == torch.float16):
-            out = self._forward_fused(x, emb, ctx, rope_emb, adaln_lora)
+            out = self._forward_fused(x, emb, ctx, rope_emb, adaln_lora, carry, defer)
             if out is not None:
                 return out
+        if carry is not None:
+            x = _apply_carry(x, carry)
         residual_dtype = x.dtype
         compute_dtype = emb.dtype
         sa = self.adaln_modulation_self_attn(emb) + adaln_lora
@@ -412,12 +439,12 @@ class _Block(nn.Module):
         h = self.layer_norm_mlp(x) * (1 + ml_sc) + ml_s
         h = self.mlp(h.to(compute_dtype)).to(residual_dtype)
         x = x + ml_g.to(residual_dtype) * h
-        return x
+        return (x, None) if defer else x
 
-    def _forward_fused(self, x, emb, ctx, rope_emb, adaln_lora):
+    def _forward_fused(self, x, emb, ctx, rope_emb, adaln_lora, carry=None, defer=False):
         """:meth:`forward` with each stage's residual add, LayerNorm, modulation
-        and casts fused into one row pass. Never writes into ``x``, so a None
-        (kernel unusable) lets the caller rerun the block eagerly."""
+        and casts fused into one row pass. Never writes into ``x`` or ``carry``,
+        so a None (kernel unusable) lets the caller rerun the block eagerly."""
         B, T, H, W, D = x.shape
         BT, rpm, N = B * T, H * W, B * T * H * W
         x2 = x.reshape(N, D)
@@ -433,12 +460,17 @@ class _Block(nn.Module):
         ca_s, ca_sc1, ca_g = mods(self.adaln_modulation_cross_attn(emb) + adaln_lora)
         ml_s, ml_sc1, ml_g = mods(self.adaln_modulation_mlp(emb) + adaln_lora)
 
-        h = _fused.ln_mod(x2, sa_sc1, sa_s, rpm, self.layer_norm_self_attn.eps)
+        xn = torch.empty_like(x2)
+        if carry is None:
+            xa = x2
+            h = _fused.ln_mod(x2, sa_sc1, sa_s, rpm, self.layer_norm_self_attn.eps)
+        else:
+            xa = xn
+            h = _fused.res_ln_mod(x2, carry[0], carry[1], sa_sc1, sa_s, rpm, self.layer_norm_self_attn.eps, xn)
         if h is None:
             return None
         h = self.self_attn(h.view(B, T * H * W, D), None, rope_emb)
-        xn = torch.empty_like(x2)
-        h = _fused.res_ln_mod(x2, h.reshape(N, D), sa_g, ca_sc1, ca_s, rpm, self.layer_norm_cross_attn.eps, xn)
+        h = _fused.res_ln_mod(xa, h.reshape(N, D), sa_g, ca_sc1, ca_s, rpm, self.layer_norm_cross_attn.eps, xn)
         if h is None:
             return None
         h = self.cross_attn(h.view(B, T * H * W, D), ctx, None)
@@ -446,6 +478,8 @@ class _Block(nn.Module):
         if h is None:
             return None
         h = self.mlp(h.view(B, T * H * W, D))
+        if defer:
+            return xn.view(B, T, H, W, D), (h.reshape(N, D), ml_g)
         if _fused.res(xn, h.reshape(N, D), ml_g, rpm, xn) is None:
             return None
         return xn.view(B, T, H, W, D)
@@ -779,8 +813,14 @@ class CosmosDiT(nn.Module):
             x_B_T_H_W_D = x_B_T_H_W_D + teacache.forecast()
         else:
             residual_in = x_B_T_H_W_D
+            # Fused blocks hand their MLP residual to the next block's first
+            # LayerNorm pass instead of applying it in a pass of their own.
+            carry = None
             for block in self.blocks:
-                x_B_T_H_W_D = block(x_B_T_H_W_D, emb_B_T_D, context, rope_emb, adaln_lora_B_T_3D)
+                x_B_T_H_W_D, carry = block(x_B_T_H_W_D, emb_B_T_D, context, rope_emb, adaln_lora_B_T_3D,
+                                           carry=carry, defer=True)
+            if carry is not None:
+                x_B_T_H_W_D = _finish_carry(x_B_T_H_W_D, carry)
             if teacache is not None:
                 teacache.update(x_B_T_H_W_D - residual_in)
 

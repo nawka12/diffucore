@@ -178,5 +178,5 @@ def qk_norm_rope(x, weight, eps, n_heads, head_dim, freqs=None):
     B, S, _ = x.shape
     out = torch.empty(B, S, n_heads, head_dim, device=x.device, dtype=torch.float16)
     ok = _launch(_qk_norm_rope_kernel, (B * S,), x, weight, freqs if freqs is not None else weight, out,
-                 S, x.stride(1), eps, H=n_heads, HD=head_dim, ROPE=freqs is not None, num_warps=4)
+                 S, x.stride(1), eps, H=n_heads, HD=head_dim, ROPE=freqs is not None, num_warps=2)
     return out if ok else None

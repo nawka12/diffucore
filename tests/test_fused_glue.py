@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 
 from diffucore.models import _fused
-from diffucore.models.anima_dit import CosmosDiTConfig, _Attention, _Block, _VideoRoPE3D
+from diffucore.models.anima_dit import (CosmosDiT, CosmosDiTConfig, _Attention, _Block, _VideoRoPE3D,
+                                         _apply_carry, _finish_carry)
 
 _CFG = CosmosDiTConfig(model_channels=256, num_heads=2, head_dim=128, adaln_lora_dim=32,
                        crossattn_emb_channels=64)
@@ -91,3 +92,43 @@ def test_qk_norm_rope_matches_eager():
         _fused.set_fused_glue(attn, True)
         out = attn(x, None, rope)
     assert float((out.float() - ref.float()).norm() / ref.float().norm()) < 1e-3
+
+
+@_needs_fused
+def test_deferred_residual_matches_eager():
+    """A fused block that takes the previous block's MLP residual as a carry
+    and defers its own equals the eager block run on ``x + g*h``."""
+    blk, x, emb, ctx, rope, lora = _block_inputs("cuda")
+    N, D = x.numel() // x.shape[-1], x.shape[-1]
+    g = torch.Generator().manual_seed(1)
+    carry = ((torch.randn(N, D, generator=g)).cuda().half(), (torch.randn(1, D, generator=g) * 0.3).cuda().half())
+    with torch.no_grad():
+        ref = blk(_apply_carry(x, carry), emb, ctx, rope, lora)
+        _fused.set_fused_glue(blk, True)
+        x_in, c_in = x.clone(), tuple(t.clone() for t in carry)
+        out, deferred = blk(x, emb, ctx, rope, lora, carry=carry, defer=True)
+        assert deferred is not None
+        out = _finish_carry(out, deferred)
+    assert torch.equal(x, x_in) and all(torch.equal(a, b) for a, b in zip(carry, c_in))
+    assert float((out - ref).norm() / ref.norm()) < 1e-4
+
+
+@_needs_fused
+def test_fused_dit_forward_matches_eager():
+    cfg = CosmosDiTConfig(model_channels=256, num_heads=2, head_dim=128, adaln_lora_dim=32,
+                          crossattn_emb_channels=64, num_blocks=3)
+    g = torch.Generator().manual_seed(0)
+    dit = CosmosDiT(cfg)
+    with torch.no_grad():
+        for p in dit.parameters():
+            p.copy_(torch.randn(p.shape, generator=g) * 0.05)
+    dit = dit.cuda().half().eval()
+    x = torch.randn(1, 16, 1, 16, 24, generator=g).cuda().half()
+    ctx = torch.randn(1, 16, 64, generator=g).cuda().half()
+    t = torch.tensor([0.6]).cuda().half()
+    with torch.no_grad():
+        ref = dit(x, t, ctx).float()
+        _fused.set_fused_glue(dit, True)
+        out = dit(x, t, ctx).float()
+    assert torch.isfinite(out).all()
+    assert float((out - ref).norm() / ref.norm()) < 1e-3
