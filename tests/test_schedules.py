@@ -732,3 +732,95 @@ def test_secant_tilt_invalid_args_raise():
         S.secant_tilt_schedule(view, 20, sigma_end=0.99)
     with pytest.raises(ValueError):
         S.secant_tilt_schedule(view, 20, top_sigma=1.0)
+
+
+# ── relay_tilt ────────────────────────────────────────────────────────
+
+def test_relay_tilt_endpoints_descent_and_terminus():
+    view = _flow_view()
+    for steps in (4, 8, 16, 24, 32, 50, 100):
+        sig = S.relay_tilt_schedule(view, steps)
+        assert sig.shape[0] == steps + 1
+        assert sig[-1].item() == 0.0
+        assert torch.all(sig[:-1] > sig[1:]), steps
+        assert abs(sig[0].item() - 1.0) < 1e-6
+        assert sig[1].item() < 0.985, steps                  # skips the static top
+        assert abs(sig[-2].item() - 0.01) < 1e-6, steps
+
+
+def test_relay_tilt_ignores_shift():
+    a = S.flow_table_schedule("relay_tilt", shift=3.0, steps=50)
+    assert torch.equal(a, S.flow_table_schedule("relay_tilt", shift=1.5, steps=50))
+
+
+def test_relay_tilt_band_tapers_into_a_uniform_tail():
+    view = _flow_view()
+    for steps in (32, 50):
+        sig = S.relay_tilt_schedule(view, steps)
+        n_tail = round(0.28 * steps)
+        knee = steps - 1 - n_tail                            # index of σ = pump_end
+        assert abs(float(sig[knee]) - 0.45) < 1e-6
+        lb = _lam_list(sig[1:knee + 1])
+        hb = [lb[i + 1] - lb[i] for i in range(len(lb) - 1)]
+        assert all(hb[i] < hb[i + 1] for i in range(len(hb) - 1)), steps
+        lt = _lam_list(sig[knee:-1])
+        ht = [lt[i + 1] - lt[i] for i in range(len(lt) - 1)]
+        assert max(ht) - min(ht) < 1e-4, steps
+    flat = _lam_list(S.relay_tilt_schedule(view, 50, tilt=0.0)[1:36])
+    h = [flat[i + 1] - flat[i] for i in range(len(flat) - 1)]
+    assert max(h) - min(h) < 1e-4
+
+
+def test_relay_tilt_cfg_interval_covers_the_pumped_band():
+    # Under the (0.1, 0.75) step-fraction interval CFG must stay on below the
+    # pump cutoff, and its band must open by the structure onset.
+    from diffucore.sampling.denoiser import guidance_interval_bounds
+    view = _flow_view()
+    for steps in range(20, 81):
+        lo, hi = guidance_interval_bounds(S.relay_tilt_schedule(view, steps), 0.1, 0.75)
+        assert 0.1 < lo < 0.45, (steps, lo)
+        assert hi > 0.95, (steps, hi)
+
+
+def test_relay_tilt_keeps_up_with_both_parents_in_the_anatomy_onset():
+    # σ 0.985-0.89 is where anatomy forms; at tilt 0.25 it got fewer steps
+    # than either parent at 32, and anatomy broke.
+    view = _flow_view()
+
+    def onset(s):
+        return sum(1 for v in s[:-1] if 0.89 < float(v) <= 0.985)
+    for steps in range(20, 81):
+        mine = onset(S.relay_tilt_schedule(view, steps))
+        best = max(onset(S.secant_tilt_schedule(view, steps)), onset(S.pump_taper_schedule(view, steps)))
+        assert mine >= best - (0 if steps in (32, 50) else 1), steps   # rounding
+
+
+def test_relay_tilt_keeps_secant_tilts_mid_band():
+    # σ 0.89-0.45 is where fine detail settles; 6-7 evaluations there at 32 left
+    # secant_anneal measurably softer than secant_tilt's 9.
+    view = _flow_view()
+
+    def mid(s):
+        return sum(1 for v in s[:-1] if 0.45 - 1e-6 <= float(v) <= 0.89)
+    for steps in range(20, 81):
+        mine, ref = mid(S.relay_tilt_schedule(view, steps)), mid(S.secant_tilt_schedule(view, steps))
+        assert mine >= ref - 1, steps
+    assert mid(S.relay_tilt_schedule(view, 50)) == mid(S.secant_tilt_schedule(view, 50))
+
+
+def test_relay_tilt_invalid_args_raise():
+    import pytest
+
+    view = _flow_view()
+    with pytest.raises(ValueError):
+        S.relay_tilt_schedule(view, 3)
+    with pytest.raises(ValueError):
+        S.relay_tilt_schedule(view, 20, tilt=-0.1)
+    with pytest.raises(ValueError):
+        S.relay_tilt_schedule(view, 20, tilt_share=1.5)
+    with pytest.raises(ValueError):
+        S.relay_tilt_schedule(view, 20, tail_share=0.0)
+    with pytest.raises(ValueError):
+        S.relay_tilt_schedule(view, 20, sigma_end=0.5)
+    with pytest.raises(ValueError):
+        S.relay_tilt_schedule(view, 20, top_sigma=1.0)

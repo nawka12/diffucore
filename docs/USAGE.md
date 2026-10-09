@@ -81,7 +81,7 @@ image = TextToImage(model)(
   `linear_quadratic` (SD/SDXL); `flow` (default), `flow_dyn`, `oss`,
   `sgm_uniform`, `simple`,
   `normal`, `kl_optimal`, `linear_quadratic`, `smoothstep`, `beta`,
-  `beta_mix`, `secant_tilt` (Anima); `flux` (default), `flow`,
+  `beta_mix`, `secant_tilt`, `relay_tilt` (Anima); `flux` (default), `flow`,
   `sgm_uniform`, `simple`, `normal`, `kl_optimal`, `linear_quadratic` (FLUX).
   `ddim_uniform` is SD/SDXL-only (it starts below σ_max, which the flow
   pipelines' σ_max = 1 init assumes).
@@ -113,6 +113,13 @@ image = TextToImage(model)(
   spaces steps by the λ-density `0.6·exp(−0.4·λ) + 0.4·uniform` from σ 0.985
   to 0.01, so steps gather where CFG shapes the layout (σ 0.98 to 0.9) and the
   tail keeps a constant step ratio. It ignores `shift`.
+  `relay_tilt` (Anima) pairs with `cogent3_pump_rate`: after `σ_max`, steps
+  from below σ 0.985 to the pump cutoff 0.45 follow the λ-density
+  `0.8·exp(−0.4·λ) + 0.2·uniform`, then 28% of the steps run uniform in λ to
+  σ 0.01. Under a 0.1–0.75 step-fraction CFG interval, CFG stays on down to
+  σ ≈ 0.24 (like `secant_tilt`; `pump_taper` stops it at ≈ 0.67), σ 0.985–0.89,
+  where anatomy forms, keeps as many steps as `pump_taper`, and σ 0.89–0.45,
+  where fine detail settles, as many as `secant_tilt`. It ignores `shift`.
 
 ### Anima (DiT)
 

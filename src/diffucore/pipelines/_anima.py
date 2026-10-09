@@ -58,6 +58,7 @@ _ANIMA_SCHEDULERS = (
     "flow", "flow_dyn", "oss", "sgm_uniform", "simple",
     "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
     "smoothstep", "beta", "beta_mix", "pump_dual", "pump_taper", "secant_tilt",
+    "relay_tilt",
 )
 
 if TYPE_CHECKING:
