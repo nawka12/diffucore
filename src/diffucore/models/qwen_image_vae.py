@@ -345,5 +345,5 @@ def convert_qwen2d_state_dict(
         out[name] = v
     for name, ref in like.items():
         if name not in out and ".time_conv." in name:
-            out[name] = torch.zeros_like(ref)
+            out[name] = torch.zeros(ref.shape, dtype=ref.dtype)   # ref may be meta
     return out

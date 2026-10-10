@@ -7,11 +7,15 @@ dispatch on ``spec.architecture``.
 
 from __future__ import annotations
 
+import itertools
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from .conditioning import AnimaTokenizer, CLIPTokenizer, FluxTokenizer, Flux2Tokenizer
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header
@@ -37,11 +41,58 @@ _SDXL_CLIP_L = "conditioner.embedders.0.transformer."
 _SDXL_CLIP_G = "conditioner.embedders.1.model."
 
 
+# Building a model the plain way allocates fp32 weights, random-inits them and
+# then copies the checkpoint over them: for the 2B Anima DiT, 6.5 s + 2.6 s and
+# ~8 GB of RAM thrown away. ``_build`` creates the parameters on the meta
+# device instead (buffers stay real: the non-persistent ones aren't in the
+# checkpoint), the loads adopt the checkpoint tensors with ``assign=True``, and
+# ``_place`` casts and moves them.
+_meta_tls = threading.local()
+_register_parameter = nn.Module.register_parameter
+
+
+def _register_parameter_on_meta(self, name, param):
+    _register_parameter(self, name, param)
+    if param is not None and getattr(_meta_tls, "on", False):
+        self._parameters[name] = nn.Parameter(param.to("meta"), param.requires_grad)
+
+
+@contextmanager
+def _meta_parameters():
+    # The hook stays installed; it is a pass-through on other threads and
+    # outside this block, so a concurrent build elsewhere is untouched.
+    nn.Module.register_parameter = _register_parameter_on_meta
+    _meta_tls.on = True
+    try:
+        yield
+    finally:
+        _meta_tls.on = False
+
+
+def _build(cls, *args, **kwargs):
+    """``cls(*args, **kwargs)`` with meta parameters, to be filled by an
+    ``assign=True`` load."""
+    with _meta_parameters():
+        return cls(*args, **kwargs)
+
+
+def _place(module, device, dtype, source):
+    """``module.to(device, dtype)``. Adopted tensors still live in the
+    checkpoint's mmap; any the move leaves in place (CPU, same dtype) are
+    copied, so a loaded model never aliases the file."""
+    module = module.to(device, dtype)
+    mapped = {t.untyped_storage().data_ptr() for t in source.values()}
+    for t in itertools.chain(module.parameters(), module.buffers()):
+        if t.untyped_storage().data_ptr() in mapped:
+            t.data = t.data.clone()
+    return module
+
+
 def _load_sub(module, state_dict, prefix):
     sub = {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
     # position_ids is a derived non-persistent buffer; drop it if shipped.
     sub = {k: v for k, v in sub.items() if not k.endswith("position_ids")}
-    module.load_state_dict(sub, strict=True)
+    module.load_state_dict(sub, strict=True, assign=True)
     return module
 
 
@@ -96,29 +147,29 @@ def load_checkpoint(
     idle_target = policy.offload_device if policy.offload_idle else policy.device
     unet_target = policy.offload_device if policy.offload_unet else policy.device
 
-    vae = _load_sub(AutoencoderKL(VAEConfig(scale_factor=spec.latent_scale)), state_dict, _VAE_PREFIX)
-    vae = vae.to(idle_target, policy.vae_dtype).eval()
+    vae = _load_sub(_build(AutoencoderKL, VAEConfig(scale_factor=spec.latent_scale)), state_dict, _VAE_PREFIX)
+    vae = _place(vae, idle_target, policy.vae_dtype, state_dict).eval()
 
     text_encoder_2 = None
     if spec.architecture == "sd15":
-        text_encoder = _load_sub(CLIPTextEncoder(), state_dict, _SD15_CLIP)
-        backbone = _load_sub(UNetModel(), state_dict, _UNET_PREFIX)
+        text_encoder = _load_sub(_build(CLIPTextEncoder), state_dict, _SD15_CLIP)
+        backbone = _load_sub(_build(UNetModel), state_dict, _UNET_PREFIX)
     else:  # sdxl
-        text_encoder = _load_sub(CLIPTextEncoder(), state_dict, _SDXL_CLIP_L)
-        text_encoder_2 = _load_sub(OpenCLIPTextEncoder(), state_dict, _SDXL_CLIP_G)
-        text_encoder_2 = text_encoder_2.to(idle_target, policy.compute_dtype).eval()
-        backbone = _load_sub(UNetModel(sdxl_unet_config()), state_dict, _UNET_PREFIX)
+        text_encoder = _load_sub(_build(CLIPTextEncoder), state_dict, _SDXL_CLIP_L)
+        text_encoder_2 = _load_sub(_build(OpenCLIPTextEncoder), state_dict, _SDXL_CLIP_G)
+        text_encoder_2 = _place(text_encoder_2, idle_target, policy.compute_dtype, state_dict).eval()
+        backbone = _load_sub(_build(UNetModel, sdxl_unet_config()), state_dict, _UNET_PREFIX)
 
-    text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+    text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, state_dict).eval()
     if policy.offload_stream:
         # Stream the UNet's blocks (ComfyUI --lowvram analog), so SDXL fits ~4 GB.
-        backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
+        backbone = _place(backbone, policy.offload_device, policy.compute_dtype, state_dict).eval()
         stream_blocks(backbone, ("input_blocks", "middle_block", "output_blocks"),
                       policy.device, policy.offload_device,
                       num_blocks_per_group=policy.stream_blocks_per_group,
                       prefetch=policy.stream_prefetch)
     else:
-        backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+        backbone = _place(backbone, unet_target, policy.compute_dtype, state_dict).eval()
 
     # "sdpa" (default) stamps nothing; the modules already use it.
     attn_backend = resolve_attention_backend(policy)
@@ -184,12 +235,12 @@ def load_anima_checkpoint(
     unet_target = policy.offload_device if policy.offload_unet else policy.device
 
     _stage("loading VAE weights")
-    vae = QwenImageVAE()
+    vae = _build(QwenImageVAE)
     vae_sd = load_state_dict(vae_path, device="cpu")
     if "decoder.conv_in.weight" in vae_sd:
         vae_sd = convert_qwen2d_state_dict(vae_sd, vae.state_dict())
-    vae.load_state_dict(vae_sd, strict=True)
-    vae = vae.to(idle_target, policy.vae_dtype).eval()
+    vae.load_state_dict(vae_sd, strict=True, assign=True)
+    vae = _place(vae, idle_target, policy.vae_dtype, vae_sd).eval()
 
     # Stock Anima uses Qwen3-0.6B; the experimental cosmos-qwen3.5 swap (4B, or
     # the raw 0.8B base) is a Qwen3.5 hybrid, identified by an SSM
@@ -201,13 +252,13 @@ def load_anima_checkpoint(
     is_qwen35 = qwen35_sd is not None and any("linear_attn.A_log" in k for k in qwen35_sd)
     if is_qwen35:
         _stage("loading text encoder (Qwen3.5 hybrid) weights")
-        text_encoder = Qwen35TextEncoder(Qwen35Config.from_state_dict(qwen35_sd))
-        text_encoder.load_state_dict(qwen35_sd, strict=True)
+        text_encoder = _build(Qwen35TextEncoder, Qwen35Config.from_state_dict(qwen35_sd))
+        text_encoder.load_state_dict(qwen35_sd, strict=True, assign=True)
     else:
         _stage("loading text encoder (Qwen3) weights")
-        text_encoder = Qwen3TextEncoder()
-        text_encoder.load_state_dict(te_sd, strict=True)
-    text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+        text_encoder = _build(Qwen3TextEncoder)
+        text_encoder.load_state_dict(te_sd, strict=True, assign=True)
+    text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, te_sd).eval()
 
     # The DiT (with ``llm_adapter``) sits under ``net.*`` or
     # ``model.diffusion_model.*``.
@@ -218,19 +269,19 @@ def load_anima_checkpoint(
     num_blocks = 1 + max(int(k.split(".")[1]) for k in sd_dit if k.startswith("blocks."))
     sd_dit = {k: v for k, v in sd_dit.items() if not k.startswith("pos_embedder.")}
     _stage(f"building DiT backbone ({num_blocks} blocks)")
-    backbone = AnimaDiT(CosmosDiTConfig(num_blocks=num_blocks))
-    backbone.load_state_dict(sd_dit, strict=True)
+    backbone = _build(AnimaDiT, CosmosDiTConfig(num_blocks=num_blocks))
+    backbone.load_state_dict(sd_dit, strict=True, assign=True)
     if policy.offload_stream:
         # Keep block 0 resident: TeaCache probes it outside the block's
         # __call__, where the stream hooks don't fire.
         _stage("streaming DiT blocks to GPU (low-VRAM mode)")
-        backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
+        backbone = _place(backbone, policy.offload_device, policy.compute_dtype, sd_dit).eval()
         stream_blocks(backbone, ("blocks",), policy.device, policy.offload_device,
                       keep_resident=(backbone.blocks[0],),
                       num_blocks_per_group=policy.stream_blocks_per_group,
                       prefetch=policy.stream_prefetch)
     else:
-        backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+        backbone = _place(backbone, unet_target, policy.compute_dtype, sd_dit).eval()
 
     # "sdpa" (default) stamps nothing; the modules already use it.
     attn_backend = resolve_attention_backend(policy)
@@ -353,7 +404,7 @@ def _load_no_missing(module, sub, drop_suffixes=()):
     ones (a real architecture mismatch)."""
     drop = ("position_ids",) + tuple(drop_suffixes)
     sub = {k: v for k, v in sub.items() if not any(k.endswith(s) for s in drop)}
-    missing, _ = module.load_state_dict(sub, strict=False)
+    missing, _ = module.load_state_dict(sub, strict=False, assign=True)
     if missing:
         raise RuntimeError(
             f"{type(module).__name__}: {len(missing)} missing key(s) "
@@ -385,12 +436,12 @@ def _build_flux2_text_encoder(lm_sub):
     Mistral (Dev) doesn't."""
     if "model.layers.0.self_attn.q_norm.weight" in lm_sub:   # Qwen3 (Klein)
         cfg = _qwen3_config_from_sd(lm_sub)
-        encoder = Qwen3TextEncoder(cfg)
+        encoder = _build(Qwen3TextEncoder, cfg)
         _load_no_missing(encoder, lm_sub, drop_suffixes=("lm_head.weight",))
         kind = "qwen3_8b" if cfg.hidden_size >= 4096 else "qwen3_4b"
         return encoder, kind, False
     cfg = MistralConfig.from_state_dict(lm_sub)              # Mistral (Dev)
-    encoder = MistralTextEncoder(cfg)
+    encoder = _build(MistralTextEncoder, cfg)
     _load_no_missing(encoder, lm_sub, drop_suffixes=("lm_head.weight",))
     return encoder, "mistral3_24b", True
 
@@ -448,17 +499,17 @@ def load_flux_checkpoint(
     flux_cfg = FluxConfig.from_state_dict(
         dit_sub, num_heads=hidden // sum(arch_params["axes_dim"]), **arch_params
     )
-    backbone = Flux(flux_cfg)
+    backbone = _build(Flux, flux_cfg)
     _load_no_missing(backbone, dit_sub)
     if policy.offload_stream:
         # Keep the small modules resident and stream the blocks.
-        backbone = backbone.to(policy.offload_device, policy.compute_dtype).eval()
+        backbone = _place(backbone, policy.offload_device, policy.compute_dtype, dit_sub).eval()
         stream_blocks(backbone, ("double_blocks", "single_blocks"),
                       policy.device, policy.offload_device,
                       num_blocks_per_group=policy.stream_blocks_per_group,
                       prefetch=policy.stream_prefetch)
     else:
-        backbone = backbone.to(unet_target, policy.compute_dtype).eval()
+        backbone = _place(backbone, unet_target, policy.compute_dtype, dit_sub).eval()
     # "sdpa" stamps nothing; the modules already use it.
     attn_backend = resolve_attention_backend(policy)
     if attn_backend != "sdpa":
@@ -470,7 +521,7 @@ def load_flux_checkpoint(
     if vae_sub is None:
         raise ValueError("no VAE found (need it in `path` or `vae_path`)")
     vae_sub = _lift_quant_convs(vae_sub)
-    vae = AutoencoderKL(_infer_vae_config(
+    vae = _build(AutoencoderKL, _infer_vae_config(
         vae_sub, scale_factor=spec.latent_scale, shift_factor=spec.latent_shift
     ))
     _load_no_missing(vae, vae_sub)
@@ -485,7 +536,7 @@ def load_flux_checkpoint(
         vae.register_buffer(
             "flux2_latent_std", (vae_sub["bn.running_var"].float() + eps).sqrt().view(1, -1, 1, 1),
             persistent=False)
-    vae = vae.to(idle_target, policy.vae_dtype).eval()
+    vae = _place(vae, idle_target, policy.vae_dtype, vae_sub).eval()
 
     # ---- text encoder(s)
     if spec.architecture == "flux1":
@@ -494,25 +545,25 @@ def load_flux_checkpoint(
             raise ValueError("FLUX.1 needs a T5-XXL encoder (in `path` or `t5_path`)")
         if "shared.weight" not in t5_sub and "encoder.embed_tokens.weight" in t5_sub:
             t5_sub["shared.weight"] = t5_sub["encoder.embed_tokens.weight"]
-        text_encoder = T5TextEncoder()
+        text_encoder = _build(T5TextEncoder)
         _load_no_missing(text_encoder, t5_sub, drop_suffixes=("encoder.embed_tokens.weight",))
-        text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+        text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, t5_sub).eval()
 
         clip_sub = _extract_component(source(clip_path), _FLUX_CLIP_LEAF)
         if clip_sub is None:
             raise ValueError("FLUX.1 needs a CLIP-L encoder (in `path` or `clip_path`)")
-        text_encoder_2 = CLIPTextEncoder()
+        text_encoder_2 = _build(CLIPTextEncoder)
         _load_no_missing(
             text_encoder_2, clip_sub, drop_suffixes=("text_projection.weight", "logit_scale")
         )
-        text_encoder_2 = text_encoder_2.to(idle_target, policy.compute_dtype).eval()
+        text_encoder_2 = _place(text_encoder_2, idle_target, policy.compute_dtype, clip_sub).eval()
         tokenizer = FluxTokenizer()
     else:  # flux2: one decoder LM (Klein/Qwen3 or Dev/Mistral)
         lm_sub = _extract_component(source(mistral_path), _FLUX_MISTRAL_LEAF)
         if lm_sub is None:
             raise ValueError("FLUX.2 needs a Qwen3 (Klein) or Mistral-3 (Dev) encoder")
         text_encoder, kind, mistral_kind = _build_flux2_text_encoder(lm_sub)
-        text_encoder = text_encoder.to(idle_target, policy.compute_dtype).eval()
+        text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, lm_sub).eval()
         text_encoder_2 = None
         if mistral_kind:
             tok_path = mistral_tokenizer_path
