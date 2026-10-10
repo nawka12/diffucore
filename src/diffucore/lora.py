@@ -116,13 +116,16 @@ def _fuse(path: str, multiplier: float, targets, base, anima_depth: int | None =
             continue
         weight, row_start, row_end = target
         view = weight if row_start is None else weight[row_start:row_end]
+        # Compose on the weight's device: the fp32 up@down / kron is ~4x slower
+        # on the CPU, plus an fp32 host-to-device copy of every full delta.
+        factors = {k: v if k == "alpha" else v.to(view.device) for k, v in factors.items()}
         delta = _compose(factors, multiplier, view.shape)
         if delta is None:
             unmatched.append(name)          # unsupported factorization (e.g. Tucker)
             continue
         _snapshot(base, weight)
         with torch.no_grad():
-            view.add_(delta.to(view.device, view.dtype))
+            view.add_(delta.to(view.dtype))
         applied += 1
 
     return LoraReport(applied=applied, unmatched=unmatched, remapped=remapped)
