@@ -210,6 +210,46 @@ def test_vae_decode_safe_oom_falls_back_to_tiled():
     assert vae.decodes > 1                      # the failed attempt + the tiles
 
 
+class _BenchFlagVAE(torch.nn.Module):
+    """Records ``cudnn.benchmark`` at each encode/decode."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1))
+        self.seen = []
+
+    def decode(self, z):
+        self.seen.append(torch.backends.cudnn.benchmark)
+        return torch.zeros(z.shape[0], 3, z.shape[-2] * 8, z.shape[-1] * 8)
+
+    def encode(self, x, generator=None):
+        self.seen.append(torch.backends.cudnn.benchmark)
+        return torch.zeros(x.shape[0], 4, x.shape[-2] // 8, x.shape[-1] // 8)
+
+
+def test_vae_calls_skip_cudnn_autotune_inside_perf_context():
+    """perf_context turns cudnn.benchmark on for the backbone, but VAE decode and
+    encode must run without it (autotune reruns per resolution: 68 s on the
+    first fp32 Qwen VAE decode at 1024²), and the flag must come back after."""
+    from types import SimpleNamespace
+    from PIL import Image
+    from diffucore.pipelines._base import _Pipeline
+
+    vae = _BenchFlagVAE()
+    policy = DevicePolicy(device=torch.device("cpu"), cudnn_benchmark=True)
+    prev = torch.backends.cudnn.benchmark
+    try:
+        with perf_context(policy):
+            vae_decode_safe(vae, torch.randn(1, 4, 8, 8), policy)
+            assert torch.backends.cudnn.benchmark is True
+            pipe = _Pipeline(SimpleNamespace(vae=vae, policy=policy))
+            pipe._encode_image(Image.new("RGB", (64, 64)), 64, 64, policy, None)
+            assert torch.backends.cudnn.benchmark is True
+    finally:
+        torch.backends.cudnn.benchmark = prev
+    assert vae.seen == [False, False]
+
+
 def test_fp32_accumulation_suspends_and_restores_the_flag():
     matmul = torch.backends.cuda.matmul
     if not hasattr(matmul, "allow_fp16_accumulation"):

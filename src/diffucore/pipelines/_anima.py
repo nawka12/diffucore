@@ -19,7 +19,8 @@ import torch
 from PIL import Image
 
 from ..models.anima_dit import TeaCache
-from ..runtime import fp32_accumulation, perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
+from ..runtime import (fp32_accumulation, no_cudnn_autotune, perf_context, staged, vae_decode_safe,
+                       vae_fallback_to_fp32)
 from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
 from ..sampling import (
     append_zero,
@@ -442,7 +443,7 @@ def anima_img2img(
         # 3. encode init → DiT-space latent z0; build the strength-noised start
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
-        with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
+        with torch.no_grad(), no_cudnn_autotune(), staged([model.vae], device, policy.offload_idle):
             z_vae = model.vae.encode(pixels)
             if z_vae.dtype == torch.float16 and not torch.isfinite(z_vae).all():
                 # An fp16 encode overflow poisons the run; retry in fp32.

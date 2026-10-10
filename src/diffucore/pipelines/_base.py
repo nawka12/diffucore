@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 
 from ..conditioning import Conditioner, SDXLConditioner
 from ..models.unet import DeepCache, timestep_embedding
-from ..runtime import DevicePolicy, staged, vae_decode_safe, vae_fallback_to_fp32
+from ..runtime import DevicePolicy, no_cudnn_autotune, staged, vae_decode_safe, vae_fallback_to_fp32
 from ..sampling import (
     CFGDenoiser,
     EpsScaling,
@@ -286,7 +286,7 @@ class _Pipeline:
         image = preprocess_image(init_image, width, height).to(policy.device, policy.vae_dtype)
         if policy.channels_last:
             image = image.contiguous(memory_format=torch.channels_last)
-        with torch.no_grad():
+        with torch.no_grad(), no_cudnn_autotune():
             with staged([self.model.vae], policy.device, policy.offload_idle):
                 z = self.model.vae.encode(image, generator=generator)
                 if z.dtype == torch.float16 and not torch.isfinite(z).all():

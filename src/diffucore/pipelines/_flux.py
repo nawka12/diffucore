@@ -19,7 +19,7 @@ import torch
 from einops import rearrange
 from PIL import Image
 
-from ..runtime import perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
+from ..runtime import no_cudnn_autotune, perf_context, staged, vae_decode_safe, vae_fallback_to_fp32
 from ._base import PipelineInfo, _step_progress, preprocess_image
 from ..sampling import (
     flow_matching_schedule,
@@ -358,7 +358,7 @@ def flux_img2img(
         # decode bridge).
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
-        with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
+        with torch.no_grad(), no_cudnn_autotune(), staged([model.vae], device, policy.offload_idle):
             vae_lat = model.vae.encode(pixels)
             if vae_lat.dtype == torch.float16 and not torch.isfinite(vae_lat).all():
                 # An fp16 encode overflow poisons the run; retry in fp32.

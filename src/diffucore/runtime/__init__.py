@@ -43,7 +43,8 @@ class DevicePolicy:
     # next group's copy with compute on a side stream (~2 groups resident).
     stream_blocks_per_group: int = 1
     stream_prefetch: bool = False
-    # ``cudnn_benchmark`` is on by default: bit-exact, 3-17% faster. ``tf32`` and
+    # ``cudnn_benchmark`` is on by default: bit-exact, 3-17% faster (backbone
+    # only; VAE calls run under :func:`no_cudnn_autotune`). ``tf32`` and
     # ``channels_last`` are opt-in (Ampere+, not bit-exact); ``channels_last``
     # only affects conv backbones.
     cudnn_benchmark: bool = True
@@ -196,6 +197,20 @@ def fp32_accumulation():
         yield
     finally:
         matmul.allow_fp16_accumulation = True
+
+
+@contextmanager
+def no_cudnn_autotune():
+    """Suspend ``cudnn.benchmark`` for the duration. For VAE encode/decode: the
+    autotune reruns per new resolution and costs far more than it saves (Qwen
+    VAE fp32 on an RTX 2060: 68 s first decode at 1024², warm decode no faster;
+    fp16: +3-6 s for 0.06 s per warm decode)."""
+    prev = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = prev
 
 
 @contextmanager
@@ -488,11 +503,12 @@ def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
             torch.cuda.empty_cache()
         return tiled_vae_decode(vae, z), True
 
-    image, tile = _decode(latent)
-    if latent.dtype == torch.float16 and not torch.isfinite(image).all():
-        vae_fallback_to_fp32(vae, policy)
-        image, tile = _decode(latent.float())
+    with no_cudnn_autotune():
+        image, tile = _decode(latent)
+        if latent.dtype == torch.float16 and not torch.isfinite(image).all():
+            vae_fallback_to_fp32(vae, policy)
+            image, tile = _decode(latent.float())
     return image, ("tiled" if tile else "untiled")
 
 
-__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "fp32_accumulation", "maybe_compile_backbone", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]
