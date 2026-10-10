@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 Dzakwan Haq (KayfaHaarukku, github.com/nawka12)
+// SPDX-License-Identifier: Apache-2.0
+
 // INT8-QK / FP16-accumulated-PV flash attention for sm75 (Turing), head_dim 128.
 //
 // GeForce Turing runs fp16 MMA with fp32 accumulation at half rate, which is what

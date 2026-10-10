@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Dzakwan Haq (KayfaHaarukku, github.com/nawka12)
+# SPDX-License-Identifier: Apache-2.0
+
 """Fused elementwise glue for the Anima DiT blocks (Triton).
 
 Eager, each block stage re-reads the fp32 residual stream ~11 times (LayerNorm,
