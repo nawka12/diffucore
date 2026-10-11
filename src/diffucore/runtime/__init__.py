@@ -64,6 +64,9 @@ class DevicePolicy:
     # chain and the q/k RMSNorm + RoPE as fused Triton kernels (CUDA only;
     # within ~1 fp16 ulp of eager, not bit-exact). Skipped under ``compile``.
     fused_glue: bool = False
+    # ``int8`` (Anima): quantize the DiT's attention and MLP linears to INT8
+    # (W8A8, ConvRot) at load. INT8 checkpoint files load as INT8 regardless.
+    int8: bool = False
     # ``compile`` wraps the backbone with torch.compile(dynamic=True) at load
     # (10-60 s warmup). Incompatible with offload modes that move the backbone.
     compile: bool = False

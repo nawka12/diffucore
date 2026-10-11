@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from .loading import load_state_dict
+from .models._int8 import Int8Linear, lora_seed
 
 _CPU = torch.device("cpu")
 
@@ -115,6 +116,9 @@ def _fuse(path: str, multiplier: float, targets, base, anima_depth: int | None =
             unmatched.append(name)          # no such layer (e.g. wrong-arch file)
             continue
         weight, row_start, row_end = target
+        int8 = weight if isinstance(weight, Int8Linear) else None
+        if int8 is not None:
+            weight = int8.weight
         view = weight if row_start is None else weight[row_start:row_end]
         # Compose on the weight's device: the fp32 up@down / kron is ~4x slower
         # on the CPU, plus an fp32 host-to-device copy of every full delta.
@@ -124,8 +128,12 @@ def _fuse(path: str, multiplier: float, targets, base, anima_depth: int | None =
             unmatched.append(name)          # unsupported factorization (e.g. Tucker)
             continue
         _snapshot(base, weight)
-        with torch.no_grad():
-            view.add_(delta.to(view.dtype))
+        if int8 is not None:
+            _snapshot(base, int8.scale_bits)
+            int8.add_delta_(delta, lora_seed(name, path))
+        else:
+            with torch.no_grad():
+                view.add_(delta.to(view.dtype))
         applied += 1
 
     return LoraReport(applied=applied, unmatched=unmatched, remapped=remapped)
@@ -268,21 +276,27 @@ def _build_targets(bundle) -> dict[str, tuple[torch.Tensor, int | None, int | No
     return targets
 
 
+def _target_weight(module):
+    """A layer's fusable weight; an :class:`Int8Linear` is its own target
+    (re-quantized on fuse)."""
+    return module if isinstance(module, Int8Linear) else module.weight.data
+
+
 def _add_module_targets(targets, model, prefixes) -> None:
     """Register every Linear/Conv2d weight under ``<prefix><dotted_name_as_>``."""
     for name, module in model.named_modules():
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
+        if isinstance(module, (nn.Linear, nn.Conv2d, Int8Linear)):
             mangled = name.replace(".", "_")
             for prefix in prefixes:
-                targets[prefix + mangled] = (module.weight.data, None, None)
+                targets[prefix + mangled] = (_target_weight(module), None, None)
 
 
 def _add_dotted_targets(targets, model, prefix) -> None:
     """Register every Linear/Conv2d weight under ``<prefix><dotted_name>``, the
     Anima/DiT convention."""
     for name, module in model.named_modules():
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            targets[prefix + name] = (module.weight.data, None, None)
+        if isinstance(module, (nn.Linear, nn.Conv2d, Int8Linear)):
+            targets[prefix + name] = (_target_weight(module), None, None)
 
 
 def _add_bigg_targets(targets, model, prefix) -> None:

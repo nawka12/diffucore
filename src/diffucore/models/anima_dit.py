@@ -23,6 +23,7 @@ from einops.layers.torch import Rearrange
 
 from . import _fused
 from ._attention import attention_blhd
+from ._int8 import Int8Linear, int8_mlp
 from ._norm import RMSNorm
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
 
@@ -327,6 +328,8 @@ class _GPT2FeedForward(nn.Module):
         self.layer2 = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.layer1, Int8Linear) and isinstance(self.layer2, Int8Linear):
+            return int8_mlp(x, self.layer1, self.layer2)
         return self.layer2(F.gelu(self.layer1(x)))
 
 
@@ -834,6 +837,18 @@ class CosmosDiT(nn.Module):
 # --------------------------------------------------------------------------- #
 # AnimaDiT: base + LLMAdapter
 # --------------------------------------------------------------------------- #
+
+def int8_layer_names(num_blocks: int) -> list[str]:
+    """What the ``int8`` load option quantizes: the attention projections and
+    MLP linears of every block but the first and last, which stay fp as in the
+    published Anima INT8 files."""
+    names = []
+    for i in range(1, num_blocks - 1):
+        for attn in ("self_attn", "cross_attn"):
+            names += [f"blocks.{i}.{attn}.{p}" for p in ("q_proj", "k_proj", "v_proj", "output_proj")]
+        names += [f"blocks.{i}.mlp.layer1", f"blocks.{i}.mlp.layer2"]
+    return names
+
 
 class AnimaDiT(CosmosDiT):
     """Cosmos-Predict2 base plus a 6-block LLM-Adapter mapping Qwen3 hidden

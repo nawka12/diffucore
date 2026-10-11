@@ -14,6 +14,7 @@ from .bundle import ModelBundle, load_anima_checkpoint, load_checkpoint, load_fl
 from .lora import LoraReport, apply_lora, clear_loras, remove_lora
 from .models._attention import fa2_turing_available, int8_turing_available
 from .models._fused import fused_glue_available
+from .models._int8 import int8_fast_available
 from .runtime import ConditioningCache
 from .pipelines import (
     ImageToImage, Inpaint, PipelineInfo, TextToImage,
@@ -25,6 +26,7 @@ __all__ = [
     "fa2_turing_available",
     "int8_turing_available",
     "fused_glue_available",
+    "int8_fast_available",
     "load_checkpoint", "load_anima_checkpoint", "load_flux_checkpoint",
     "apply_lora", "remove_lora", "clear_loras", "LoraReport",
     "ImageToImage", "Inpaint", "PipelineInfo", "TextToImage",

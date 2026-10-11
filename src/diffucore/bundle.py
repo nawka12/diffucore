@@ -27,6 +27,10 @@ from .models import (
 )
 from .models._attention import resolve_attention_backend, set_attention_backend
 from .models._fused import fused_glue_available, set_fused_glue
+from .models._int8 import (
+    adopt_int8_layers, dequantize_linears, int8_fast_available, int8_layers, quantize_linears,
+)
+from .models.anima_dit import int8_layer_names
 from .models.qwen_image_vae import convert_qwen2d_state_dict
 from .models.unet import sdxl_unet_config
 from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
@@ -270,7 +274,23 @@ def load_anima_checkpoint(
     sd_dit = {k: v for k, v in sd_dit.items() if not k.startswith("pos_embedder.")}
     _stage(f"building DiT backbone ({num_blocks} blocks)")
     backbone = _build(AnimaDiT, CosmosDiTConfig(num_blocks=num_blocks))
+    int8 = int8_layers(sd_dit)
+    if int8:
+        sd_dit = adopt_int8_layers(backbone, sd_dit, int8)
     backbone.load_state_dict(sd_dit, strict=True, assign=True)
+    int8_fast = int8_fast_available(policy.device)
+    if int8 and not int8_fast:
+        _stage(f"INT8 file without a fast int8 path here (needs CUDA sm75+ and Triton): "
+               f"dequantizing {len(int8)} layers")
+        dequantize_linears(backbone, policy.compute_dtype,
+                           policy.device if policy.device.type == "cuda" else None)
+    elif int8:
+        _stage(f"INT8 file: {len(int8)} int8 layers")
+    elif policy.int8 and int8_fast:
+        n = quantize_linears(backbone, int8_layer_names(num_blocks), policy.device)
+        _stage(f"int8: quantized {n} layers")
+    elif policy.int8:
+        _stage("int8 skipped: needs CUDA sm75+ and Triton")
     if policy.offload_stream:
         # Keep block 0 resident: TeaCache probes it outside the block's
         # __call__, where the stream hooks don't fire.
