@@ -272,6 +272,8 @@ def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
     ("dpmpp_2s_ancestral", {}),
     ("res_multistep_ancestral", {}),
     ("lcm", {}),
+    ("seeds_2", {}),
+    ("seeds_3", {}),
 ])
 @pytest.mark.parametrize("model_type", ["ve", "flow"])
 def test_new_ancestral_samplers_land_on_target(name, extra, model_type):
@@ -593,6 +595,89 @@ def test_exp_heun_2_x0_registered_in_sampler_table():
 
 
 # ── UniPC ─────────────────────────────────────────────────────────────
+
+
+# ── SEEDS ─────────────────────────────────────────────────────────────
+# SEEDS-2/3 (arXiv:2305.14267), data prediction. Gaussian data has a closed-form
+# denoiser and probability-flow solution, so order and the SDE marginal are exact.
+
+_GAUSS_C2 = 0.25
+
+
+def _gauss_var(sigma, model_type):
+    return (1 - sigma) ** 2 * _GAUSS_C2 + sigma ** 2 if model_type == "flow" else _GAUSS_C2 + sigma ** 2
+
+
+def _gauss_denoiser(model_type):
+    def model(x, sigma):
+        s = sigma.view(-1, 1, 1, 1)
+        alpha = 1 - s if model_type == "flow" else torch.ones_like(s)
+        return alpha * _GAUSS_C2 * x / _gauss_var(s, model_type)
+    return model
+
+
+def _gauss_sigmas(n, model_type):
+    # No final zero: compare against the exact marginal at sigma_min.
+    if model_type == "flow":
+        return S.flow_matching_schedule(n + 1, shift=3.0).double()[1:-1]
+    return S.karras_schedule(n + 1, 0.03, 14.6).double()[:-1]
+
+
+@pytest.mark.parametrize("model_type,sigmas", [
+    ("ve", S.karras_schedule(12, 0.03, 14.6)),
+    ("flow", S.flow_matching_schedule(12, shift=3.0)[1:]),  # skip the σ=1 guards, which differ
+])
+def test_seeds_2_eta_zero_is_dpmpp_2s(model_type, sigmas):
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (0.4 * torch.tanh(x) + 0.2 * x * sg.view(-1, 1, 1, 1))
+    sigmas = sigmas.double()
+    torch.manual_seed(0)
+    x_init = torch.randn(2, 4, 8, 8, dtype=torch.float64) * float(sigmas[0])
+    a = K.sample_seeds_2(model, x_init.clone(), sigmas, eta=0.0, model_type=model_type)
+    b = K.sample_dpmpp_2s_ancestral(model, x_init.clone(), sigmas, eta=0.0, model_type=model_type)
+    assert torch.allclose(a, b, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("name,order", [("seeds_2", 2), ("seeds_3", 3)])
+def test_seeds_deterministic_convergence_order(name, order):
+    errs = []
+    for n in (16, 32, 64):
+        sigmas = _gauss_sigmas(n, "ve")
+        x_init = torch.linspace(-2, 2, 101, dtype=torch.float64).view(1, 1, 1, -1) * _gauss_var(sigmas[0], "ve").sqrt()
+        out = K.get_sampler(name)(_gauss_denoiser("ve"), x_init.clone(), sigmas, eta=0.0)
+        exact = x_init * (_gauss_var(sigmas[-1], "ve") / _gauss_var(sigmas[0], "ve")).sqrt()
+        errs.append(float((out - exact).abs().max()))
+    assert errs[1] / errs[2] > 0.85 * 2 ** order
+
+
+@pytest.mark.parametrize("model_type", ["ve", "flow"])
+def test_seeds_3_sde_keeps_the_gaussian_marginal(model_type):
+    # Independent per-stage noise of the right size loses 24-27% of the variance
+    # here at 20 steps; the shared Brownian path stays within 0.5%.
+    sigmas = _gauss_sigmas(20, model_type)
+    g = torch.Generator().manual_seed(0)
+    x_init = torch.randn(1, 1, 500, 1000, generator=g, dtype=torch.float64) * _gauss_var(sigmas[0], model_type).sqrt()
+    out = K.sample_seeds_3(_gauss_denoiser(model_type), x_init, sigmas, generator=g, model_type=model_type)
+    assert abs(float(out.var()) / float(_gauss_var(sigmas[-1], model_type)) - 1) < 0.02
+
+
+def test_seeds_seed_reproducible_and_stochastic():
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    x_init = torch.randn(1, 4, 8, 8)
+    for name in ("seeds_2", "seeds_3"):
+        run = lambda seed, **kw: K.get_sampler(name)(
+            model, x_init.clone(), _flow_sigmas(), generator=torch.Generator().manual_seed(seed),
+            model_type="flow", **kw)
+        assert torch.equal(run(0), run(0))
+        assert not torch.allclose(run(0), run(1))
+        assert torch.equal(run(0, eta=0.0), run(1, eta=0.0))
+
+
+def test_seeds_bad_args_and_registration():
+    x = torch.randn(1, 4, 4, 4)
+    with pytest.raises(ValueError):
+        K.sample_seeds_2(const_denoiser(torch.zeros_like(x)), x, _flow_sigmas(), eta=-0.5)
+    assert K.get_sampler("seeds_2") is K.sample_seeds_2
+    assert K.get_sampler("seeds_3") is K.sample_seeds_3
 
 
 def _unipc_sigma_dependent_model(target):

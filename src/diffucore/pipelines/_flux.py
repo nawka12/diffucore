@@ -33,12 +33,12 @@ _FLUX_SAMPLERS = {
     "dpmpp_3m_sde", "ipndm", "ipndm_v", "res_multistep", "res_multistep_ancestral",
     "gradient_estimation", "stork2", "stork4", "infinity", "lms", "lcm", "secant",
     "sa_solver", "sa_solver_pece",
-    "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "cogent", "cogent3",
+    "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "seeds_2", "seeds_3", "cogent", "cogent3",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
     "dpmpp_3m_sde", "euler_ancestral", "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
-    "cogent", "cogent3", "sa_solver", "sa_solver_pece",
+    "cogent", "cogent3", "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init is pure noise.
 _FLUX_SCHEDULERS = (

@@ -43,7 +43,7 @@ _ANIMA_SAMPLERS = {
     "lms", "lcm",
     "sa_solver", "sa_solver_pece",
     "secant", "secant_anneal",
-    "exp_heun_2_x0", "uni_pc", "uni_pc_bh2",
+    "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "seeds_2", "seeds_3",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
 }
 _FLOW_AWARE_SAMPLERS = {
@@ -51,7 +51,7 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate",
-    "sa_solver", "sa_solver_pece",
+    "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
 # noise at σ_max == 1.

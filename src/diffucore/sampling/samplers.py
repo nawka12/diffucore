@@ -37,6 +37,8 @@ __all__ = [
     "sample_dpmpp_sde",
     "sample_dpmpp_2m_sde",
     "sample_dpmpp_3m_sde",
+    "sample_seeds_2",
+    "sample_seeds_3",
     "sample_ipndm",
     "sample_ipndm_v",
     "sample_res_multistep",
@@ -622,6 +624,106 @@ def sample_exp_heun_2_x0(
             b1 = phi_1 - b2
             x = (sigma_next / sigma) * x - alpha_t * (b1 * denoised + b2 * denoised_2)
     return x
+
+
+def _seeds_noise(noise, h, dr, eta, x, generator):
+    """Carry SEEDS's σ-normalized noise integral a further ``dr·h`` in
+    half-logSNR: decay by e^(−η·dr·h), add the fresh increment. Every stage reads
+    one Brownian path, so the full step's noise is the exact SDE's."""
+    decay = (-eta * dr * h).exp()
+    fresh = (1 - decay ** 2).sqrt() * _noise_like(x, generator)
+    return fresh if noise is None else decay * noise + fresh
+
+
+def _seeds(model, x, sigmas, order, *, generator, callback, eta, s_noise, model_type, shift):
+    """Shared body of :func:`sample_seeds_2` and :func:`sample_seeds_3`.
+
+    Stage ``j`` lands at λ_s + r_j·h with the exact exponential-SDE step
+    ``(σ_r/σ)·e^(−η·r·h)·x + α_r·∫ k·e^(−k(λ_r−λ))·D(λ) dλ + σ_r·noise`` (k = 1+η),
+    D constant at the first stage. SEEDS-2 ends on the midpoint estimate;
+    SEEDS-3 makes D linear in λ through D_s and the latest stage (the
+    DPM-Solver-3 tableau, r = 1/3, 2/3)."""
+    if len(sigmas) <= 1:
+        return x
+    if eta < 0:
+        raise ValueError("eta must be >= 0")
+    s_in = x.new_ones([x.shape[0]])
+    lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
+    sigma_fn = lambda lam: _sigma_from_half_log_snr(lam, model_type)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    rs = (0.5, 1.0) if order == 2 else (1 / 3, 2 / 3, 1.0)
+    stochastic = eta > 0 and s_noise > 0
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+            continue
+        lambda_s = lambda_fn(sigma)
+        h = lambda_fn(sigma_next) - lambda_s
+        d_last, noise, r_prev = denoised, None, 0.0
+        for j, r in enumerate(rs):
+            lambda_r = lambda_s + r * h
+            sigma_r = sigma_next if r == 1.0 else sigma_fn(lambda_r)
+            alpha_r = sigma_r * lambda_r.exp()
+            H = (1 + eta) * r * h
+            e1 = (-H).expm1().neg()                         # 1 − e^(−H)
+            d = d_last if order == 2 else denoised
+            x_r = (sigma_r / sigma) * (-eta * r * h).exp() * x + alpha_r * e1 * d
+            if order == 3 and j > 0 and bool(H > 0):
+                # H·φ_2(−H) times D's change across [λ_s, λ_r].
+                x_r = x_r + alpha_r * (1 - e1 / H) * (r / rs[j - 1]) * (d_last - denoised)
+            if stochastic:
+                noise = _seeds_noise(noise, h, r - r_prev, eta, x, generator)
+                x_r = x_r + sigma_r * s_noise * noise
+                r_prev = r
+            if r == 1.0:
+                x = x_r
+            else:
+                d_last = model(x_r, sigma_r * s_in)
+    return x
+
+
+def sample_seeds_2(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """SEEDS-2 (Gonzalez et al., NeurIPS 2023, arXiv:2305.14267), data
+    prediction, clean-room from the paper: a stochastic exponential midpoint
+    method, two evaluations per step. The midpoint stage and the full step share
+    one Brownian path. ``eta=1`` is the reverse SDE, ``eta=0`` DPM-Solver++(2S).
+    Flow-aware."""
+    return _seeds(model, x, sigmas, 2, generator=generator, callback=callback, eta=eta,
+                  s_noise=s_noise, model_type=model_type, shift=shift)
+
+
+def sample_seeds_3(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    eta: float = 1.0,
+    s_noise: float = 1.0,
+    model_type: str = "ve",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """SEEDS-3 (same paper): the third-order stage, three evaluations per step,
+    stages at λ_s + h/3 and λ_s + 2h/3 on one Brownian path. ``eta=0`` is
+    DPM-Solver++(3S). Flow-aware."""
+    return _seeds(model, x, sigmas, 3, generator=generator, callback=callback, eta=eta,
+                  s_noise=s_noise, model_type=model_type, shift=shift)
 
 
 def _uni_pc_bh_update(model, x, model_prev, sigma_prev, lambda_prev,
@@ -2470,6 +2572,8 @@ SAMPLERS: dict[str, Denoiser] = {
     "secant": sample_secant,
     "secant_anneal": sample_secant_anneal,
     "exp_heun_2_x0": sample_exp_heun_2_x0,
+    "seeds_2": sample_seeds_2,
+    "seeds_3": sample_seeds_3,
     "uni_pc": partial(sample_uni_pc, variant="bh1"),
     "uni_pc_bh2": partial(sample_uni_pc, variant="bh2"),
     "cogent": sample_cogent,
