@@ -7,8 +7,10 @@ package ``flash_attn_turing``) is ×1.3–1.6 faster there on DiT shapes. It is 
 locally built optional extra; without it everything resolves to plain SDPA,
 and ``auto`` never picks it off sm75.
 
-``int8_turing`` (``kernels/int8_attn_sm75.cu``) runs Q K^T on INT8 and P V on
-fp16-accumulate tensor cores, ~×1.75 over FA2-Turing on an RTX 2060. It is
+``int8_turing`` runs Q K^T on INT8 and P V on fp16-accumulate tensor cores:
+``kernels/int8_attn_sm75.cu`` on Turing (~×1.75 over FA2-Turing on an RTX 2060)
+and ``kernels/int8_attn_sm80.cu`` on sm80+ (~×1.85 over SDPA on an RTX 5090;
+GeForce cards run fp16 with fp32 accumulation at half rate). It is
 approximate (per-call error ~0.4% vs ~0.02% for FA2), so ``auto`` never picks it
 and it only replaces self-attention: Anima's cross-attention (512 text keys, the
 largest INT8 error, ~1% of the attention time) keeps the exact backend. It is
@@ -26,7 +28,7 @@ import torch
 import torch.nn.functional as F
 
 _CHOICES = ("sdpa", "auto", "fa2_turing", "int8_turing")
-_INT8_SRC = Path(__file__).resolve().parent.parent / "kernels" / "int8_attn_sm75.cu"
+_KERNELS = Path(__file__).resolve().parent.parent / "kernels"
 _int8_build_error = ""
 
 
@@ -60,27 +62,35 @@ def _toolchain_available() -> bool:
             and shutil.which(cpp_extension.get_cxx_compiler()) is not None)
 
 
-def int8_turing_available(device=None) -> bool:
-    """Whether the INT8 kernel can be used here: an sm75 CUDA device and a CUDA
-    toolchain to build it. Cheap; the build itself happens at model load."""
+def _int8_arch(device=None) -> str | None:
+    """The sm arch an INT8 kernel is built for here ("75" or "80"+), else None."""
     if not torch.cuda.is_available():
-        return False
+        return None
+    cap = torch.cuda.get_device_capability(device)
+    return f"{cap[0]}{cap[1]}" if cap == (7, 5) or cap >= (8, 0) else None
+
+
+def int8_turing_available(device=None) -> bool:
+    """Whether the INT8 kernel can be used here: an sm75 or sm80+ CUDA device
+    and a CUDA toolchain to build it. Cheap; the build happens at model load."""
     if device is not None and getattr(device, "type", None) == "cpu":
         return False
-    return _is_sm75(device) and _toolchain_available()
+    return _int8_arch(device) is not None and _toolchain_available()
 
 
 @functools.cache
 def _int8_module():
     """Build (first time; torch caches the binary by source hash) and import the
-    INT8 kernel. ``None`` when the build fails, with the reason kept for the
-    explicit-backend error."""
+    INT8 kernel for this GPU's arch. ``None`` when the build fails, with the
+    reason kept for the explicit-backend error."""
     global _int8_build_error
+    arch = _int8_arch()
     try:
         from torch.utils.cpp_extension import load
+        src = _KERNELS / ("int8_attn_sm75.cu" if arch == "75" else "int8_attn_sm80.cu")
         return load(
-            name="diffucore_int8_attn_sm75", sources=[str(_INT8_SRC)],
-            extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_75,code=sm_75"],
+            name=f"diffucore_int8_attn_sm{arch}", sources=[str(src)],
+            extra_cuda_cflags=["-O3", "-std=c++20", f"-gencode=arch=compute_{arch},code=sm_{arch}"],
             extra_cflags=["-O3", "-std=c++20"], verbose=False,
         )
     except Exception as e:  # noqa: BLE001  any toolchain failure means "unavailable"
@@ -88,10 +98,9 @@ def _int8_module():
         return None
 
 
-def _common_requirements(policy, kernel_note):
+def _common_requirements(policy, arch_note, arch_ok):
     yield "device is not CUDA", policy.device.type == "cuda"
-    yield (f"GPU is not Turing; {kernel_note}",
-           policy.device.type == "cuda" and _is_sm75(policy.device))
+    yield arch_note, policy.device.type == "cuda" and arch_ok(policy.device)
     yield "compute dtype is not fp16", policy.compute_dtype == torch.float16
     yield ("incompatible with compile=True (the custom op graph-breaks in "
            "every block)", not policy.compile)
@@ -100,13 +109,14 @@ def _common_requirements(policy, kernel_note):
 def _fa2_requirements(policy):
     """(message, satisfied) pairs for running FA2-Turing under ``policy``."""
     yield "flash_attn_turing is not installed", _fa2_module() is not None
-    yield from _common_requirements(policy, "the kernel is compiled for sm_75 only")
+    yield from _common_requirements(policy, "GPU is not Turing; the kernel is compiled for sm_75 only", _is_sm75)
 
 
 def _int8_requirements(policy):
     """(message, satisfied) pairs for the INT8 kernel; builds it only when
     everything else holds."""
-    checks = list(_common_requirements(policy, "the INT8 kernel targets sm_75 only"))
+    checks = list(_common_requirements(policy, "GPU is older than Turing; the INT8 kernels need sm75 or sm80+",
+                                       lambda d: _int8_arch(d) is not None))
     checks.append(("no CUDA toolchain to build the INT8 kernel (needs nvcc, ninja and a C++ compiler)",
                    _toolchain_available()))
     yield from checks

@@ -1,7 +1,7 @@
 """Attention dispatch semantics: bit-exact SDPA default, silent "auto" fallback,
 loud explicit failure, and the per-call eligibility guard. The FA2-Turing
-kernel itself is sm75-only and not exercised here; the INT8 kernel's accuracy
-tests run only on an sm75 GPU with a CUDA toolchain.
+kernel itself is sm75-only and not exercised here; the INT8 kernels' accuracy
+tests run only on an sm75 or sm80+ GPU with a CUDA toolchain.
 """
 
 from __future__ import annotations
@@ -160,6 +160,15 @@ def test_int8_toolchain_needs_host_compiler(monkeypatch):
     assert not _attention._toolchain_available()
     monkeypatch.setattr(_attention.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert _attention._toolchain_available()
+
+
+def test_int8_arch_covers_turing_and_sm80_plus(monkeypatch):
+    from diffucore.models import _attention
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for cap, want in (((6, 1), None), ((7, 0), None), ((7, 5), "75"), ((8, 6), "86"),
+                      ((8, 9), "89"), ((12, 0), "120")):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d=None, c=cap: c)
+        assert _attention._int8_arch() == want
 
 
 def test_int8_stamps_self_attention_only():
