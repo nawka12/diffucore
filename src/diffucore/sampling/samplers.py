@@ -1573,6 +1573,83 @@ def sample_stork2(
     return x
 
 
+def sample_stork4(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    callback: Callback = None,
+    taylor_order: int = 1,
+) -> torch.Tensor:
+    """STORK-4 (Tan et al., ICLR 2026, arXiv:2505.24210), clean-room from the
+    paper. Deterministic, one evaluation per step, all families.
+
+    STORK-4 runs a ROCK4 cascade whose stage velocities are a Taylor polynomial
+    built from previous real evaluations, and it advances the stage times with
+    the same recurrence as the state. A velocity that depends only on σ is then
+    integrated as ROCK4 integrates a polynomial: exactly, up to the tabulated
+    coefficients (offline check against the ROCK4 tables: every Taylor term
+    within 2.5e-4 of exact at 9 stages, 1.5e-5 at 50). So the cascade is
+    applied in closed form, ``x + Δ·v + Δ²/2·v' + Δ³/6·v'' + Δ⁴/24·v'''``, which
+    makes the stage count irrelevant and the method a variable-step
+    Adams-Bashforth of order ``taylor_order + 1``. Compare :func:`sample_stork2`,
+    whose fixed stage abscissae damp the ``v'`` term to about 0.463.
+
+    ``taylor_order`` 1 (the paper's setting for latent flow models) to 3. The
+    derivatives are exact on nonuniform grids (the reference's order-2 ``v'``
+    stencil assumes uniform steps). Missing history or σ-collisions lower the
+    order for that step; the first step is Euler.
+    """
+    if taylor_order not in (1, 2, 3):
+        raise ValueError("taylor_order must be 1, 2 or 3")
+    s_in = x.new_ones([x.shape[0]])
+    hist_sigma: list[float] = []       # σ of the previous real evaluations, newest last
+    hist_v: list[torch.Tensor] = []
+    for i in range(len(sigmas) - 1):
+        sigma, sigma_next = sigmas[i], sigmas[i + 1]
+        denoised = model(x, sigma * s_in)
+        d = to_d(x, sigma * s_in, denoised)
+        if callback is not None:
+            callback(i, sigma, x, denoised)
+        if bool(sigma_next == 0):
+            x = denoised
+        else:
+            # Stencil: current point, then history newest first; a σ-collision ends it.
+            nodes, vals = [float(sigma)], [d]
+            for s_k, v_k in zip(reversed(hist_sigma), reversed(hist_v)):
+                if len(nodes) > taylor_order or any(abs(s_k - s) < 1e-8 for s in nodes):
+                    break
+                nodes.append(s_k)
+                vals.append(v_k)
+            # Newton coefficients f[0], f[0,1], f[0,1,2], ...
+            coef, col = [vals[0]], vals
+            for k in range(1, len(nodes)):
+                col = [(col[j] - col[j + 1]) / (nodes[j] - nodes[j + k]) for j in range(len(col) - 1)]
+                coef.append(col[0])
+            dt = sigma_next - sigma
+            step = d * dt
+            if len(coef) > 1:          # Taylor derivatives of the Newton polynomial at σ0
+                a = nodes[0] - nodes[1]
+                vp = coef[1]
+                if len(coef) > 2:
+                    b = nodes[0] - nodes[2]
+                    vp = vp + a * coef[2]
+                    vpp = 2.0 * coef[2]
+                    if len(coef) > 3:
+                        vp = vp + (a * b) * coef[3]
+                        vpp = vpp + (2.0 * (a + b)) * coef[3]
+                        step = step + (dt ** 4 / 24) * (6.0 * coef[3])
+                    step = step + (dt ** 3 / 6) * vpp
+                step = step + (dt ** 2 / 2) * vp
+            x = x + step
+        hist_sigma.append(float(sigma))
+        hist_v.append(d)
+        if len(hist_sigma) > taylor_order:
+            hist_sigma.pop(0)
+            hist_v.pop(0)
+    return x
+
+
 def sample_infinity(
     model: Denoiser,
     x: torch.Tensor,
@@ -2380,6 +2457,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "res_multistep_ancestral": sample_res_multistep_ancestral,
     "gradient_estimation": sample_gradient_estimation,
     "stork2": sample_stork2,
+    "stork4": sample_stork4,
     "infinity": sample_infinity,
     "infinity_realism": sample_infinity_realism,
     "infinity_omega": sample_infinity_omega,

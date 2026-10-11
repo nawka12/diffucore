@@ -255,7 +255,7 @@ def test_secant_registered_in_sampler_table():
 
 
 @pytest.mark.parametrize("name", ["heunpp2", "ipndm", "ipndm_v", "res_multistep",
-                                  "gradient_estimation", "stork2", "infinity",
+                                  "gradient_estimation", "stork2", "stork4", "infinity",
                                   "lms", "exp_heun_2_x0", "uni_pc", "uni_pc_bh2"])
 @pytest.mark.parametrize("sigmas_fn", [_ve_sigmas, _flow_sigmas])
 def test_new_deterministic_samplers_land_on_target(name, sigmas_fn):
@@ -1237,6 +1237,52 @@ def test_stork2_bad_args_raise():
 
 def test_stork2_registered_in_sampler_table():
     assert K.get_sampler("stork2") is K.sample_stork2
+
+
+def test_stork4_default_is_variable_step_ab2():
+    # taylor_order=1 is the collapsed ROCK4 cascade: exact variable-step AB2.
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * (0.4 * torch.tanh(x) + 0.2 * x * sg.view(-1, 1, 1, 1))
+    for sigmas in (S.karras_schedule(12, 0.03, 14.6), S.flow_matching_schedule(12, shift=3.0)):
+        sigmas = sigmas.double()
+        torch.manual_seed(0)
+        x_init = torch.randn(2, 4, 8, 8, dtype=torch.float64) * float(sigmas[0])
+        a = K.sample_stork4(model, x_init.clone(), sigmas)
+        b = K.sample_ipndm_v(model, x_init.clone(), sigmas, max_order=2)
+        assert torch.allclose(a, b, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("order", [1, 2, 3])
+def test_stork4_step_is_exact_for_polynomial_velocity(order):
+    # With d = p(σ), deg p <= taylor_order, every full-order step integrates p
+    # exactly on a nonuniform grid. Increments come from running on prefixes.
+    sigmas = S.flow_matching_schedule(10, shift=3.0).double()[:-1]
+    coef = [0.3, -1.1, 0.7, 2.0][: order + 1]
+    p = lambda s: sum(c * s ** k for k, c in enumerate(coef))
+    P = lambda s: sum(c * s ** (k + 1) / (k + 1) for k, c in enumerate(coef))
+    model = lambda x, sg: x - sg.view(-1, 1, 1, 1) * p(sg.view(-1, 1, 1, 1))
+    x_init = torch.zeros(1, 1, 1, 1, dtype=torch.float64)
+    run = lambda k: float(K.sample_stork4(model, x_init.clone(), sigmas[: k + 1], taylor_order=order))
+    for k in range(order + 2, len(sigmas)):
+        exact = float(P(sigmas[k]) - P(sigmas[k - 1]))
+        assert abs((run(k) - run(k - 1)) - exact) < 1e-12
+
+
+def test_stork4_deterministic_and_collision_safe():
+    model = lambda x, sg: 0.3 * torch.tanh(x)
+    x_init = torch.randn(1, 4, 4, 4)
+    for order in (1, 2, 3):
+        a = K.sample_stork4(model, x_init.clone(), _flow_sigmas(), taylor_order=order)
+        b = K.sample_stork4(model, x_init.clone(), _flow_sigmas(), taylor_order=order)
+        assert torch.equal(a, b)
+        sigmas = torch.tensor([1.0, 0.5, 0.5, 0.25, 0.25, 0.1, 0.0])
+        assert torch.isfinite(K.sample_stork4(model, x_init.clone(), sigmas, taylor_order=order)).all()
+
+
+def test_stork4_bad_args_and_registration():
+    x = torch.randn(1, 4, 4, 4)
+    with pytest.raises(ValueError):
+        K.sample_stork4(const_denoiser(torch.zeros_like(x)), x, _flow_sigmas(), taylor_order=4)
+    assert K.get_sampler("stork4") is K.sample_stork4
 
 
 # ── INFINITY ──────────────────────────────────────────────────────────
