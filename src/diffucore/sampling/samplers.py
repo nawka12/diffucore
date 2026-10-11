@@ -427,8 +427,9 @@ def sample_dpmpp_sde(
     model_type: str = "ve",
     shift: float = 1.0,
 ) -> torch.Tensor:
-    """DPM-Solver++ SDE (single-step 2nd order). Flow-aware via half-logSNR;
-    noise is seeded Gaussian, not a Brownian tree."""
+    """DPM-Solver++ SDE (single-step 2nd order). Flow-aware via half-logSNR.
+    The full step's noise contains the midpoint's, as k-diffusion's Brownian
+    tree (time σ) has it, drawn in closed form from seeded Gaussians."""
     if len(sigmas) <= 1:
         return x
     s_in = x.new_ones([x.shape[0]])
@@ -457,7 +458,8 @@ def sample_dpmpp_sde(
             h_ = sd.log().neg() - lambda_s
             x_2 = (alpha_s_1 / alpha_s) * (-h_).exp() * x - alpha_s_1 * (-h_).expm1() * denoised
             if eta > 0 and s_noise > 0:
-                x_2 = x_2 + alpha_s_1 * _noise_like(x, generator) * s_noise * su
+                noise_1 = _noise_like(x, generator)
+                x_2 = x_2 + alpha_s_1 * noise_1 * s_noise * su
             denoised_2 = model(x_2, sigma_s_1 * s_in)
 
             # Step 2
@@ -466,7 +468,10 @@ def sample_dpmpp_sde(
             denoised_d = (1 - fac) * denoised + fac * denoised_2
             x = (alpha_t / alpha_s) * (-h_).exp() * x - alpha_t * (-h_).expm1() * denoised_d
             if eta > 0 and s_noise > 0:
-                x = x + alpha_t * _noise_like(x, generator) * s_noise * su
+                # Independent draws here lose ~25% of the variance at 20 steps.
+                frac = (sigma - sigma_s_1) / (sigma - sigma_next)
+                noise = frac.sqrt() * noise_1 + (1 - frac).sqrt() * _noise_like(x, generator)
+                x = x + alpha_t * noise * s_noise * su
     return x
 
 

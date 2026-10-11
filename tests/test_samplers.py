@@ -660,6 +660,16 @@ def test_seeds_3_sde_keeps_the_gaussian_marginal(model_type):
     assert abs(float(out.var()) / float(_gauss_var(sigmas[-1], model_type)) - 1) < 0.02
 
 
+@pytest.mark.parametrize("model_type", ["ve", "flow"])
+def test_dpmpp_sde_keeps_the_gaussian_marginal(model_type):
+    # Independent midpoint and full-step noise lost 14% (ve) / 20% (flow) here.
+    sigmas = _gauss_sigmas(40, model_type)
+    g = torch.Generator().manual_seed(0)
+    x_init = torch.randn(1, 1, 500, 1000, generator=g, dtype=torch.float64) * _gauss_var(sigmas[0], model_type).sqrt()
+    out = K.sample_dpmpp_sde(_gauss_denoiser(model_type), x_init, sigmas, generator=g, model_type=model_type)
+    assert abs(float(out.var()) / float(_gauss_var(sigmas[-1], model_type)) - 1) < 0.05
+
+
 def test_seeds_seed_reproducible_and_stochastic():
     model = lambda x, sg: 0.3 * torch.tanh(x)
     x_init = torch.randn(1, 4, 8, 8)
