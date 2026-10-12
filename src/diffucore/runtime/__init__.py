@@ -43,6 +43,10 @@ class DevicePolicy:
     # next group's copy with compute on a side stream (~2 groups resident).
     stream_blocks_per_group: int = 1
     stream_prefetch: bool = False
+    # Where streamed blocks and parked encoders live between uses (Krea 2 so
+    # far): "pinned" RAM copies (async uploads), "file" (the checkpoint's own
+    # mmap, so no RAM copy: for models larger than free RAM), or "auto".
+    stream_masters: str = "auto"
     # ``cudnn_benchmark`` is on by default: bit-exact, 3-17% faster (backbone
     # only; VAE calls run under :func:`no_cudnn_autotune`). ``tf32`` and
     # ``channels_last`` are opt-in (Ampere+, not bit-exact); ``channels_last``
@@ -84,6 +88,8 @@ class DevicePolicy:
             raise ValueError(
                 f"stream_blocks_per_group must be >= 1; got {self.stream_blocks_per_group}"
             )
+        if self.stream_masters not in ("auto", "pinned", "file"):
+            raise ValueError(f"stream_masters must be 'auto', 'pinned', or 'file'; got {self.stream_masters!r}")
         if self.attention not in ("sdpa", "auto", "fa2_turing", "int8_turing"):
             raise ValueError(
                 f"attention must be 'sdpa', 'auto', 'fa2_turing', or 'int8_turing'; "
@@ -232,15 +238,40 @@ def staged(modules, device, offload):
 @contextmanager
 def on_device(module, device):
     """Move ``module`` to ``device`` for the duration, then park it on CPU and
-    ``empty_cache`` so the next stage sees the lower peak.
+    ``empty_cache`` so the next stage sees the lower peak. A :func:`file_backed`
+    module is uploaded from, and re-pointed back at, its checkpoint mmap.
     """
-    module.to(device)
+    masters = getattr(module, "_file_masters", None)
+    if masters is not None:
+        entries, dtype = masters
+        for t, master in entries:
+            t.data = _upload(master, device, dtype)
+    else:
+        module.to(device)
     try:
         yield module
     finally:
-        module.to(_CPU)
+        if masters is not None:
+            for t, master in entries:
+                t.data = master
+        else:
+            module.to(_CPU)
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+
+def _upload(master: torch.Tensor, device, dtype, non_blocking: bool = False) -> torch.Tensor:
+    t = master.to(device, non_blocking=non_blocking)
+    return t.to(dtype) if dtype is not None and t.is_floating_point() and t.dtype != dtype else t
+
+
+def file_backed(module, dtype=None):
+    """Park ``module`` on its loaded tensors (a checkpoint's mmap) instead of a
+    RAM copy: :func:`on_device` uploads them, cast to ``dtype``, and drops the
+    device copies afterward. The page cache holds the weights, so a model
+    bigger than free RAM still loads."""
+    module._file_masters = ([(t, t.data) for t in _stream_tensors(module)], dtype)
+    return module
 
 
 def _stream_tensors(module):
@@ -259,11 +290,14 @@ class _GroupStreamer:
     The pinned CPU copy is the permanent home: :meth:`_onload` copies a group
     to the GPU on the side stream, overlapping the current group's compute, and
     :meth:`_offload` re-points each tensor at its CPU master and drops the GPU
-    copy. At most two groups are resident.
+    copy. At most two groups are resident. With ``pin=False`` the master is
+    the tensor as loaded (a checkpoint mmap, any dtype), cast to ``dtype`` on
+    the GPU; pageable copies don't overlap, but no RAM copy is made.
     """
 
-    def __init__(self, groups, device, offload_device):
+    def __init__(self, groups, device, offload_device, *, pin: bool = True, dtype=None):
         self.device = device
+        self.dtype = dtype
         self.stream = torch.cuda.Stream(device)
         self.n = len(groups)
         self.resident = [False] * self.n
@@ -274,7 +308,7 @@ class _GroupStreamer:
             entries = []
             for module in group:
                 for t in _stream_tensors(module):
-                    master = t.data.to(offload_device).pin_memory()
+                    master = t.data.to(offload_device).pin_memory() if pin else t.data
                     t.data = master
                     entries.append((t, master))
             self.tensors.append(entries)
@@ -284,7 +318,7 @@ class _GroupStreamer:
             return
         with torch.cuda.stream(self.stream):
             for t, master in self.tensors[gi]:
-                t.data = master.to(self.device, non_blocking=True)
+                t.data = _upload(master, self.device, self.dtype, non_blocking=True)
             ev = torch.cuda.Event()
             ev.record(self.stream)
         self.copy_done[gi] = ev
@@ -313,7 +347,7 @@ class _GroupStreamer:
 
 
 def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_resident=(),
-                  num_blocks_per_group=1, prefetch=False):
+                  num_blocks_per_group=1, prefetch=False, masters="pinned", dtype=None):
     """Grouped sequential offload for a block-list backbone (FLUX DiT, SD/SDXL
     UNet, Anima DiT).
 
@@ -324,12 +358,17 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_re
     attributes to stream. ``keep_resident`` blocks are read outside their own
     forward (Anima's block 0, probed by TeaCache) and stay put.
     ``num_blocks_per_group`` groups consecutive blocks within one attr.
-    Returns the number of streamed blocks.
+    ``masters="file"`` keeps the blocks on their loaded tensors (the
+    checkpoint mmap) instead of RAM copies, uploading and casting them to
+    ``dtype`` per group (see :class:`_GroupStreamer`); it needs CUDA and implies
+    the side-stream streamer. Returns the number of streamed blocks.
     """
     keep = {id(m) for m in keep_resident}
+    file_masters = masters == "file"
+    cast = dtype if file_masters else None
     for name, child in backbone.named_children():
         if name not in block_attrs:
-            child.to(device)
+            child.to(device, cast)
 
     # Contiguous groups within each attr; kept-resident blocks are excluded.
     groups, n = [], 0
@@ -337,7 +376,7 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_re
         current = []
         for block in getattr(backbone, attr):
             if id(block) in keep:
-                block.to(device)
+                block.to(device, cast)
                 continue
             block.to(offload_device)
             current.append(block)
@@ -348,8 +387,9 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_re
         if current:
             groups.append(current)
 
-    if prefetch and device.type == "cuda":
-        streamer = _GroupStreamer(groups, device, offload_device)
+    if (prefetch or file_masters) and device.type == "cuda":
+        streamer = _GroupStreamer(groups, device, offload_device, pin=not file_masters,
+                                  dtype=dtype if file_masters else None)
         backbone._block_streamer = streamer  # keep the side stream / masters alive
         for gi, group in enumerate(groups):
             group[0].register_forward_pre_hook(lambda m, i, gi=gi: streamer.pre(gi))
@@ -514,4 +554,4 @@ def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
     return image, ("tiled" if tile else "untiled")
 
 
-__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "file_backed", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]

@@ -137,6 +137,28 @@ image = TextToImage(model)(
 )
 ```
 
+### Krea 2 (DiT)
+
+Raw and Turbo share one network; the variant (read off the filename, or passed
+as `variant=`) picks the sampling setup. The `krea2` scheduler is each
+checkpoint's own shift. `cfg_scale` is the usual CFG scale: Krea's documented
+guidance g equals `cfg_scale = g + 1` (Krea's 4.5 is 5.5 here). Turbo runs
+without CFG (`cfg_scale=1.0`).
+
+```python
+from diffucore import load_krea2_checkpoint, TextToImage
+from diffucore.runtime import DevicePolicy
+import torch
+
+policy = DevicePolicy(device=torch.device("cuda"), offload="stream", stream_prefetch=True)
+model = load_krea2_checkpoint(
+    "krea2/krea2_turbo_int8_convrot.safetensors", "krea2/qwen3vl_4b_bf16.safetensors",
+    "krea2/qwen_image_vae.safetensors", policy=policy,
+)
+image = TextToImage(model)(prompt, steps=8, cfg_scale=1.0, scheduler="krea2", seed=0)
+# Raw: steps=28, cfg_scale=5.5
+```
+
 ### FLUX (DiT)
 
 FLUX is a guidance-distilled rectified-flow MMDiT, so there's no negative-prompt
@@ -301,10 +323,18 @@ few-step multistep samplers (`dpmpp_2m`) need ≤0.01. Tune by eye, starting low
 | Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i · img2img · inpaint ‡ | flow-matching, Qwen3 + Qwen-Image VAE |
 | FLUX.1 (dev / schnell) | 1024² | t2i · img2img · inpaint ‡ | flow-matching MMDiT, T5-XXL + CLIP-L † |
 | FLUX.2 (Klein / Dev) | 1024² | t2i · img2img · inpaint ‡ | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev) † |
+| Krea 2 (Raw / Turbo) | 1024² | t2i | 12.8 B single-stream DiT, Qwen3-VL-4B + Qwen-Image VAE, bf16 / ComfyUI INT8 files § |
 
 ‡ Soft, latent-mask inpaint (no dedicated inpaint model).
 
 LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima.
+
+§ **Krea 2** is checked against the diffusers reference on real weights:
+tokenizer ids exact, text-encoder and DiT outputs within the bf16 reference's own
+rounding noise (fp16 here lands closer to an fp32 run than the reference does),
+and full Raw/Turbo images from the reference's initial noise match it visually.
+fp16 carries the residual stream at 1/4 scale (exact; the bf16-trained stream
+peaks at a third of fp16's range).
 
 † **FLUX.1 (schnell) and FLUX.2 (Klein-4B) load and run on the official real
 weights**: coherent, prompt-faithful, deterministic. Bit-exact parity against

@@ -25,7 +25,8 @@ image.save("fox.png")
 ```
 
 Supports SD 1.5, SDXL, **Anima**, and the **FLUX** family: txt2img, img2img, and
-inpaint, the same way across all of them. The full feature list, every model's
+inpaint, the same way across all of them. **Krea 2** (Raw and Turbo) runs
+txt2img. The full feature list, every model's
 examples, and performance numbers live in
 **[docs/USAGE.md](docs/USAGE.md)**.
 

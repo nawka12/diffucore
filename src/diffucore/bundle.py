@@ -8,22 +8,24 @@ dispatch on ``spec.architecture``.
 from __future__ import annotations
 
 import itertools
+import os
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from .conditioning import AnimaTokenizer, CLIPTokenizer, FluxTokenizer, Flux2Tokenizer
+from .conditioning import AnimaTokenizer, CLIPTokenizer, FluxTokenizer, Flux2Tokenizer, Krea2Tokenizer
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header
 from .models import (
     AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig,
     AnimaDiT, CosmosDiTConfig, QwenImageVAE, Qwen3TextEncoder, Qwen3Config,
     Qwen35TextEncoder, Qwen35Config,
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
+    Krea2Config, Krea2DiT,
 )
 from .models._attention import resolve_attention_backend, set_attention_backend
 from .models._fused import fused_glue_available, set_fused_glue
@@ -31,9 +33,10 @@ from .models._int8 import (
     adopt_int8_layers, dequantize_linears, int8_fast_available, int8_layers, quantize_linears,
 )
 from .models.anima_dit import int8_layer_names
+from .models.krea2_dit import int8_layer_names as krea2_int8_layer_names
 from .models.qwen_image_vae import convert_qwen2d_state_dict
 from .models.unet import sdxl_unet_config
-from .runtime import DevicePolicy, maybe_compile_backbone, stream_blocks, to_channels_last
+from .runtime import DevicePolicy, file_backed, maybe_compile_backbone, stream_blocks, to_channels_last
 from .sampling import DiscreteSchedule, make_betas
 
 # On-disk prefixes. SDXL keeps CLIP-L under embedders.0 and OpenCLIP bigG under
@@ -323,6 +326,179 @@ def load_anima_checkpoint(
         spec=spec,
         schedule=None,                  # flow: σ schedule built at sample time
         tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        backbone=backbone,
+        vae=vae,
+        text_encoder_2=None,
+        policy=policy,
+    )
+
+
+# ─── Krea 2 (Raw + Turbo) ────────────────────────────────────────────────────
+_KREA2_DIT_LEAF = "txtfusion.projector.weight"
+_KREA2_TE_LEAF = "layers.0.self_attn.q_norm.weight"
+# Krea 2 reads Qwen3-VL-4B hidden layers up to 35 of 36, so the last layer and
+# the final norm never run. Qwen3-VL's rope base; Qwen3-4B (FLUX.2 Klein) is 1e6.
+_KREA2_TE_LAYERS = 35
+_KREA2_TE_ROPE_THETA = 5_000_000.0
+
+
+def _krea2_text_encoder(te_sd) -> tuple[Qwen3TextEncoder, dict]:
+    """Qwen3-VL-4B's language model as a plain Qwen3: text-only, its mRoPE
+    (equal T/H/W positions) is 1-D RoPE. The vision tower is never read."""
+    lm = _extract_component(te_sd, _KREA2_TE_LEAF)
+    if lm is None:
+        raise ValueError("the text encoder file has no Qwen3 language model (expected Qwen3-VL-4B)")
+    n_layers = 1 + max(int(k.split(".")[1]) for k in lm if k.startswith("layers."))
+    if n_layers < _KREA2_TE_LAYERS:
+        raise ValueError(f"the text encoder has {n_layers} layers; Krea 2 needs Qwen3-VL-4B (36)")
+    sd = {"model." + k: v for k, v in lm.items()
+          if not (k.startswith("layers.") and int(k.split(".")[1]) >= _KREA2_TE_LAYERS)}
+    cfg = replace(_qwen3_config_from_sd(sd), rope_theta=_KREA2_TE_ROPE_THETA)
+    encoder = _build(Qwen3TextEncoder, cfg)
+    encoder.load_state_dict(sd, strict=True, assign=True)
+    return encoder, sd
+
+
+def _available_ram() -> int | None:
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except Exception:  # noqa: BLE001  no psutil: Linux /proc, else unknown
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except OSError:
+            pass
+    return None
+
+
+def _krea2_masters(policy: DevicePolicy, *paths: str) -> str:
+    """``policy.stream_masters``, with "auto" resolved to "file" when the files
+    plus a 4 GB margin exceed available RAM (pinned copies would swap or OOM)."""
+    if policy.stream_masters != "auto":
+        return policy.stream_masters
+    avail = _available_ram()
+    need = sum(os.path.getsize(p) for p in paths) + 4 * 2**30
+    return "file" if avail is not None and need > avail else "pinned"
+
+
+def load_krea2_dit(dit_path: str, policy: DevicePolicy, _stage=print, variant: str = "",
+                   masters: str = "pinned") -> Krea2DiT:
+    """The Krea 2 DiT alone, placed per ``policy`` (int8, streaming, attention
+    backend, fp16 residual scale). ``masters="file"`` streams the blocks
+    straight from the checkpoint's mmap (``offload="stream"`` only)."""
+    _stage("loading DiT weights (largest file)")
+    sd_dit = _extract_component(load_state_dict(dit_path, device="cpu"), _KREA2_DIT_LEAF)
+    cfg = Krea2Config.from_state_dict(sd_dit)
+    _stage(f"building DiT backbone ({cfg.layers} blocks, {variant})")
+    backbone = _build(Krea2DiT, cfg)
+    int8 = int8_layers(sd_dit)
+    if int8:
+        sd_dit = adopt_int8_layers(backbone, sd_dit, int8)
+    backbone.load_state_dict(sd_dit, strict=True, assign=True)
+    int8_fast = int8_fast_available(policy.device)
+    if int8 and not int8_fast:
+        _stage(f"INT8 file without a fast int8 path here (needs CUDA sm75+ and Triton): "
+               f"dequantizing {len(int8)} layers")
+        dequantize_linears(backbone, policy.compute_dtype,
+                           policy.device if policy.device.type == "cuda" else None)
+    elif int8:
+        _stage(f"INT8 file: {len(int8)} int8 layers")
+    elif policy.int8 and int8_fast:
+        n = quantize_linears(backbone, krea2_int8_layer_names(cfg.layers), policy.device)
+        _stage(f"int8: quantized {n} layers")
+    elif policy.int8:
+        _stage("int8 skipped: needs CUDA sm75+ and Triton")
+    # fp16 tops out at 65504 and the bf16-trained residual stream reaches ~2.3e4.
+    backbone.residual_scale = 0.25 if policy.compute_dtype == torch.float16 else 1.0
+    if policy.offload_stream and masters == "file":
+        _stage("streaming DiT blocks to GPU from the file's mmap (no RAM copy)")
+        stream_blocks(backbone.eval(), ("blocks",), policy.device, policy.offload_device,
+                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      masters="file", dtype=policy.compute_dtype)
+    elif policy.offload_stream:
+        _stage("streaming DiT blocks to GPU (low-VRAM mode)")
+        backbone = _place(backbone, policy.offload_device, policy.compute_dtype, sd_dit).eval()
+        stream_blocks(backbone, ("blocks",), policy.device, policy.offload_device,
+                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      prefetch=policy.stream_prefetch)
+    else:
+        unet_target = policy.offload_device if policy.offload_unet else policy.device
+        backbone = _place(backbone, unet_target, policy.compute_dtype, sd_dit).eval()
+
+    attn_backend = resolve_attention_backend(policy)
+    if attn_backend != "sdpa":
+        set_attention_backend(backbone, attn_backend)
+        _stage(f"attention backend: {attn_backend}")
+    backbone = maybe_compile_backbone(backbone, policy)
+    return backbone
+
+
+def load_krea2_checkpoint(
+    dit_path: str,
+    te_path: str,
+    vae_path: str,
+    *,
+    variant: str | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float16,
+    policy: DevicePolicy | None = None,
+) -> ModelBundle:
+    """Load Krea 2 (DiT + Qwen3-VL-4B TE + Qwen-Image VAE). Raw and Turbo share
+    weights layout and differ only in sampling, so ``variant`` ("raw" /
+    "turbo") is stamped on the spec; ``None`` reads it off the DiT filename."""
+    if policy is None:
+        policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
+    _t0 = time.perf_counter()
+    def _stage(msg: str) -> None:
+        print(f"[load] (+{time.perf_counter() - _t0:.1f}s) {msg}", flush=True)
+
+    _stage("detecting architecture")
+    spec = detect_architecture(read_header(dit_path))
+    if spec.architecture != "krea2":
+        raise ValueError(f"{dit_path!r} is not a Krea 2 checkpoint (detected {spec.architecture!r})")
+    if variant is None:
+        variant = "turbo" if "turbo" in Path(dit_path).name.lower() else "raw"
+    if variant not in ("raw", "turbo"):
+        raise ValueError(f"Krea 2 variant must be 'raw' or 'turbo'; got {variant!r}")
+    spec = replace(spec, variant=variant)
+
+    idle_target = policy.offload_device if policy.offload_idle else policy.device
+    masters = _krea2_masters(policy, dit_path, te_path) if policy.offload_idle else "pinned"
+
+    _stage("loading VAE weights")
+    vae = _build(QwenImageVAE)
+    vae_sd = load_state_dict(vae_path, device="cpu")
+    if "decoder.conv_in.weight" in vae_sd:
+        vae_sd = convert_qwen2d_state_dict(vae_sd, vae.state_dict())
+    vae.load_state_dict(vae_sd, strict=True, assign=True)
+    vae = _place(vae, idle_target, policy.vae_dtype, vae_sd).eval()
+
+    _stage("loading text encoder (Qwen3-VL-4B language model) weights")
+    te_file_sd = load_state_dict(te_path, device="cpu")
+    te_sd_keys = list(te_file_sd)
+    text_encoder, te_sd = _krea2_text_encoder(te_file_sd)
+    if masters == "file":
+        _stage("text encoder parked on the file's mmap (low RAM)")
+        text_encoder = file_backed(text_encoder.eval(), policy.compute_dtype)
+    else:
+        text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, te_sd).eval()
+
+    backbone = load_krea2_dit(dit_path, policy, _stage, variant, masters)
+    if text_encoder.cfg.hidden_size != backbone.cfg.txtdim:
+        raise ValueError(f"the text encoder is {text_encoder.cfg.hidden_size} wide but the DiT reads "
+                         f"{backbone.cfg.txtdim}; Krea 2 needs Qwen3-VL-4B")
+    if not any("visual." in k or "language_model." in k for k in te_sd_keys):
+        _stage("warning: the text encoder file has no Qwen3-VL markers; Krea 2 expects Qwen3-VL-4B")
+    _stage("model ready")
+
+    return ModelBundle(
+        spec=spec,
+        schedule=None,
+        tokenizer=Krea2Tokenizer(),
         text_encoder=text_encoder,
         backbone=backbone,
         vae=vae,

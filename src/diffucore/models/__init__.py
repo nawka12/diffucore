@@ -16,6 +16,7 @@ from .anima_dit import AnimaDiT, CosmosDiT, CosmosDiTConfig
 from .t5_text import T5Config, T5TextEncoder
 from .flux_dit import Flux, FluxConfig
 from .mistral_text import MistralConfig, MistralTextEncoder
+from .krea2_dit import Krea2Config, Krea2DiT
 
 __all__ = [
     "RMSNorm",
@@ -43,4 +44,6 @@ __all__ = [
     "FluxConfig",
     "MistralConfig",
     "MistralTextEncoder",
+    "Krea2Config",
+    "Krea2DiT",
 ]

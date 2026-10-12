@@ -21,6 +21,7 @@ _ATTN2_TO_K = re.compile(r"transformer_blocks\.\d+\.attn2\.to_k\.weight$")
 _ANIMA_FINGERPRINT = "llm_adapter.blocks.0.cross_attn.q_proj.weight"
 # FLUX double-stream blocks: bare in a BFL file, prefixed all-in-one.
 _FLUX_FINGERPRINT = "double_blocks.0.img_attn.qkv.weight"
+_KREA2_FINGERPRINT = "txtfusion.projector.weight"
 
 Shape = Sequence[int]
 
@@ -40,6 +41,7 @@ class ModelSpec:
     latent_scale: float = 0.18215   # VAE latent scale factor (SDXL uses 0.13025)
     latent_shift: float = 0.0       # VAE pre-scale shift (FLUX uses 0.1159; 0 for SD)
     guidance_distilled: bool = False  # FLUX-dev style baked-in guidance embedding
+    variant: str = ""               # same weights, different sampling setup (Krea 2 "raw"/"turbo")
 
 
 def _context_dim(shapes: Mapping[str, Shape]) -> int | None:
@@ -108,6 +110,13 @@ def _detect_flux(shapes: Mapping[str, Shape], prefix: str) -> ModelSpec:
     )
 
 
+def _krea2_prefix(shapes: Mapping[str, Shape]) -> str | None:
+    for k in shapes:
+        if k.endswith(_KREA2_FINGERPRINT):
+            return k[: -len(_KREA2_FINGERPRINT)]
+    return None
+
+
 def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
     """Infer a :class:`ModelSpec` from a ``{key: shape}`` mapping.
 
@@ -122,6 +131,18 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
             zero_terminal_snr=False,
             latent_channels=16,
             context_dim=1024,
+            image_size=1024,
+            latent_scale=1.0,
+        )
+
+    # Krea 2: single-stream DiT with a layer-fusing text path.
+    if _krea2_prefix(shapes) is not None:
+        return ModelSpec(
+            architecture="krea2",
+            prediction="flow",
+            zero_terminal_snr=False,
+            latent_channels=16,
+            context_dim=2560,
             image_size=1024,
             latent_scale=1.0,
         )
