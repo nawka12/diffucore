@@ -1,4 +1,4 @@
-"""Krea 2 text-to-image (Raw and Turbo).
+"""Krea 2 text-to-image, img2img and inpaint (Raw and Turbo).
 
 prompt -> Krea2Tokenizer -> Qwen3-VL-4B hidden layers 2..35 -> DiT text fusion
 (once per generation) -> Krea2DiT each step on a flow-matching σ schedule ->
@@ -16,10 +16,13 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Callable
 
+import numpy as np
 import torch
+from PIL import Image
 
 from ..conditioning.krea2_tokenizer import PREFIX_TOKENS, SELECT_LAYERS
-from ..runtime import fp32_accumulation, perf_context, staged, vae_decode_safe
+from ..runtime import (fp32_accumulation, no_cudnn_autotune, perf_context, staged, vae_decode_safe,
+                       vae_fallback_to_fp32)
 from ..sampling import (
     flow_matching_dynamic_shift,
     flow_matching_schedule,
@@ -28,7 +31,7 @@ from ..sampling import (
     guidance_interval_bounds,
 )
 from ._anima import _ANIMA_SAMPLERS, _FLOW_AWARE_SAMPLERS, _to_pil
-from ._base import PipelineInfo, _step_progress
+from ._base import PipelineInfo, _step_progress, preprocess_image
 
 if TYPE_CHECKING:
     from ..bundle import ModelBundle
@@ -101,6 +104,82 @@ def krea2_sigmas(scheduler: str, steps: int, variant: str, width: int, height: i
                                **table_kwargs), shift
 
 
+def _sampler_kwargs(sampler: str, gen, sched_shift: float, curvature: float, eta_max: float,
+                    gate_reduce: str) -> dict:
+    kwargs = {}
+    if sampler in _FLOW_AWARE_SAMPLERS:
+        kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
+    elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):
+        kwargs = dict(model_type="flow", shift=sched_shift)
+    if sampler in ("secant", "secant_anneal"):
+        kwargs.setdefault("generator", gen)
+        kwargs["curvature"] = curvature
+    if sampler == "infinity_aether":
+        kwargs["generator"] = gen
+    if sampler in ("euler_ancestral_anneal", "secant_anneal", "cogent", "cogent3", "cogent3_pump",
+                   "cogent3_pump_rate"):
+        kwargs["eta_max"] = eta_max
+    if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
+        kwargs["gate_reduce"] = gate_reduce
+    return kwargs
+
+
+def _sample(model: "ModelBundle", key, hit, feats, x: torch.Tensor, sigmas: torch.Tensor, *,
+            sampler: str, sampler_kwargs: dict, cfg_scale: float, cfg_lo: float, cfg_hi: float,
+            need_uncond: bool, progress_callback, preview_callback,
+            mask_lat: torch.Tensor | None = None, z0: torch.Tensor | None = None) -> torch.Tensor:
+    """Integrate ``x`` down ``sigmas``. With ``mask_lat`` (1 = repaint) the keep
+    region of each x0 estimate is pinned to ``z0``."""
+    policy = model.policy
+    device = policy.device
+    backbone = model.backbone
+    cond_ctx = uncond_ctx = None
+
+    def velocity(x_in: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        t = sigma.reshape(-1)[:1].float()
+        v = backbone(x_in, t, cond_ctx).float()
+        if uncond_ctx is not None and cfg_lo < float(sigma.max()) <= cfg_hi:
+            v_uncond = backbone(x_in, t, uncond_ctx).float()
+            v = v_uncond + cfg_scale * (v - v_uncond)
+        return v
+
+    def denoise(x_in, sigma_b):
+        """CONST x0 estimate ``x − σ·v`` in fp32."""
+        x0 = x_in.float() - sigma_b.float().view(-1, 1, 1, 1) * velocity(x_in, sigma_b)
+        if mask_lat is not None:
+            x0 = x0 * mask_lat + z0 * (1.0 - mask_lat)
+        return x0
+
+    with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+        cond_ctx, uncond_ctx = _contexts(model, key, hit, feats, need_uncond, device)
+        total = len(sigmas) - 1
+        with _step_progress(total, progress_callback, preview_callback) as on_step:
+            if sampler == "euler" and mask_lat is None:
+                for i in range(total):
+                    sigma, sigma_next = sigmas[i], sigmas[i + 1]
+                    v = velocity(x, sigma)
+                    denoised = x - sigma * v
+                    x = x + (sigma_next - sigma) * v
+                    on_step(i, sigma, x, denoised)
+            else:
+                x = get_sampler(sampler)(denoise, x, sigmas, callback=on_step, **sampler_kwargs)
+    return x
+
+
+def _decode(model: "ModelBundle", x: torch.Tensor):
+    policy = model.policy
+    with torch.no_grad(), staged([model.vae], policy.device, policy.offload_idle):
+        z = model.vae.process_out(x.to(policy.vae_dtype))
+        image, decode_mode = vae_decode_safe(model.vae, z, policy)
+    return _to_pil(image), decode_mode
+
+
+def _variant_defaults(model: "ModelBundle", steps: int | None, cfg_scale: float | None):
+    variant = model.spec.variant or "raw"
+    d = KREA2_DEFAULTS[variant]
+    return variant, (d["steps"] if steps is None else steps), (d["cfg_scale"] if cfg_scale is None else cfg_scale)
+
+
 def krea2_text_to_image(
     model: "ModelBundle",
     prompt: str,
@@ -139,10 +218,7 @@ def krea2_text_to_image(
         raise ValueError(f"Krea 2 scheduler must be one of {_KREA2_SCHEDULERS}; got {scheduler!r}")
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
-    variant = model.spec.variant or "raw"
-    defaults = KREA2_DEFAULTS[variant]
-    steps = defaults["steps"] if steps is None else steps
-    cfg_scale = defaults["cfg_scale"] if cfg_scale is None else cfg_scale
+    variant, steps, cfg_scale = _variant_defaults(model, steps, cfg_scale)
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -161,55 +237,102 @@ def krea2_text_to_image(
         else:
             x = torch.randn(1, 16, height // 8, width // 8, generator=gen, device=device,
                             dtype=dtype).float()
+        x = _sample(model, ("krea2", prompt, negative_prompt), hit, feats, x, sigmas,
+                    sampler=sampler,
+                    sampler_kwargs=_sampler_kwargs(sampler, gen, sched_shift, curvature, eta_max, gate_reduce),
+                    cfg_scale=cfg_scale, cfg_lo=cfg_lo, cfg_hi=cfg_hi, need_uncond=need_uncond,
+                    progress_callback=progress_callback, preview_callback=preview_callback)
+        image, decode_mode = _decode(model, x)
+        info = PipelineInfo(vae_decode_mode=decode_mode)
+        return (image, info) if return_info else image
 
-        backbone = model.backbone
-        cond_ctx = uncond_ctx = None
 
-        def velocity(x_in: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-            t = sigma.reshape(-1)[:1].float()
-            v = backbone(x_in, t, cond_ctx).float()
-            if uncond_ctx is not None and cfg_lo < float(sigma.max()) <= cfg_hi:
-                v_uncond = backbone(x_in, t, uncond_ctx).float()
-                v = v_uncond + cfg_scale * (v - v_uncond)
-            return v
+def krea2_img2img(
+    model: "ModelBundle",
+    prompt: str,
+    init_image: Image.Image,
+    negative_prompt: str = "",
+    *,
+    mask_image: "Image.Image | None" = None,
+    strength: float = 0.75,
+    steps: int | None = None,
+    cfg_scale: float | None = None,
+    cfg_interval_start: float = 0.0,
+    cfg_interval_end: float = 1.0,
+    shift: float = 3.0,
+    width: int = 1024,
+    height: int = 1024,
+    sampler: str = "euler",
+    scheduler: str = "krea2",
+    seed: int | None = None,
+    curvature: float = 0.25,
+    eta_max: float = 1.0,
+    gate_reduce: str = "all",
+    beta_alpha: float = 0.6,
+    beta_beta: float = 0.6,
+    lq_threshold: float = 0.025,
+    bm_weight: float = 0.5,
+    bm_alpha1: float = 0.8, bm_beta1: float = 2.0,
+    bm_alpha2: float = 3.0, bm_beta2: float = 0.7,
+    progress_callback: Callable[[int, int], None] | None = None,
+    preview_callback: Callable[[object], None] | None = None,
+    return_info: bool = False,
+):
+    """Krea 2 image-to-image, or inpaint when ``mask_image`` is given (white =
+    repaint). Same conventions as Anima's: ComfyUI's denoise (the schedule is
+    built for ``steps / strength`` steps and its last ``steps`` run), the
+    strength-noised start ``(1-σ)·z0 + σ·ε``, the keep region pinned at each
+    x0 estimate and its original pixels composited back after decode. Unknown
+    sampler / scheduler names fall back to ``euler`` / ``krea2``."""
+    if sampler not in _KREA2_SAMPLERS:
+        sampler = "euler"
+    if scheduler not in _KREA2_SCHEDULERS:
+        scheduler = "krea2"
+    if not 0.0 < strength <= 1.0:
+        raise ValueError(f"strength must be in (0, 1], got {strength}")
+    if width % 16 or height % 16:
+        raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
+    variant, steps, cfg_scale = _variant_defaults(model, steps, cfg_scale)
+    policy = model.policy
+    device, dtype = policy.device, policy.compute_dtype
 
-        def denoise(x_in, sigma_b):
-            """CONST x0 estimate ``x − σ·v`` in fp32."""
-            return x_in.float() - sigma_b.float().view(-1, 1, 1, 1) * velocity(x_in, sigma_b)
+    with perf_context(policy):
+        sigmas, sched_shift = krea2_sigmas(
+            scheduler, int(steps / strength), variant, width, height, shift, device,
+            alpha=beta_alpha, beta=beta_beta, threshold_noise=lq_threshold, bm_weight=bm_weight,
+            bm_alpha1=bm_alpha1, bm_beta1=bm_beta1, bm_alpha2=bm_alpha2, bm_beta2=bm_beta2)
+        sigmas = sigmas[-(steps + 1):]
+        cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
+        need_uncond = cfg_scale != 1.0 and cfg_hi > cfg_lo
+        hit, feats = _text_features(model, prompt, negative_prompt, need_uncond, device)
 
-        with staged([backbone], device, policy.offload_unet), torch.inference_mode():
-            cond_ctx, uncond_ctx = _contexts(model, ("krea2", prompt, negative_prompt), hit, feats,
-                                             need_uncond, device)
-            total = len(sigmas) - 1
-            with _step_progress(total, progress_callback, preview_callback) as on_step:
-                if sampler == "euler":
-                    for i in range(total):
-                        sigma, sigma_next = sigmas[i], sigmas[i + 1]
-                        v = velocity(x, sigma)
-                        denoised = x - sigma * v
-                        x = x + (sigma_next - sigma) * v
-                        on_step(i, sigma, x, denoised)
-                else:
-                    kwargs = {}
-                    if sampler in _FLOW_AWARE_SAMPLERS:
-                        kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
-                    elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):
-                        kwargs = dict(model_type="flow", shift=sched_shift)
-                    if sampler in ("secant", "secant_anneal"):
-                        kwargs.setdefault("generator", gen)
-                        kwargs["curvature"] = curvature
-                    if sampler == "infinity_aether":
-                        kwargs["generator"] = gen
-                    if sampler in ("euler_ancestral_anneal", "secant_anneal", "cogent", "cogent3",
-                                   "cogent3_pump", "cogent3_pump_rate"):
-                        kwargs["eta_max"] = eta_max
-                    if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate"):
-                        kwargs["gate_reduce"] = gate_reduce
-                    x = get_sampler(sampler)(denoise, x, sigmas, callback=on_step, **kwargs)
+        pixels = preprocess_image(init_image, width, height).to(device, policy.vae_dtype)
+        with torch.no_grad(), no_cudnn_autotune(), staged([model.vae], device, policy.offload_idle):
+            z_vae = model.vae.encode(pixels)
+            if z_vae.dtype == torch.float16 and not torch.isfinite(z_vae).all():
+                vae_fallback_to_fp32(model.vae, policy)
+                z_vae = model.vae.encode(pixels.float())
+            z0 = model.vae.process_in(z_vae).float()
+        gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+        noise = torch.randn(z0.shape, generator=gen, device=device, dtype=dtype).float()
+        sigma0 = sigmas[0]
+        x = (1.0 - sigma0) * z0 + sigma0 * noise
 
-        with torch.no_grad(), staged([model.vae], device, policy.offload_idle):
-            z = model.vae.process_out(x.to(policy.vae_dtype))
-            image, decode_mode = vae_decode_safe(model.vae, z, policy)
-        image = _to_pil(image)
+        mask_lat = None
+        if mask_image is not None:
+            m = mask_image.convert("L").resize((width // 8, height // 8), Image.BILINEAR)
+            mask_lat = torch.from_numpy(np.asarray(m, dtype=np.float32) / 255.0)[None, None].to(device)
+
+        x = _sample(model, ("krea2", prompt, negative_prompt), hit, feats, x, sigmas,
+                    sampler=sampler,
+                    sampler_kwargs=_sampler_kwargs(sampler, gen, sched_shift, curvature, eta_max, gate_reduce),
+                    cfg_scale=cfg_scale, cfg_lo=cfg_lo, cfg_hi=cfg_hi, need_uncond=need_uncond,
+                    progress_callback=progress_callback, preview_callback=preview_callback,
+                    mask_lat=mask_lat, z0=z0)
+        image, decode_mode = _decode(model, x)
+        if mask_image is not None:
+            keep = np.asarray(mask_image.convert("L").resize((width, height), Image.NEAREST)) < 128
+            original = np.asarray(init_image.convert("RGB").resize((width, height), Image.LANCZOS))
+            image = Image.fromarray(np.where(keep[..., None], original, np.asarray(image)).astype(np.uint8))
         info = PipelineInfo(vae_decode_mode=decode_mode)
         return (image, info) if return_info else image

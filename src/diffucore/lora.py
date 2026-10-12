@@ -11,6 +11,12 @@ Keys: SD1.5 / SDXL use kohya's ``lora_unet_`` / ``lora_te_`` / ``lora_te1_`` /
 ``named_modules()``); bigG's split q/k/v keys add into row slices of its fused
 ``in_proj_weight``. Anima uses dotted ``diffusion_model.<path>`` with
 ``lora_A``/``lora_B`` (or kohya-mangled names).
+
+Krea 2 is not fused: its streamed blocks may live on the checkpoint's
+read-only mmap, and a full-coverage snapshot would be ~12 GB. Each LoRA adds a
+forward hook per layer, ``out += scale · up(down(x))``, with the factors on
+the GPU; keys are ``diffusion_model.<path>``, kohya-mangled, or diffusers'
+``transformer.<path>``. LoKr is not supported there.
 """
 
 from __future__ import annotations
@@ -20,9 +26,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .loading import load_state_dict
 from .models._int8 import Int8Linear, lora_seed
+from .models.krea2_dit import from_diffusers_name
 
 _CPU = torch.device("cpu")
 
@@ -75,6 +83,11 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
     ``unmatched`` for keys that mapped to no layer.
     """
     state = _lora_state(bundle)
+    if _is_krea2(bundle):
+        report, handles = _krea2_attach(bundle, path, multiplier)
+        state["stack"].append((path, multiplier))
+        state.setdefault("hooks", []).append(handles)
+        return report
     targets = _build_targets(bundle)
     report = _fuse(path, multiplier, targets, state["base"], _anima_depth(bundle))
     state["stack"].append((path, multiplier))
@@ -84,19 +97,31 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
 def remove_lora(bundle, path: str) -> None:
     """Remove the most recent application of ``path`` and re-fuse the rest, as
     if it had never been applied. Raises ``ValueError`` if it isn't applied."""
-    stack = _lora_state(bundle)["stack"]
+    state = _lora_state(bundle)
+    stack = state["stack"]
     for i in range(len(stack) - 1, -1, -1):
         if stack[i][0] == path:
             del stack[i]
             break
     else:
         raise ValueError(f"{path!r} is not in the active LoRA stack")
+    if _is_krea2(bundle):
+        for h in state["hooks"].pop(i):
+            h.remove()
+        _krea2_invalidate(bundle)
+        return
     _refuse(bundle)
 
 
 def clear_loras(bundle) -> None:
     """Remove all LoRAs, restoring the base weights. No-op if none are applied."""
     state = _lora_state(bundle)
+    hooks = state.pop("hooks", [])
+    for handles in hooks:
+        for h in handles:
+            h.remove()
+    if hooks:
+        _krea2_invalidate(bundle)
     _restore(state["base"])
     state["base"].clear()
     state["stack"].clear()
@@ -313,6 +338,64 @@ def _add_bigg_targets(targets, model, prefix) -> None:
         mlp = f"{prefix}text_model_encoder_layers_{i}_mlp_"
         targets[mlp + "fc1"] = (block.mlp.c_fc.weight.data, None, None)
         targets[mlp + "fc2"] = (block.mlp.c_proj.weight.data, None, None)
+
+
+def _is_krea2(bundle) -> bool:
+    return getattr(bundle.spec, "architecture", None) == "krea2"
+
+
+def _krea2_invalidate(bundle) -> None:
+    """The cached text-stream tokens went through LoRA-able layers."""
+    if getattr(bundle, "cond_cache", None) is not None:
+        bundle.cond_cache.clear()
+
+
+class _LoraBranch:
+    """Forward hook adding ``x @ down.T @ (scale · up).T`` to a layer's output."""
+
+    def __init__(self, down: torch.Tensor, up: torch.Tensor):
+        self.down, self.up = down, up
+
+    def __call__(self, module, args, out):
+        x = args[0]
+        return out + F.linear(F.linear(x.to(self.down.dtype), self.down), self.up).to(out.dtype)
+
+
+def _krea2_targets(backbone) -> dict:
+    targets = {}
+    for name, module in backbone.named_modules():
+        if isinstance(module, (nn.Linear, Int8Linear)):
+            targets["diffusion_model." + name] = module
+            targets["lora_unet_" + name.replace(".", "_")] = module
+    return targets
+
+
+def _krea2_attach(bundle, path: str, multiplier: float):
+    """Hook each LoRA module onto its Krea 2 layer; ``(report, hook handles)``."""
+    policy = getattr(bundle, "policy", None)
+    device = policy.device if policy is not None else _CPU
+    dtype = policy.compute_dtype if policy is not None else torch.float32
+    targets = _krea2_targets(_eager(bundle.backbone))
+    handles, unmatched = [], []
+    for name, factors in _group(load_state_dict(path, device="cpu")).items():
+        key = name
+        if key.startswith("transformer."):
+            key = "diffusion_model." + from_diffusers_name(key[len("transformer."):])
+        module = targets.get(key)
+        if module is None or "down" not in factors or "up" not in factors:
+            unmatched.append(name)
+            continue
+        down, up = factors["down"].float(), factors["up"].float()
+        rank = down.shape[0]
+        if down.shape[1] != module.in_features or up.shape[0] != module.out_features:
+            unmatched.append(name)
+            continue
+        alpha = factors["alpha"].item() if "alpha" in factors else float(rank)
+        up = up * (alpha / rank * multiplier)
+        handles.append(module.register_forward_hook(
+            _LoraBranch(down.to(device, dtype), up.to(device, dtype))))
+    _krea2_invalidate(bundle)
+    return LoraReport(applied=len(handles), unmatched=unmatched), handles
 
 
 __all__ = ["apply_lora", "remove_lora", "clear_loras", "LoraReport"]

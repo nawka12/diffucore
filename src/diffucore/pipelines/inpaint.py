@@ -95,6 +95,23 @@ class Inpaint(_Pipeline):
                 progress_callback=progress_callback, preview_callback=preview_callback,
                 return_info=return_info,
             )
+        if self.model.spec.architecture == "krea2":
+            from ._krea2 import krea2_img2img
+            return krea2_img2img(
+                self.model, prompt, init_image, negative_prompt,
+                mask_image=mask_image,
+                strength=strength, steps=steps, cfg_scale=cfg_scale,
+                width=width or self.model.spec.image_size,
+                height=height or self.model.spec.image_size,
+                sampler=sampler, scheduler=scheduler, seed=seed,
+                cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
+                curvature=curvature, eta_max=eta_max, gate_reduce=gate_reduce,
+                beta_alpha=beta_alpha, beta_beta=beta_beta, lq_threshold=lq_threshold,
+                bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,
+                bm_alpha2=bm_alpha2, bm_beta2=bm_beta2,
+                progress_callback=progress_callback, preview_callback=preview_callback,
+                return_info=return_info,
+            )
         if self.model.spec.architecture in ("flux1", "flux2"):
             # FLUX is guidance-distilled: cfg_scale is the distilled guidance.
             from ._flux import flux_img2img

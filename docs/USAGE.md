@@ -323,11 +323,15 @@ few-step multistep samplers (`dpmpp_2m`) need ≤0.01. Tune by eye, starting low
 | Anima (Cosmos-Predict2 2 B DiT) | 1024² | t2i · img2img · inpaint ‡ | flow-matching, Qwen3 + Qwen-Image VAE |
 | FLUX.1 (dev / schnell) | 1024² | t2i · img2img · inpaint ‡ | flow-matching MMDiT, T5-XXL + CLIP-L † |
 | FLUX.2 (Klein / Dev) | 1024² | t2i · img2img · inpaint ‡ | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev) † |
-| Krea 2 (Raw / Turbo) | 1024² | t2i | 12.8 B single-stream DiT, Qwen3-VL-4B + Qwen-Image VAE, bf16 / ComfyUI INT8 files § |
+| Krea 2 (Raw / Turbo) | 1024² | t2i · img2img · inpaint ‡ | 12.8 B single-stream DiT, Qwen3-VL-4B + Qwen-Image VAE, bf16 / ComfyUI INT8 files § |
 
 ‡ Soft, latent-mask inpaint (no dedicated inpaint model).
 
-LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima.
+LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima. Krea 2 takes LoRA
+(ComfyUI or diffusers keys, not LoKr) as forward hooks instead of fused weights,
+so it works on streamed, file-backed and INT8 weights with no RAM snapshot.
+Diffusers-format Krea 2 transformers load from the `transformer/` folder, its
+repo root or its `*.index.json`.
 
 § **Krea 2** is checked against the diffusers reference on real weights:
 tokenizer ids exact, text-encoder and DiT outputs within the bf16 reference's own

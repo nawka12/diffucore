@@ -7,6 +7,9 @@ block streaming and tiled VAE decode. See ``docs/RUNTIME_SPEC.md``.
 
 from __future__ import annotations
 
+import ctypes
+import mmap
+import sys
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
@@ -15,6 +18,38 @@ import torch
 from .cond_cache import ConditioningCache
 
 _CPU = torch.device("cpu")
+
+
+def _resolve_madvise():
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        fn = ctypes.CDLL(None, use_errno=True).madvise
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    return fn
+
+
+_MADVISE = _resolve_madvise()
+# One MADV_WILLNEED call reads at most one readahead window: 4 MB on btrfs,
+# the device's (128 KB by default) elsewhere.
+_READAHEAD_CHUNK = 128 * 1024
+
+
+def _readahead(tensors) -> None:
+    """Queue the reads for mmap-backed ``tensors`` before they're copied.
+    Once an mmap's faults miss more than they hit (the page cache churning
+    under a model bigger than RAM), Linux stops reading around them and each
+    fault reads one 4 KB page: ~60 MB/s from an NVMe that does 2 GB/s.
+    MADV_WILLNEED reads at full speed regardless."""
+    if _MADVISE is None:
+        return
+    page = mmap.PAGESIZE
+    for t in tensors:
+        end = t.data_ptr() + t.nbytes
+        for p in range(t.data_ptr() // page * page, end, _READAHEAD_CHUNK):
+            _MADVISE(p, min(_READAHEAD_CHUNK, end - p), mmap.MADV_WILLNEED)
 
 
 @dataclass
@@ -244,6 +279,7 @@ def on_device(module, device):
     masters = getattr(module, "_file_masters", None)
     if masters is not None:
         entries, dtype = masters
+        _readahead(master for _, master in entries)
         for t, master in entries:
             t.data = _upload(master, device, dtype)
     else:
@@ -265,13 +301,28 @@ def _upload(master: torch.Tensor, device, dtype, non_blocking: bool = False) -> 
     return t.to(dtype) if dtype is not None and t.is_floating_point() and t.dtype != dtype else t
 
 
-def file_backed(module, dtype=None):
+def file_backed(module, dtype=None, exclude=()):
     """Park ``module`` on its loaded tensors (a checkpoint's mmap) instead of a
     RAM copy: :func:`on_device` uploads them, cast to ``dtype``, and drops the
     device copies afterward. The page cache holds the weights, so a model
-    bigger than free RAM still loads."""
-    module._file_masters = ([(t, t.data) for t in _stream_tensors(module)], dtype)
+    bigger than free RAM still loads. Tensors of the ``exclude`` submodules
+    are left alone (e.g. layers streamed by :func:`stream_layers`)."""
+    skip = {id(t) for m in exclude for t in _stream_tensors(m)}
+    module._file_masters = ([(t, t.data) for t in _stream_tensors(module) if id(t) not in skip], dtype)
     return module
+
+
+def stream_layers(layers, device, dtype=None) -> None:
+    """Upload each member of ``layers`` (an ``nn.ModuleList``) from its loaded
+    tensors for its own forward only, cast to ``dtype``, leaving the rest of
+    the parent where it is. With :func:`file_backed` on the parent, a model
+    runs from the file with about two layers on the device at a time."""
+    groups = [[m] for m in layers]
+    streamer = _GroupStreamer(groups, device, _CPU, pin=False, dtype=dtype)
+    layers._block_streamer = streamer
+    for gi, (m,) in enumerate(groups):
+        m.register_forward_pre_hook(lambda mod, i, gi=gi: streamer.pre(gi))
+        m.register_forward_hook(lambda mod, i, o, gi=gi: streamer.post(gi))
 
 
 def _stream_tensors(module):
@@ -298,6 +349,7 @@ class _GroupStreamer:
     def __init__(self, groups, device, offload_device, *, pin: bool = True, dtype=None):
         self.device = device
         self.dtype = dtype
+        self.pin = pin
         self.stream = torch.cuda.Stream(device)
         self.n = len(groups)
         self.resident = [False] * self.n
@@ -316,6 +368,8 @@ class _GroupStreamer:
     def _onload(self, gi):
         if self.resident[gi]:
             return
+        if not self.pin:
+            _readahead(master for _, master in self.tensors[gi])
         with torch.cuda.stream(self.stream):
             for t, master in self.tensors[gi]:
                 t.data = _upload(master, self.device, self.dtype, non_blocking=True)
@@ -366,9 +420,15 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_re
     keep = {id(m) for m in keep_resident}
     file_masters = masters == "file"
     cast = dtype if file_masters else None
+
+    def to_device(module):
+        if file_masters:
+            _readahead(_stream_tensors(module))
+        module.to(device, cast)
+
     for name, child in backbone.named_children():
         if name not in block_attrs:
-            child.to(device, cast)
+            to_device(child)
 
     # Contiguous groups within each attr; kept-resident blocks are excluded.
     groups, n = [], 0
@@ -376,7 +436,7 @@ def stream_blocks(backbone, block_attrs, device, offload_device=_CPU, *, keep_re
         current = []
         for block in getattr(backbone, attr):
             if id(block) in keep:
-                block.to(device, cast)
+                to_device(block)
                 continue
             block.to(offload_device)
             current.append(block)
@@ -554,4 +614,4 @@ def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
     return image, ("tiled" if tile else "untiled")
 
 
-__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "file_backed", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "perf_context", "staged", "stream_blocks", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "file_backed", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "perf_context", "staged", "stream_blocks", "stream_layers", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]

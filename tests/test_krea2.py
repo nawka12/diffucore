@@ -18,6 +18,7 @@ import importlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,20 @@ def test_tiny_bundle_generates_and_skips_unused_uncond(tiny_bundle, monkeypatch)
     assert len(calls) == 3                                            # both contexts cached
 
 
+def test_tiny_bundle_img2img_and_inpaint_keep_the_unmasked_pixels(tiny_bundle):
+    import numpy as np
+    from PIL import Image
+    from diffucore import ImageToImage, Inpaint
+    init = Image.fromarray((np.random.default_rng(0).random((48, 64, 3)) * 255).astype(np.uint8))
+    out = ImageToImage(tiny_bundle)("a cat", init, steps=2, strength=0.5, width=64, height=48, seed=0, cfg_scale=1.0)
+    assert out.size == (64, 48)
+    mask = np.zeros((48, 64), dtype=np.uint8)
+    mask[:, 32:] = 255
+    out = Inpaint(tiny_bundle)("a cat", init, Image.fromarray(mask), steps=2, strength=1.0, width=64, height=48,
+                               seed=0, cfg_scale=5.5, sampler="dpmpp_2m")
+    assert np.array_equal(np.asarray(out)[:, :32], np.asarray(init)[:, :32])
+
+
 _cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
@@ -238,6 +253,24 @@ def test_file_backed_module_uploads_casts_and_repoints():
     assert all(t.data_ptr() == masters[id(t)].data_ptr() and t.dtype == torch.bfloat16 for t in lin.parameters())
 
 
+def test_file_masters_are_read_ahead_in_window_sized_chunks(monkeypatch):
+    import mmap
+    from diffucore import runtime
+    calls = []
+    monkeypatch.setattr(runtime, "_MADVISE", lambda p, n, advice: calls.append((p, n, advice)))
+    lin = torch.nn.Linear(256, 300)    # 300 KB weight: three chunks
+    runtime.file_backed(lin)
+    with runtime.on_device(lin, torch.device("cpu")):
+        pass
+    assert {advice for _, _, advice in calls} == {mmap.MADV_WILLNEED}
+    assert all(p % mmap.PAGESIZE == 0 and n <= runtime._READAHEAD_CHUNK for p, n, _ in calls)
+    for t in lin.parameters():
+        start, end = t.data_ptr(), t.data_ptr() + t.nbytes
+        spans = sorted((p, p + n) for p, n, _ in calls if p < end and p + n > start)
+        assert spans[0][0] <= start and spans[-1][1] == end
+        assert all(a[1] == b[0] for a, b in zip(spans, spans[1:]))
+
+
 @_cuda
 def test_file_master_streaming_matches_resident():
     from diffucore.runtime import stream_blocks
@@ -251,8 +284,10 @@ def test_file_master_streaming_matches_resident():
     model = model.to(torch.bfloat16).eval()
     ref = Krea2DiT(cfg).half().cuda().eval()
     ref.load_state_dict(model.state_dict())
-    block_masters = [t.data for t in model.blocks.parameters()]
-    stream_blocks(model, ("blocks",), torch.device("cuda"), masters="file", dtype=torch.float16)
+    block_masters = [t.data for t in model.blocks[1:].parameters()]
+    stream_blocks(model, ("blocks",), torch.device("cuda"), keep_resident=(model.blocks[0],),
+                  masters="file", dtype=torch.float16)
+    assert model.blocks[0].mod.lin.device.type == "cuda"
     feats = torch.randn(1, 4, 3, 256, device="cuda")
     x, t = torch.randn(1, 16, 8, 8, device="cuda"), torch.tensor([0.5], device="cuda")
     with torch.inference_mode():
@@ -260,7 +295,33 @@ def test_file_master_streaming_matches_resident():
         got = model(x, t, model.encode_text(feats))
     assert torch.equal(got, want)
     assert all(t.data_ptr() == m.data_ptr() and t.dtype == torch.bfloat16
-               for t, m in zip(model.blocks.parameters(), block_masters))
+               for t, m in zip(model.blocks[1:].parameters(), block_masters))
+
+
+@_cuda
+def test_layer_streamed_file_backed_text_encoder_matches_resident():
+    from diffucore.models import Qwen3Config, Qwen3TextEncoder
+    from diffucore.runtime import file_backed, on_device, stream_layers
+    torch.manual_seed(0)
+    cfg = Qwen3Config(hidden_size=64, intermediate_size=128, num_hidden_layers=6,
+                      num_attention_heads=2, num_key_value_heads=1, head_dim=32)
+    te = Qwen3TextEncoder(cfg).eval()
+    for p in te.parameters():          # bf16 weights like the file; RoPE inv_freq stays fp32
+        p.data = p.data.to(torch.bfloat16)
+    ref = Qwen3TextEncoder(cfg).half().cuda().eval()
+    ref.load_state_dict(te.state_dict())
+    masters = [t.data for t in te.model.layers.parameters()]
+    file_backed(te, torch.float16, exclude=(te.model.layers,))
+    stream_layers(te.model.layers, torch.device("cuda"), torch.float16)
+    ids = torch.randint(0, 1000, (1, 12), device="cuda")
+    with torch.no_grad(), on_device(te, torch.device("cuda")):
+        assert te.model.embed_tokens.weight.device.type == "cuda"
+        assert te.model.layers[0].self_attn.q_proj.weight.device.type == "cpu"
+        got = te(ids, hidden_layers=[2, 5])
+    want = ref(ids, hidden_layers=[2, 5])
+    assert all(torch.equal(a, b) for a, b in zip(got, want))
+    assert te.model.embed_tokens.weight.device.type == "cpu"
+    assert all(t.data_ptr() == m.data_ptr() for t, m in zip(te.model.layers.parameters(), masters))
 
 
 def test_auto_masters_go_to_file_when_ram_is_short(monkeypatch, tmp_path):
@@ -274,3 +335,124 @@ def test_auto_masters_go_to_file_when_ram_is_short(monkeypatch, tmp_path):
     monkeypatch.setattr(bundle, "_available_ram", lambda: 64 * 2**30)
     assert bundle._krea2_masters(policy, str(f)) == "pinned"
     assert bundle._krea2_masters(DevicePolicy(device=torch.device("cpu"), stream_masters="file"), str(f)) == "file"
+
+
+def _tiny_krea2(seed: int = 0) -> Krea2DiT:
+    torch.manual_seed(seed)
+    cfg = Krea2Config(features=256, layers=2, heads=2, kvheads=1, mlp_dim=768, tdim=64, txtdim=256,
+                      txtheads=2, txtkvheads=2, txt_mlp_dim=768, txtlayers=3)
+    model = Krea2DiT(cfg).float()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(torch.randn_like(p) * 0.05)
+    return model.eval()
+
+
+def test_diffusers_names_map_onto_the_original_layout():
+    from diffucore.models.krea2_dit import from_diffusers_name
+    ours = set(_build(Krea2DiT, Krea2Config()).state_dict())
+    assert {from_diffusers_name(k) for k in _HEADERS["diffusers_keys"]} == ours
+
+
+def test_krea2_lora_hooks_match_a_fused_lora_in_all_three_formats(tmp_path):
+    from types import SimpleNamespace
+    from safetensors.torch import save_file
+    from diffucore.lora import apply_lora, clear_loras, remove_lora
+    from diffucore.runtime import ConditioningCache, DevicePolicy
+    model, fused = _tiny_krea2(), _tiny_krea2()
+    torch.manual_seed(1)
+    r = 4
+    layers = {  # original layer name -> the LoRA key base naming it
+        "blocks.0.attn.wq": "diffusion_model.blocks.0.attn.wq",
+        "blocks.1.mlp.down": "lora_unet_blocks_1_mlp_down",
+        "txtfusion.refiner_blocks.0.attn.wo": "transformer.text_fusion.refiner_blocks.0.attn.to_out.0",
+        "tproj.1": "transformer.time_mod_proj",
+    }
+    lora = {}
+    for name, key in layers.items():
+        lin = model.get_submodule(name)
+        down, up = torch.randn(r, lin.in_features) * 0.1, torch.randn(lin.out_features, r) * 0.1
+        if key.startswith("transformer."):
+            lora[key + ".lora_A.weight"], lora[key + ".lora_B.weight"] = down, up
+        else:
+            lora[key + ".lora_down.weight"], lora[key + ".lora_up.weight"] = down, up
+            lora[key + ".alpha"] = torch.tensor(2.0)
+        scale = 0.7 * (2.0 / r if not key.startswith("transformer.") else 1.0)
+        with torch.no_grad():
+            fused.get_submodule(name).weight += scale * up @ down
+    lora["diffusion_model.blocks.0.attn.nonexistent.lora_down.weight"] = torch.zeros(r, 4)
+    lora["diffusion_model.blocks.0.attn.nonexistent.lora_up.weight"] = torch.zeros(4, r)
+    save_file(lora, str(tmp_path / "l.safetensors"))
+
+    cache = ConditioningCache()
+    cache.put(("krea2", "p", ""), {"cond_ctx": torch.zeros(1), "uncond_ctx": None})
+    bundle = SimpleNamespace(spec=SimpleNamespace(architecture="krea2"), backbone=model, cond_cache=cache,
+                             policy=DevicePolicy(device=torch.device("cpu"), compute_dtype=torch.float32))
+    feats, x, t = torch.randn(1, 4, 3, 256), torch.randn(1, 16, 8, 8), torch.tensor([0.6])
+    with torch.no_grad():
+        base = model(x, t, model.encode_text(feats))
+        report = apply_lora(bundle, str(tmp_path / "l.safetensors"), 0.7)
+        assert report.applied == 4 and report.unmatched == ["diffusion_model.blocks.0.attn.nonexistent"]
+        assert cache.get(("krea2", "p", "")) is None
+        got = model(x, t, model.encode_text(feats))
+        want = fused(x, t, fused.encode_text(feats))
+        assert torch.allclose(got, want, rtol=1e-4, atol=1e-5)
+        remove_lora(bundle, str(tmp_path / "l.safetensors"))
+        assert torch.equal(model(x, t, model.encode_text(feats)), base)
+        apply_lora(bundle, str(tmp_path / "l.safetensors"), 0.7)
+        clear_loras(bundle)
+        assert torch.equal(model(x, t, model.encode_text(feats)), base)
+
+
+_TO_DIFFUSERS = [(re.compile(p), r) for p, r in [
+    (r"\.mod\.lin$", ".scale_shift_table"),
+    (r"\.prenorm\.scale$", ".norm1.weight"), (r"\.postnorm\.scale$", ".norm2.weight"),
+    (r"\.mlp\.", ".ff."),
+    (r"\.attn\.qknorm\.qnorm\.scale$", ".attn.norm_q.weight"),
+    (r"\.attn\.qknorm\.knorm\.scale$", ".attn.norm_k.weight"),
+    (r"\.attn\.wo\b", ".attn.to_out.0"), (r"\.attn\.gate\b", ".attn.to_gate"),
+    (r"\.attn\.wv\b", ".attn.to_v"), (r"\.attn\.wk\b", ".attn.to_k"), (r"\.attn\.wq\b", ".attn.to_q"),
+    (r"^txtmlp\.3\b", "txt_in.linear_2"), (r"^txtmlp\.1\b", "txt_in.linear_1"),
+    (r"^txtmlp\.0\.scale$", "txt_in.norm.weight"),
+    (r"^tproj\.1\b", "time_mod_proj"), (r"^tmlp\.2\b", "time_embed.linear_2"), (r"^tmlp\.0\b", "time_embed.linear_1"),
+    (r"^last\.modulation\.lin$", "final_layer.scale_shift_table"),
+    (r"^last\.norm\.scale$", "final_layer.norm.weight"), (r"^last\.linear\b", "final_layer.linear"),
+    (r"^first\b", "img_in"), (r"^txtfusion\.", "text_fusion."), (r"^blocks\.", "transformer_blocks."),
+]]
+
+
+def _to_diffusers(name: str) -> str:
+    for pattern, repl in _TO_DIFFUSERS:
+        name = pattern.sub(repl, name)
+    return name
+
+
+def test_loads_a_sharded_diffusers_transformer(tmp_path):
+    """The same weights as diffusers shards (renamed, [6, F] block modulation,
+    split over two files + an index) load to the same model, from the folder,
+    its parent repo or the index."""
+    from safetensors.torch import save_file
+    from diffucore.bundle import load_krea2_dit, _krea2_dit_state
+    from diffucore.models.krea2_dit import from_diffusers_name
+    from diffucore.runtime import DevicePolicy
+    model = _tiny_krea2()
+    sd = model.state_dict()
+    assert all(from_diffusers_name(_to_diffusers(k)) == k for k in _build(Krea2DiT, Krea2Config()).state_dict())
+    dsd = {}
+    for k, v in sd.items():
+        dk = _to_diffusers(k)
+        dsd[dk] = v.reshape(6, -1) if dk.startswith("transformer_blocks") and dk.endswith("scale_shift_table") else v
+    d = tmp_path / "Krea-2-Turbo" / "transformer"
+    d.mkdir(parents=True)
+    keys = sorted(dsd)
+    shards = {"m-1.safetensors": keys[: len(keys) // 2], "m-2.safetensors": keys[len(keys) // 2:]}
+    for f, ks in shards.items():
+        save_file({k: dsd[k].contiguous() for k in ks}, str(d / f))
+    (d / "m.safetensors.index.json").write_text(json.dumps({"weight_map": {k: f for f, ks in shards.items() for k in ks}}))
+    assert set(_krea2_dit_state(str(d))) == set(sd)
+    feats, x, t = torch.randn(1, 4, 3, 256), torch.randn(1, 16, 8, 8), torch.tensor([0.3])
+    for path in (str(d), str(d.parent), str(d / "m.safetensors.index.json")):
+        loaded = load_krea2_dit(path, DevicePolicy(device=torch.device("cpu"), compute_dtype=torch.float32),
+                                lambda m: None)
+        with torch.no_grad():
+            assert torch.equal(loaded(x, t, loaded.encode_text(feats)), model(x, t, model.encode_text(feats)))

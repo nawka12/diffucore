@@ -18,6 +18,7 @@ here no padding exists, which is exact (padded keys are always masked).
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 
 import torch
@@ -300,3 +301,50 @@ def int8_layer_names(num_blocks: int) -> list[str]:
         names += [f"blocks.{i}.attn.{p}" for p in ("wq", "wk", "wv", "gate", "wo")]
         names += [f"blocks.{i}.mlp.{p}" for p in ("gate", "up", "down")]
     return names
+
+
+# diffusers (Krea2Transformer2DModel) names -> the original ones, applied in
+# order. The tensors are identical apart from the per-block modulation table,
+# stored [6, F] instead of flat.
+_DIFFUSERS_RULES = [
+    (r"^transformer_blocks\.", "blocks."),
+    (r"^text_fusion\.", "txtfusion."),
+    (r"^img_in\b", "first"),
+    (r"^final_layer\.linear\b", "last.linear"),
+    (r"^final_layer\.norm\.weight$", "last.norm.scale"),
+    (r"^final_layer\.scale_shift_table$", "last.modulation.lin"),
+    (r"^time_embed\.linear_1\b", "tmlp.0"),
+    (r"^time_embed\.linear_2\b", "tmlp.2"),
+    (r"^time_mod_proj\b", "tproj.1"),
+    (r"^txt_in\.norm\.weight$", "txtmlp.0.scale"),
+    (r"^txt_in\.linear_1\b", "txtmlp.1"),
+    (r"^txt_in\.linear_2\b", "txtmlp.3"),
+    (r"\.attn\.to_q\b", ".attn.wq"),
+    (r"\.attn\.to_k\b", ".attn.wk"),
+    (r"\.attn\.to_v\b", ".attn.wv"),
+    (r"\.attn\.to_gate\b", ".attn.gate"),
+    (r"\.attn\.to_out\.0\b", ".attn.wo"),
+    (r"\.attn\.norm_q\.weight$", ".attn.qknorm.qnorm.scale"),
+    (r"\.attn\.norm_k\.weight$", ".attn.qknorm.knorm.scale"),
+    (r"\.ff\.", ".mlp."),
+    (r"\.norm1\.weight$", ".prenorm.scale"),
+    (r"\.norm2\.weight$", ".postnorm.scale"),
+    (r"\.scale_shift_table$", ".mod.lin"),
+]
+_DIFFUSERS_RES = [(re.compile(p), r) for p, r in _DIFFUSERS_RULES]
+
+
+def from_diffusers_name(name: str) -> str:
+    """A diffusers Krea 2 tensor or module name in the original naming."""
+    for pattern, repl in _DIFFUSERS_RES:
+        name = pattern.sub(repl, name)
+    return name
+
+
+def from_diffusers(state_dict: dict) -> dict:
+    """A diffusers-format Krea 2 transformer state dict in the original layout."""
+    out = {}
+    for k, v in state_dict.items():
+        name = from_diffusers_name(k)
+        out[name] = v.reshape(-1) if name.endswith(".mod.lin") else v
+    return out

@@ -8,6 +8,7 @@ dispatch on ``spec.architecture``.
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import threading
 import time
@@ -33,10 +34,12 @@ from .models._int8 import (
     adopt_int8_layers, dequantize_linears, int8_fast_available, int8_layers, quantize_linears,
 )
 from .models.anima_dit import int8_layer_names
+from .models.krea2_dit import from_diffusers as krea2_from_diffusers
 from .models.krea2_dit import int8_layer_names as krea2_int8_layer_names
 from .models.qwen_image_vae import convert_qwen2d_state_dict
 from .models.unet import sdxl_unet_config
-from .runtime import DevicePolicy, file_backed, maybe_compile_backbone, stream_blocks, to_channels_last
+from .runtime import (DevicePolicy, file_backed, maybe_compile_backbone, stream_blocks, stream_layers,
+                      to_channels_last)
 from .sampling import DiscreteSchedule, make_betas
 
 # On-disk prefixes. SDXL keeps CLIP-L under embedders.0 and OpenCLIP bigG under
@@ -360,6 +363,34 @@ def _krea2_text_encoder(te_sd) -> tuple[Qwen3TextEncoder, dict]:
     return encoder, sd
 
 
+def _krea2_dit_files(path: str) -> list[str]:
+    """A DiT file, or the shards of a diffusers ``transformer`` folder (given as
+    the folder, its parent repo, or its ``*.index.json``)."""
+    p = Path(path)
+    if p.is_dir():
+        if (p / "transformer").is_dir():
+            p = p / "transformer"
+        return [str(f) for f in sorted(p.glob("*.safetensors"))]
+    if p.name.endswith(".index.json"):
+        weight_map = json.loads(p.read_text())["weight_map"]
+        return [str(p.parent / f) for f in sorted(set(weight_map.values()))]
+    return [str(p)]
+
+
+def _krea2_dit_state(path: str, shapes_only: bool = False) -> dict:
+    """The DiT's state dict (or ``{key: shape}``) in the original naming, from
+    an original / ComfyUI file or diffusers shards."""
+    sd = {}
+    for f in _krea2_dit_files(path):
+        sd.update(read_header(f) if shapes_only else load_state_dict(f, device="cpu"))
+    if "img_in.weight" in sd:
+        if shapes_only:
+            from .models.krea2_dit import from_diffusers_name
+            return {from_diffusers_name(k): v for k, v in sd.items()}
+        return krea2_from_diffusers(sd)
+    return sd
+
+
 def _available_ram() -> int | None:
     try:
         import psutil
@@ -385,13 +416,40 @@ def _krea2_masters(policy: DevicePolicy, *paths: str) -> str:
     return "file" if avail is not None and need > avail else "pinned"
 
 
+# VRAM left free beside the GPU-resident blocks: activations, the staged TE
+# embedding + two streamed layers, VAE decode, LoRA factors and a resident
+# ~0.6 GB image tagger (the UI's rating pass).
+_KREA2_VRAM_RESERVE = 5 * 2**30
+
+
+def _device_bytes(module, dtype: torch.dtype) -> int:
+    size = torch.finfo(dtype).bits // 8
+    return sum(t.numel() * (size if t.is_floating_point() else t.element_size())
+               for t in itertools.chain(module.parameters(), module.buffers()))
+
+
+def _krea2_resident_blocks(backbone, policy: DevicePolicy) -> tuple:
+    """The leading blocks that fit in free VRAM after the non-block modules and
+    the reserve. Streaming only the rest keeps the per-step file reads well
+    inside the page cache (a cyclic scan just larger than the cache misses on
+    nearly every block) and cuts PCIe traffic."""
+    if policy.device.type != "cuda":
+        return ()
+    free, _ = torch.cuda.mem_get_info(policy.device)
+    dtype = policy.compute_dtype
+    rest = sum(_device_bytes(c, dtype) for n, c in backbone.named_children() if n != "blocks")
+    per = _device_bytes(backbone.blocks[0], dtype)
+    k = max(0, min(len(backbone.blocks), (free - rest - _KREA2_VRAM_RESERVE) // per))
+    return tuple(backbone.blocks[:k])
+
+
 def load_krea2_dit(dit_path: str, policy: DevicePolicy, _stage=print, variant: str = "",
                    masters: str = "pinned") -> Krea2DiT:
     """The Krea 2 DiT alone, placed per ``policy`` (int8, streaming, attention
     backend, fp16 residual scale). ``masters="file"`` streams the blocks
     straight from the checkpoint's mmap (``offload="stream"`` only)."""
     _stage("loading DiT weights (largest file)")
-    sd_dit = _extract_component(load_state_dict(dit_path, device="cpu"), _KREA2_DIT_LEAF)
+    sd_dit = _extract_component(_krea2_dit_state(dit_path), _KREA2_DIT_LEAF)
     cfg = Krea2Config.from_state_dict(sd_dit)
     _stage(f"building DiT backbone ({cfg.layers} blocks, {variant})")
     backbone = _build(Krea2DiT, cfg)
@@ -415,9 +473,11 @@ def load_krea2_dit(dit_path: str, policy: DevicePolicy, _stage=print, variant: s
     # fp16 tops out at 65504 and the bf16-trained residual stream reaches ~2.3e4.
     backbone.residual_scale = 0.25 if policy.compute_dtype == torch.float16 else 1.0
     if policy.offload_stream and masters == "file":
-        _stage("streaming DiT blocks to GPU from the file's mmap (no RAM copy)")
+        keep = _krea2_resident_blocks(backbone, policy)
+        _stage(f"DiT: {len(keep)} of {cfg.layers} blocks kept on the GPU, the rest streamed "
+               f"from the file's mmap (no RAM copy)")
         stream_blocks(backbone.eval(), ("blocks",), policy.device, policy.offload_device,
-                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      keep_resident=keep, num_blocks_per_group=policy.stream_blocks_per_group,
                       masters="file", dtype=policy.compute_dtype)
     elif policy.offload_stream:
         _stage("streaming DiT blocks to GPU (low-VRAM mode)")
@@ -457,17 +517,20 @@ def load_krea2_checkpoint(
         print(f"[load] (+{time.perf_counter() - _t0:.1f}s) {msg}", flush=True)
 
     _stage("detecting architecture")
-    spec = detect_architecture(read_header(dit_path))
+    spec = detect_architecture(_krea2_dit_state(dit_path, shapes_only=True))
     if spec.architecture != "krea2":
         raise ValueError(f"{dit_path!r} is not a Krea 2 checkpoint (detected {spec.architecture!r})")
     if variant is None:
-        variant = "turbo" if "turbo" in Path(dit_path).name.lower() else "raw"
+        # A diffusers folder's leaf is just "transformer"; read the whole path.
+        p = Path(dit_path)
+        where = str(p) if p.is_dir() or p.name.endswith(".index.json") else p.name
+        variant = "turbo" if "turbo" in where.lower() else "raw"
     if variant not in ("raw", "turbo"):
         raise ValueError(f"Krea 2 variant must be 'raw' or 'turbo'; got {variant!r}")
     spec = replace(spec, variant=variant)
 
     idle_target = policy.offload_device if policy.offload_idle else policy.device
-    masters = _krea2_masters(policy, dit_path, te_path) if policy.offload_idle else "pinned"
+    masters = _krea2_masters(policy, *_krea2_dit_files(dit_path), te_path) if policy.offload_idle else "pinned"
 
     _stage("loading VAE weights")
     vae = _build(QwenImageVAE)
@@ -481,8 +544,12 @@ def load_krea2_checkpoint(
     te_file_sd = load_state_dict(te_path, device="cpu")
     te_sd_keys = list(te_file_sd)
     text_encoder, te_sd = _krea2_text_encoder(te_file_sd)
-    if masters == "file":
-        _stage("text encoder parked on the file's mmap (low RAM)")
+    if masters == "file" and policy.device.type == "cuda":
+        _stage("text encoder parked on the file's mmap, layers streamed (low RAM)")
+        layers = text_encoder.model.layers
+        text_encoder = file_backed(text_encoder.eval(), policy.compute_dtype, exclude=(layers,))
+        stream_layers(layers, policy.device, policy.compute_dtype)
+    elif masters == "file":
         text_encoder = file_backed(text_encoder.eval(), policy.compute_dtype)
     else:
         text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, te_sd).eval()
