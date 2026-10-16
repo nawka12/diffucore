@@ -296,6 +296,26 @@ def on_device(module, device):
             torch.cuda.empty_cache()
 
 
+@contextmanager
+def parked_on_cpu(modules):
+    """Move the CUDA-resident tensors of ``modules`` to CPU for the duration and
+    back afterward, freeing VRAM for a one-off model. Streamed tensors already
+    sit on their CPU masters between forwards and are left alone."""
+    moved = []
+    for module in modules:
+        for t in _stream_tensors(module):
+            if t.device.type == "cuda":
+                moved.append((t, t.device))
+                t.data = t.data.to(_CPU)
+    if moved:
+        torch.cuda.empty_cache()
+    try:
+        yield
+    finally:
+        for t, device in moved:
+            t.data = t.data.to(device)
+
+
 def _upload(master: torch.Tensor, device, dtype, non_blocking: bool = False) -> torch.Tensor:
     t = master.to(device, non_blocking=non_blocking)
     return t.to(dtype) if dtype is not None and t.is_floating_point() and t.dtype != dtype else t
@@ -614,4 +634,4 @@ def vae_decode_safe(vae, latent: torch.Tensor, policy: "DevicePolicy"):
     return image, ("tiled" if tile else "untiled")
 
 
-__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "file_backed", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "perf_context", "staged", "stream_blocks", "stream_layers", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]
+__all__ = ["ConditioningCache", "DevicePolicy", "can_decode_untiled", "file_backed", "fp32_accumulation", "maybe_compile_backbone", "no_cudnn_autotune", "on_device", "parked_on_cpu", "perf_context", "staged", "stream_blocks", "stream_layers", "tiled_vae_decode", "to_channels_last", "vae_decode_safe", "vae_fallback_to_fp32"]

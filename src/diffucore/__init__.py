@@ -18,8 +18,8 @@ from .models._fused import fused_glue_available
 from .models._int8 import int8_fast_available
 from .runtime import ConditioningCache
 from .pipelines import (
-    ImageToImage, Inpaint, PipelineInfo, TextToImage,
-    anima_calibrate_oss, anima_calibrate_teacache,
+    ImageToImage, Inpaint, PipelineInfo, PromptEnhancer, TextToImage,
+    anima_calibrate_oss, anima_calibrate_teacache, load_prompt_enhancer,
 )
 
 __all__ = [
@@ -30,6 +30,6 @@ __all__ = [
     "int8_fast_available",
     "load_checkpoint", "load_anima_checkpoint", "load_flux_checkpoint", "load_krea2_checkpoint",
     "apply_lora", "remove_lora", "clear_loras", "LoraReport",
-    "ImageToImage", "Inpaint", "PipelineInfo", "TextToImage",
-    "anima_calibrate_oss", "anima_calibrate_teacache",
+    "ImageToImage", "Inpaint", "PipelineInfo", "PromptEnhancer", "TextToImage",
+    "anima_calibrate_oss", "anima_calibrate_teacache", "load_prompt_enhancer",
 ]
