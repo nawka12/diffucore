@@ -67,8 +67,13 @@ class AnimaTokenizer:
         self._ensure_loaded(max_length)
         q = self._qwen.encode(prompt)
         t = self._t5.encode(prompt)
+        q_ids, q_mask = q.ids, q.attention_mask
+        if not q_ids:
+            # As ComfyUI (min_length=1, masked <|endoftext|> pad); zero tokens
+            # also crash the Qwen3.5 encoder's causal conv.
+            q_ids, q_mask = [self._qwen.token_to_id("<|endoftext|>")], [0]
         return AnimaTokenized(
-            qwen_ids=torch.tensor([q.ids], dtype=torch.long),
-            qwen_mask=torch.tensor([q.attention_mask], dtype=torch.long),
+            qwen_ids=torch.tensor([q_ids], dtype=torch.long),
+            qwen_mask=torch.tensor([q_mask], dtype=torch.long),
             t5_ids=torch.tensor([t.ids], dtype=torch.long),
         )

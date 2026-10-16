@@ -56,6 +56,17 @@ def test_anima_tokenizer_golden_ids():
     assert out.t5_ids[0].tolist() == _GOLDEN_T5
 
 
+@pytest.mark.parametrize("qwen35,pad_id", [(False, 151643), (True, 248044)])
+def test_anima_tokenizer_empty_prompt_is_one_pad_token(qwen35, pad_id):
+    """ComfyUI's Anima tokenizers pad the Qwen side to min_length=1 with
+    <|endoftext|>, so an empty prompt is one masked pad token, never zero."""
+    from diffucore.conditioning import AnimaTokenizer
+    out = (AnimaTokenizer.qwen35() if qwen35 else AnimaTokenizer())("")
+    assert out.qwen_ids.tolist() == [[pad_id]]
+    assert out.qwen_mask.tolist() == [[0]]
+    assert out.t5_ids.tolist() == [[1]]
+
+
 def test_anima_tokenizer_truncates_to_max_length():
     from diffucore.conditioning import AnimaTokenizer
     out = AnimaTokenizer()("word " * 1000, max_length=16)

@@ -169,6 +169,18 @@ def test_qwen_encode_runs_without_autograd_graph():
     assert out.grad_fn is None and not out.requires_grad
 
 
+def test_qwen35_encodes_empty_prompt():
+    """An empty prompt (e.g. a blank negative) must reach the encoder as at
+    least one token: the linear-attention conv1d rejects a length-0 input."""
+    from diffucore.conditioning.anima_tokenizer import AnimaTokenizer
+    from diffucore.pipelines._anima import _qwen_encode
+    model = Qwen35TextEncoder(_tiny_cfg(vocab_size=248320)).eval()
+    ids = AnimaTokenizer.qwen35()("").qwen_ids
+    out = _qwen_encode(model, ids, None, torch.device("cpu"), torch.float32)
+    assert out.shape == (1, 1, 32)
+    assert torch.isfinite(out).all()
+
+
 @pytest.mark.parametrize("name", list(_CKPTS))
 def test_qwen35_strict_load_and_forward_shape(name):
     ckpt = _CKPTS[name]
