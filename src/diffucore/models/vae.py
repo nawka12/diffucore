@@ -11,6 +11,7 @@ Contracts (scale factor 0.18215 applied at the boundary, not inside the nets):
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import torch
@@ -31,6 +32,9 @@ class VAEConfig:
     # (shift 0, convs present) so SD1.5/SDXL loads and numerics are unchanged.
     shift_factor: float = 0.0
     use_quant_conv: bool = True
+    # Per-level decoder widths when they differ from the encoder's
+    # (base_channels * channel_mult): MOSS-Image's small FLUX.2 decoder.
+    decoder_channels: tuple[int, ...] | None = None
 
 
 def Normalize(channels: int) -> nn.GroupNorm:
@@ -156,9 +160,9 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self, cfg: VAEConfig):
         super().__init__()
-        ch = cfg.base_channels
         num_resolutions = len(cfg.channel_mult)
-        block_in = ch * cfg.channel_mult[-1]
+        widths = cfg.decoder_channels or tuple(cfg.base_channels * m for m in cfg.channel_mult)
+        block_in = widths[-1]
         self.conv_in = nn.Conv2d(cfg.z_channels, block_in, 3, padding=1)
 
         self.mid = nn.Module()
@@ -171,7 +175,7 @@ class Decoder(nn.Module):
         self.up = nn.ModuleList([nn.Module() for _ in range(num_resolutions)])
         cur_in = block_in
         for i in reversed(range(num_resolutions)):
-            block_out = ch * cfg.channel_mult[i]
+            block_out = widths[i]
             level = self.up[i]
             blocks = []
             for j in range(cfg.num_res_blocks + 1):
@@ -197,6 +201,44 @@ class Decoder(nn.Module):
                 h = level.upsample(h)
         h = self.conv_out(F.silu(self.norm_out(h)))
         return h
+
+
+_DIFFUSERS_VAE_RULES = [
+    (r"\.conv_norm_out\.", ".norm_out."),
+    (r"\.mid_block\.resnets\.0\.", ".mid.block_1."),
+    (r"\.mid_block\.resnets\.1\.", ".mid.block_2."),
+    (r"\.mid_block\.attentions\.0\.group_norm\.", ".mid.attn_1.norm."),
+    (r"\.mid_block\.attentions\.0\.to_q\.", ".mid.attn_1.q."),
+    (r"\.mid_block\.attentions\.0\.to_k\.", ".mid.attn_1.k."),
+    (r"\.mid_block\.attentions\.0\.to_v\.", ".mid.attn_1.v."),
+    (r"\.mid_block\.attentions\.0\.to_out\.0\.", ".mid.attn_1.proj_out."),
+    (r"\.down_blocks\.(\d+)\.resnets\.(\d+)\.", r".down.\1.block.\2."),
+    (r"\.down_blocks\.(\d+)\.downsamplers\.0\.", r".down.\1.downsample."),
+    (r"\.conv_shortcut\.", ".nin_shortcut."),
+]
+_DIFFUSERS_VAE_RES = [(re.compile(p), r) for p, r in _DIFFUSERS_VAE_RULES]
+_UP_RESNET = re.compile(r"\.up_blocks\.(\d+)\.resnets\.(\d+)\.")
+_UP_SAMPLER = re.compile(r"\.up_blocks\.(\d+)\.upsamplers\.0\.")
+
+
+def convert_diffusers_vae_state_dict(sd: dict) -> dict:
+    """An ``AutoencoderKL`` / ``AutoencoderKLFlux2`` diffusers state dict in the
+    LDM layout :class:`AutoencoderKL` mirrors. The decoder's ``up_blocks`` run
+    deepest first (``up_blocks.i`` is LDM ``up.(n-1-i)``) and the mid attention's
+    Linear q/k/v/out weights become 1x1 convs."""
+    n_up = 1 + max((int(m.group(1)) for k in sd if (m := _UP_RESNET.search(k))), default=-1)
+    out = {}
+    for key, value in sd.items():
+        new = "." + key
+        new = _UP_RESNET.sub(lambda m: f".up.{n_up - 1 - int(m.group(1))}.block.{m.group(2)}.", new)
+        new = _UP_SAMPLER.sub(lambda m: f".up.{n_up - 1 - int(m.group(1))}.upsample.", new)
+        for pattern, repl in _DIFFUSERS_VAE_RES:
+            new = pattern.sub(repl, new)
+        new = new[1:]
+        if ".mid.attn_1." in new and new.endswith(".weight") and value.ndim == 2:
+            value = value[:, :, None, None]
+        out[new] = value
+    return out
 
 
 class AutoencoderKL(nn.Module):

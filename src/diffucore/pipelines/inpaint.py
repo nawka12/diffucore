@@ -40,6 +40,7 @@ class Inpaint(_Pipeline):
         cfg_rescale: float | None = None,
         cfg_interval_start: float = 0.0,
         cfg_interval_end: float = 1.0,
+        uncond_skip_layers: "tuple[int, ...] | list[int] | None" = None,
         width: int | None = None,
         height: int | None = None,
         sampler: str = "euler",
@@ -105,6 +106,24 @@ class Inpaint(_Pipeline):
                 height=height or self.model.spec.image_size,
                 sampler=sampler, scheduler=scheduler, seed=seed,
                 cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
+                curvature=curvature, eta_max=eta_max, gate_reduce=gate_reduce,
+                beta_alpha=beta_alpha, beta_beta=beta_beta, lq_threshold=lq_threshold,
+                bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,
+                bm_alpha2=bm_alpha2, bm_beta2=bm_beta2,
+                progress_callback=progress_callback, preview_callback=preview_callback,
+                return_info=return_info,
+            )
+        if self.model.spec.architecture == "moss_image":
+            from ._moss import moss_img2img
+            return moss_img2img(
+                self.model, prompt, init_image, negative_prompt,
+                mask_image=mask_image,
+                strength=strength, steps=steps, cfg_scale=cfg_scale,
+                width=width or self.model.spec.image_size,
+                height=height or self.model.spec.image_size,
+                sampler=sampler, scheduler=scheduler, seed=seed,
+                cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
+                uncond_skip_layers=uncond_skip_layers,
                 curvature=curvature, eta_max=eta_max, gate_reduce=gate_reduce,
                 beta_alpha=beta_alpha, beta_beta=beta_beta, lq_threshold=lq_threshold,
                 bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,

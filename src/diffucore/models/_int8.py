@@ -156,6 +156,33 @@ class Int8Linear(nn.Module):
         return f"in_features={self.in_features}, out_features={self.out_features}, group={self.group}"
 
 
+class Int8Embedding(nn.Module):
+    """``nn.Embedding`` over an int8 ConvRot table with one fp32 scale per row
+    (ComfyUI's int8 text-encoder files quantize ``embed_tokens`` too). A lookup
+    gathers the rows, rescales and un-rotates only those, so the table is never
+    expanded; ``out_dtype`` is the activation dtype the lookup returns."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, group: int = GROUP, device=None):
+        super().__init__()
+        if group and embedding_dim % group:
+            raise ValueError(f"embedding_dim {embedding_dim} is not a multiple of the ConvRot group {group}")
+        self.num_embeddings, self.embedding_dim, self.group = num_embeddings, embedding_dim, group
+        self.out_dtype = torch.float32
+        self.register_buffer("weight", torch.empty(num_embeddings, embedding_dim, dtype=torch.int8, device=device))
+        self.register_buffer("scale_bits", torch.empty(num_embeddings, dtype=torch.int32, device=device))
+
+    @property
+    def scale(self) -> torch.Tensor:
+        return self.scale_bits.view(torch.float32)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        rows = dequantize_weight(self.weight[ids.reshape(-1)], self.scale[ids.reshape(-1)], self.group)
+        return rows.reshape(*ids.shape, self.embedding_dim).to(self.out_dtype)
+
+    def extra_repr(self) -> str:
+        return f"{self.num_embeddings}, {self.embedding_dim}, group={self.group}"
+
+
 def int_mm(q: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """int32 ``q @ w.T``. ``w.t()`` stays a transposed view: cuBLASLt is ~4x
     slower on a row-major ``[K, N]`` copy. ``_int_mm`` needs M > 16."""
@@ -338,6 +365,18 @@ def adopt_int8_layers(model: nn.Module, state_dict: dict, layers: dict[str, int]
         scale = state_dict.pop(name + ".weight_scale").float().reshape(-1)
         state_dict[name + ".scale_bits"] = scale.expand(lin.out_features).contiguous().view(torch.int32)
         del state_dict[name + ".comfy_quant"]
+    return state_dict
+
+
+def adopt_int8_embedding(model: nn.Module, state_dict: dict, name: str, group: int) -> dict:
+    """:func:`adopt_int8_layers` for an ``nn.Embedding`` (``name`` is the
+    embedding module, e.g. ``embed_tokens``)."""
+    parent, attr = _parent(model, name)
+    emb = getattr(parent, attr)
+    setattr(parent, attr, Int8Embedding(emb.num_embeddings, emb.embedding_dim, group, device="meta"))
+    scale = state_dict.pop(name + ".weight_scale").float().reshape(-1)
+    state_dict[name + ".scale_bits"] = scale.expand(emb.num_embeddings).contiguous().view(torch.int32)
+    del state_dict[name + ".comfy_quant"]
     return state_dict
 
 

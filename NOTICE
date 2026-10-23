@@ -18,6 +18,14 @@ krea-ai/krea-2 (Apache License 2.0, Krea); its module names mirror
 that implementation so released checkpoints load unchanged. Krea 2 weights are
 not distributed with this product and carry their own license.
 
+The MOSS-Image DiT (src/diffucore/models/moss_dit.py) and the sigma schedule in
+src/diffucore/pipelines/_moss.py are ported from the reference
+pipeline_moss_image.py of OpenMOSS-Team/MOSS-Image-SFT (Apache License 2.0,
+OpenMOSS Team); module names mirror it so released checkpoints load unchanged.
+tests/_moss_reference.py is that reference code, vendored for the oracle tests.
+MOSS-Image weights are not distributed with this product and carry their own
+license.
+
 The Qwen3.5 text encoder (src/diffucore/models/qwen35_text.py) follows the
 Qwen3.5 text model in Hugging Face transformers (Apache License 2.0, The
 Hugging Face Team and the Qwen Team); its parameter names mirror the released

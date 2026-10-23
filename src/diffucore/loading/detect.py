@@ -4,7 +4,8 @@ only, no weights).
 SD checkpoints use the LDM layout; the UNet cross-attention context width
 (``attn2.to_k``) tells the families apart: 768 = SD1.x, 1024 = SD2.x,
 2048 = SDXL. Anima (Cosmos-Predict2 + Qwen3 + Qwen-Image VAE) is found by its
-LLM-adapter fingerprint, FLUX by its double-stream blocks.
+LLM-adapter fingerprint, FLUX by its double-stream blocks, MOSS-Image by its
+shared block modulation.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ _ANIMA_FINGERPRINT = "llm_adapter.blocks.0.cross_attn.q_proj.weight"
 # FLUX double-stream blocks: bare in a BFL file, prefixed all-in-one.
 _FLUX_FINGERPRINT = "double_blocks.0.img_attn.qkv.weight"
 _KREA2_FINGERPRINT = "txtfusion.projector.weight"
+# MOSS-Image: the shared modulation tables (the official shards and the fused
+# ComfyUI files differ only in q/k/v, which these don't touch).
+_MOSS_FINGERPRINTS = ("shared_block_modulation.weight", "video_head_modulation.weight")
 
 Shape = Sequence[int]
 
@@ -30,7 +34,7 @@ Shape = Sequence[int]
 class ModelSpec:
     """Everything the engine needs to know about a checkpoint before building it."""
 
-    architecture: str          # e.g. "sd15", "sdxl", "anima", "flux1", "flux2"
+    architecture: str          # e.g. "sd15", "sdxl", "anima", "flux1", "flux2", "krea2", "moss_image"
     prediction: str            # "eps" | "v" | "flow"
     zero_terminal_snr: bool    # rescale the schedule to zero terminal SNR (ZTSNR)
     latent_channels: int       # VAE latent channel count
@@ -117,6 +121,14 @@ def _krea2_prefix(shapes: Mapping[str, Shape]) -> str | None:
     return None
 
 
+def _moss_prefix(shapes: Mapping[str, Shape]) -> str | None:
+    first, second = _MOSS_FINGERPRINTS
+    for k in shapes:
+        if k.endswith(first) and k[: -len(first)] + second in shapes:
+            return k[: -len(first)]
+    return None
+
+
 def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
     """Infer a :class:`ModelSpec` from a ``{key: shape}`` mapping.
 
@@ -143,6 +155,21 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
             zero_terminal_snr=False,
             latent_channels=16,
             context_dim=2560,
+            image_size=1024,
+            latent_scale=1.0,
+        )
+
+    # MOSS-Image (Base and SFT are the same network): checked before FLUX.
+    moss_prefix = _moss_prefix(shapes)
+    if moss_prefix is not None:
+        text_proj = shapes.get(moss_prefix + "text_embedder.proj.weight")
+        embedder = shapes.get(moss_prefix + "video_embedder.weight")
+        return ModelSpec(
+            architecture="moss_image",
+            prediction="flow",
+            zero_terminal_snr=False,
+            latent_channels=int(embedder[1]) if embedder is not None else 128,
+            context_dim=int(text_proj[1]) if text_proj is not None else 4096,
             image_size=1024,
             latent_scale=1.0,
         )

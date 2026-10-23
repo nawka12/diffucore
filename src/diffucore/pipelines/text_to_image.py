@@ -1,5 +1,5 @@
-"""Text-to-image pipeline: a thin wrapper over :class:`._base._Pipeline`. Anima
-and FLUX dispatch to their own drivers.
+"""Text-to-image pipeline: a thin wrapper over :class:`._base._Pipeline`. Anima,
+Krea 2, MOSS-Image and FLUX dispatch to their own drivers.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from ..runtime import perf_context
 from ._anima import anima_text_to_image, _ANIMA_SCHEDULERS
 from ._flux import flux_text_to_image, _FLUX_SCHEDULERS
 from ._krea2 import krea2_text_to_image, _KREA2_SCHEDULERS
+from ._moss import moss_text_to_image, _MOSS_SCHEDULERS
 from ._base import PipelineInfo, _Pipeline
 
 if TYPE_CHECKING:  # avoid importing the bundle (and torch-heavy models) eagerly
@@ -30,6 +31,7 @@ class TextToImage(_Pipeline):
         cfg_rescale: float | None = None,
         cfg_interval_start: float = 0.0,
         cfg_interval_end: float = 1.0,
+        uncond_skip_layers: "tuple[int, ...] | list[int] | None" = None,
         width: int | None = None,
         height: int | None = None,
         sampler: str = "euler",
@@ -92,6 +94,24 @@ class TextToImage(_Pipeline):
                 seed=seed, sampler=sampler,
                 scheduler=scheduler if scheduler in _KREA2_SCHEDULERS else "krea2",
                 cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
+                curvature=curvature, eta_max=eta_max, gate_reduce=gate_reduce,
+                beta_alpha=beta_alpha, beta_beta=beta_beta, lq_threshold=lq_threshold,
+                bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,
+                bm_alpha2=bm_alpha2, bm_beta2=bm_beta2,
+                progress_callback=progress_callback,
+                preview_callback=preview_callback,
+                return_info=return_info,
+            )
+        if self.model.spec.architecture == "moss_image":
+            return moss_text_to_image(
+                self.model, prompt, negative_prompt,
+                steps=steps, cfg_scale=cfg_scale, shift=shift,
+                width=width if width is not None else self.model.spec.image_size,
+                height=height if height is not None else self.model.spec.image_size,
+                seed=seed, sampler=sampler,
+                scheduler=scheduler if scheduler in _MOSS_SCHEDULERS else "moss",
+                cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
+                uncond_skip_layers=uncond_skip_layers,
                 curvature=curvature, eta_max=eta_max, gate_reduce=gate_reduce,
                 beta_alpha=beta_alpha, beta_beta=beta_beta, lq_threshold=lq_threshold,
                 bm_weight=bm_weight, bm_alpha1=bm_alpha1, bm_beta1=bm_beta1,

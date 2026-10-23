@@ -1,5 +1,5 @@
 """Neural-network backbones, implemented from their original publications:
-text encoders, the SD UNet, the VAEs, and the Anima and FLUX DiTs. Each is
+text encoders, the SD UNet, the VAEs, and the Anima, FLUX, Krea 2 and MOSS DiTs. Each is
 strict-loadable from real checkpoints.
 """
 
@@ -17,6 +17,7 @@ from .t5_text import T5Config, T5TextEncoder
 from .flux_dit import Flux, FluxConfig
 from .mistral_text import MistralConfig, MistralTextEncoder
 from .krea2_dit import Krea2Config, Krea2DiT
+from .moss_dit import MossConfig, MossDiT
 
 __all__ = [
     "RMSNorm",
@@ -46,4 +47,6 @@ __all__ = [
     "MistralTextEncoder",
     "Krea2Config",
     "Krea2DiT",
+    "MossConfig",
+    "MossDiT",
 ]

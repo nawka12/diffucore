@@ -11,7 +11,7 @@ LoRA / LoKr adapters. See ``docs/ARCHITECTURE.md`` and ``docs/ROADMAP.md``.
 __version__ = "0.2.1"
 
 from .bundle import (ModelBundle, load_anima_checkpoint, load_checkpoint, load_flux_checkpoint,
-                     load_krea2_checkpoint)
+                     load_krea2_checkpoint, load_moss_checkpoint)
 from .lora import LoraReport, apply_lora, clear_loras, remove_lora
 from .models._attention import fa2_turing_available, int8_turing_available
 from .models._fused import fused_glue_available
@@ -29,6 +29,7 @@ __all__ = [
     "fused_glue_available",
     "int8_fast_available",
     "load_checkpoint", "load_anima_checkpoint", "load_flux_checkpoint", "load_krea2_checkpoint",
+    "load_moss_checkpoint",
     "apply_lora", "remove_lora", "clear_loras", "LoraReport",
     "ImageToImage", "Inpaint", "PipelineInfo", "PromptEnhancer", "TextToImage",
     "anima_calibrate_oss", "anima_calibrate_teacache", "load_prompt_enhancer",

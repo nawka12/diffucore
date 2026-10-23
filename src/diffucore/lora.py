@@ -17,18 +17,26 @@ read-only mmap, and a full-coverage snapshot would be ~12 GB. Each LoRA adds a
 forward hook per layer, ``out += scale · up(down(x))``, with the factors on
 the GPU; keys are ``diffusion_model.<path>``, kohya-mangled, or diffusers'
 ``transformer.<path>``. LoKr is not supported there.
+
+MOSS-Image is hooked the same way. Its q/k/v LoRAs (separate in every file)
+add into the row thirds of the fused ``proj.qkv`` output; the text embedder's
+``text_embedder.blocks.N.*`` layers are targets too. ``alpha`` comes from the
+``.alpha`` tensor, else the file's metadata (``alpha``, or PEFT's
+``lora_adapter_metadata``), else the rank. A LoRA that carries a weight of a
+different shape (a control adapter) is rejected.
 """
 
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .loading import load_state_dict
+from .loading import load_state_dict, read_metadata
 from .models._int8 import Int8Linear, lora_seed
 from .models.krea2_dit import from_diffusers_name
 
@@ -83,8 +91,9 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
     ``unmatched`` for keys that mapped to no layer.
     """
     state = _lora_state(bundle)
-    if _is_krea2(bundle):
-        report, handles = _krea2_attach(bundle, path, multiplier)
+    if _is_hooked(bundle):
+        attach = _moss_attach if _is_moss(bundle) else _krea2_attach
+        report, handles = attach(bundle, path, multiplier)
         state["stack"].append((path, multiplier))
         state.setdefault("hooks", []).append(handles)
         return report
@@ -105,7 +114,7 @@ def remove_lora(bundle, path: str) -> None:
             break
     else:
         raise ValueError(f"{path!r} is not in the active LoRA stack")
-    if _is_krea2(bundle):
+    if _is_hooked(bundle):
         for h in state["hooks"].pop(i):
             h.remove()
         _krea2_invalidate(bundle)
@@ -344,6 +353,15 @@ def _is_krea2(bundle) -> bool:
     return getattr(bundle.spec, "architecture", None) == "krea2"
 
 
+def _is_moss(bundle) -> bool:
+    return getattr(bundle.spec, "architecture", None) == "moss_image"
+
+
+def _is_hooked(bundle) -> bool:
+    """Families whose LoRAs are forward hooks rather than fused weights."""
+    return _is_krea2(bundle) or _is_moss(bundle)
+
+
 def _krea2_invalidate(bundle) -> None:
     """The cached text-stream tokens went through LoRA-able layers."""
     if getattr(bundle, "cond_cache", None) is not None:
@@ -396,6 +414,111 @@ def _krea2_attach(bundle, path: str, multiplier: float):
             _LoraBranch(down.to(device, dtype), up.to(device, dtype))))
     _krea2_invalidate(bundle)
     return LoraReport(applied=len(handles), unmatched=unmatched), handles
+
+
+class _LoraSlices:
+    """Forward hook adding several low-rank branches into row slices of one
+    layer's output (the three q/k/v LoRAs on the fused ``proj.qkv``)."""
+
+    def __init__(self, branches):
+        self.branches = branches            # [(row_start, row_end, down, up)]
+
+    def __call__(self, module, args, out):
+        x = args[0]
+        for lo, hi, down, up in self.branches:
+            out[..., lo:hi] += F.linear(F.linear(x.to(down.dtype), down), up).to(out.dtype)
+        return out
+
+
+def _moss_targets(backbone) -> dict:
+    """LoRA module name -> ``(layer, (row_start, row_end) or None)``, under the
+    bare, ``diffusion_model.`` and ``transformer.`` dotted names and kohya's
+    ``lora_unet_`` mangling. ``proj.q/k/v`` are the row thirds of ``proj.qkv``."""
+    targets = {}
+    for name, module in backbone.named_modules():
+        if not isinstance(module, (nn.Linear, Int8Linear)):
+            continue
+        entries = {name: (module, None)}
+        if name.endswith(".proj.qkv"):
+            third = module.out_features // 3
+            for i, c in enumerate("qkv"):
+                entries[name[:-3] + c] = (module, (i * third, (i + 1) * third))
+        for key, target in entries.items():
+            for prefix in ("", "diffusion_model.", "transformer."):
+                targets[prefix + key] = target
+            targets["lora_unet_" + key.replace(".", "_")] = target
+    return targets
+
+
+def _moss_metadata_alpha(path: str) -> float | None:
+    """The file-wide alpha: safetensors metadata ``alpha`` (kohya / trainers) or
+    ``lora_alpha`` of PEFT's ``lora_adapter_metadata``."""
+    meta = read_metadata(path)
+    try:
+        if "alpha" in meta:
+            return float(meta["alpha"])
+        if "lora_adapter_metadata" in meta:
+            return float(json.loads(meta["lora_adapter_metadata"])["lora_alpha"])
+    except (ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _moss_attach(bundle, path: str, multiplier: float):
+    """Hook each LoRA module onto its MOSS-Image layer; ``(report, hook handles)``."""
+    policy = getattr(bundle, "policy", None)
+    device = policy.device if policy is not None else _CPU
+    dtype = policy.compute_dtype if policy is not None else torch.float32
+    targets = _moss_targets(_eager(bundle.backbone))
+    state_dict = load_state_dict(path, device="cpu")
+    file_alpha = _moss_metadata_alpha(path)
+    unmatched = [k for k in state_dict
+                 if not any(k.endswith(suffix) for suffix, _ in _SUFFIXES)]
+    for key in unmatched:
+        # A full weight / bias riding along (a control adapter such as the
+        # color-depth one widens video_embedder) can't be a side branch.
+        base, _, leaf = key.rpartition(".")
+        target = targets.get(base)
+        if target is not None and leaf in ("weight", "bias"):
+            have = getattr(target[0], leaf)
+            if have is not None and tuple(have.shape) != tuple(state_dict[key].shape):
+                raise ValueError(
+                    f"this LoRA changes the shape of {base}.{leaf} {tuple(have.shape)} -> "
+                    f"{tuple(state_dict[key].shape)} (a control / adapter LoRA); only plain LoRAs "
+                    f"are supported for MOSS-Image")
+
+    per_layer: dict = {}
+    for name, factors in _group(state_dict).items():
+        target = targets.get(name)
+        if target is None or "down" not in factors or "up" not in factors:
+            unmatched.append(name)
+            continue
+        module, rows = target
+        down, up = factors["down"].float(), factors["up"].float()
+        rank = down.shape[0]
+        out_features = module.out_features if rows is None else rows[1] - rows[0]
+        if down.shape[1] != module.in_features or up.shape[0] != out_features or up.shape[1] != rank:
+            raise ValueError(
+                f"this LoRA's {name} is {tuple(down.shape)} / {tuple(up.shape)}, which doesn't fit the "
+                f"layer ({module.in_features} -> {out_features})")
+        alpha = factors["alpha"].item() if "alpha" in factors else (
+            file_alpha if file_alpha is not None else float(rank))
+        up = up * (alpha / rank * multiplier)
+        per_layer.setdefault(id(module), (module, []))[1].append(
+            (rows, down.to(device, dtype), up.to(device, dtype)))
+
+    handles = []
+    for module, branches in per_layer.values():
+        for rows, down, up in branches:
+            if rows is None:
+                handles.append(module.register_forward_hook(_LoraBranch(down, up)))
+        sliced = [(*rows, down, up) for rows, down, up in branches if rows is not None]
+        if sliced:
+            handles.append(module.register_forward_hook(_LoraSlices(sliced)))
+    applied = sum(len(b) for _, b in per_layer.values())
+    _krea2_invalidate(bundle)
+    print(f"[lora] MOSS-Image: {applied} modules hooked, {len(unmatched)} unmapped", flush=True)
+    return LoraReport(applied=applied, unmatched=unmatched), handles
 
 
 __all__ = ["apply_lora", "remove_lora", "clear_loras", "LoraReport"]
