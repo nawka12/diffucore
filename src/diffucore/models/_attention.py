@@ -21,15 +21,23 @@ first selects it.
 from __future__ import annotations
 
 import functools
+import math
 import shutil
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # noqa: BLE001  no Triton: torch ops
+    triton = None
+
 _CHOICES = ("sdpa", "auto", "fa2_turing", "int8_turing")
 _KERNELS = Path(__file__).resolve().parent.parent / "kernels"
 _int8_build_error = ""
+_keep_broken = False
 
 
 @functools.cache
@@ -185,11 +193,26 @@ def _int8_eligible(*ts: torch.Tensor) -> bool:
 
 
 def attention_blhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                   backend: str = "sdpa") -> torch.Tensor:
+                   backend: str = "sdpa", null_keys: int = 0) -> torch.Tensor:
     """Attention over ``(B, L, H, D)`` q/k/v → ``(B, Lq, H·D)``. FA2 takes that
     layout natively but ignores strides, so its inputs are made contiguous.
+
+    ``null_keys`` counts all-zero key/value rows left off ``k``/``v``: each
+    scores exactly 0 and adds only to the softmax denominator. FA2 runs on the
+    real keys and rescales by its log-sum-exp; the other backends get the zero
+    rows back, so their result is the padded one.
     """
     B, Lq = q.shape[0], q.shape[1]
+    if null_keys:
+        if backend == "fa2_turing" and _fa2_eligible(q):
+            out, lse = _fa2_module().fwd(
+                q.contiguous(), k.contiguous(), v.contiguous(),
+                q.shape[-1] ** -0.5, False,
+            )
+            _scale_to_real_share(out, lse, null_keys)
+            return out.reshape(B, Lq, -1)
+        k = F.pad(k, (0, 0, 0, 0, 0, null_keys))
+        v = F.pad(v, (0, 0, 0, 0, 0, null_keys))
     if backend == "int8_turing" and _int8_eligible(q, k, v):
         return _int8_module().fwd(q, k, v, q.shape[-1] ** -0.5).reshape(B, Lq, -1)
     if backend == "fa2_turing" and _fa2_eligible(q):
@@ -202,6 +225,37 @@ def attention_blhd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     )
     return out.transpose(1, 2).reshape(B, Lq, -1)
+
+
+def _scale_to_real_share(out: torch.Tensor, lse: torch.Tensor, n: int) -> None:
+    """``out *= Z / (Z + n)`` in place, ``Z = e^lse``: the real keys' share of a
+    softmax that also holds ``n`` zero-score keys. ``out`` is FA2's packed
+    ``(B, L, H, D)``, ``lse`` its ``(B, H, L)`` fp32 log-sum-exp. One Triton
+    pass (torch's broadcast mixed-dtype multiply is ~2.5x slower)."""
+    global _keep_broken
+    B, L, H, D = out.shape
+    pow2 = H & (H - 1) == 0 and D & (D - 1) == 0
+    if triton is not None and not _keep_broken and out.is_cuda and lse.is_contiguous() and pow2:
+        try:
+            _keep_kernel[(B * L,)](out, lse, math.log(n), L, H=H, D=D, num_warps=4)
+            return
+        except Exception as e:  # noqa: BLE001  any compile/launch failure
+            print(f"[attention] Triton unavailable ({type(e).__name__}); using torch ops", flush=True)
+            _keep_broken = True
+    out.mul_(torch.sigmoid(lse - math.log(n)).transpose(1, 2).unsqueeze(-1))
+
+
+if triton is not None:
+
+    @triton.jit
+    def _keep_kernel(o_ptr, lse_ptr, log_n, L, H: tl.constexpr, D: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)   # token: b * L + l
+        b, l = row // L, row % L
+        h = tl.arange(0, H)
+        keep = tl.sigmoid(tl.load(lse_ptr + (b * H + h) * L + l) - log_n)
+        offs = row * H * D + h[:, None] * D + tl.arange(0, D)[None, :]
+        o = tl.load(o_ptr + offs).to(tl.float32)
+        tl.store(o_ptr + offs, (o * keep[:, None]).to(o_ptr.dtype.element_ty))
 
 
 def attention_bhld(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,

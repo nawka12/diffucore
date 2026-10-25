@@ -287,3 +287,30 @@ def test_unet_attention_fa2_matches_sdpa():
         out_self, out_cross = attn1(x), attn2(x, ctx)
     for out, ref in ((out_self, ref_self), (out_cross, ref_cross)):
         assert float((out.float() - ref.float()).norm() / ref.float().norm()) < 2e-3
+
+
+# --- null keys (zero context rows left off k/v) -------------------------------
+
+def _null_key_inputs(device, dtype, Lk=67, n=445):
+    torch.manual_seed(0)
+    q = torch.randn(1, 300, 4, 128, device=device).to(dtype)
+    k = torch.randn(1, Lk, 4, 128, device=device).to(dtype)
+    v = torch.randn(1, Lk, 4, 128, device=device).to(dtype)
+    pad = (0, 0, 0, 0, 0, n)
+    return q, k, v, F.pad(k, pad), F.pad(v, pad), n
+
+
+def test_null_keys_sdpa_equals_padded():
+    q, k, v, kp, vp, n = _null_key_inputs("cpu", torch.float32)
+    assert torch.equal(attention_blhd(q, k, v, null_keys=n), attention_blhd(q, kp, vp))
+
+
+@pytest.mark.skipif(not fa2_turing_available(), reason="needs flash_attn_turing on an sm75 GPU")
+def test_null_keys_fa2_matches_padded():
+    """FA2 runs on the real keys and rescales by its log-sum-exp."""
+    q, k, v, kp, vp, n = _null_key_inputs("cuda", torch.float16)
+    ref = _ref_blhd(q.float(), kp.float(), vp.float())
+    out = attention_blhd(q, k, v, "fa2_turing", null_keys=n)
+    padded = attention_blhd(q, kp, vp, "fa2_turing")
+    assert out.dtype == torch.float16
+    assert _rel_err(out, ref) < 1.5 * _rel_err(padded, ref) + 1e-4

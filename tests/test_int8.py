@@ -164,3 +164,45 @@ def test_fused_mlp_matches_unfused(monkeypatch):
         mp.setattr(_int8, "_fast", lambda t: False)
         y_ref = l2(F.gelu(l1(x)))
     assert _rel(y, y_ref) < 2e-3
+
+
+fused_gemm = pytest.mark.skipif(
+    not (_int8.int8_fast_available() and _int8.fused_gemm_applies("cuda") and not _int8.fused_gemm_error("cuda")),
+    reason="needs an sm75 GPU, the CUTLASS headers and a CUDA toolchain")
+
+
+@fused_gemm
+@pytest.mark.parametrize("m,n,k", [(33, 2048, 1024), (300, 512, 768), (4096, 2048, 2048), (1000, 8192, 2048)])
+def test_fused_gemm_is_bit_exact_with_rescale(m, n, k):
+    """The epilogue rounds exactly like the int32 GEMM + rescale pass."""
+    torch.manual_seed(6)
+    q = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+    w = torch.randint(-127, 128, (n, k), device="cuda", dtype=torch.int8)
+    sx, sw = torch.rand(m, device="cuda") * 1e-2, torch.rand(n, device="cuda") * 1e-3
+    out = _int8.scaled_mm(q, w, sx, sw, torch.float16)
+    assert out is not None and torch.equal(out, _int8.rescale(_int8.int_mm(q, w), sx, sw, None, torch.float16))
+
+
+@fused_gemm
+def test_fused_gemm_mlp_matches_triton_gelu(monkeypatch):
+    torch.manual_seed(5)
+    l1 = Int8Linear.from_linear(nn.Linear(1024, 4096, bias=False).cuda().half())
+    l2 = Int8Linear.from_linear(nn.Linear(4096, 1024, bias=False).cuda().half())
+    x = torch.randn(2, 500, 1024, device="cuda", dtype=torch.float16)
+    y = int8_mlp(x, l1, l2)
+    with monkeypatch.context() as mp:
+        mp.setattr(_int8, "scaled_mm", lambda *a, **k: None)
+        y_ref = int8_mlp(x, l1, l2)
+    assert torch.equal(y, y_ref)
+
+
+@fast
+def test_selfattn_int8_shares_one_quantized_input():
+    from diffucore.models.anima_dit import _Attention
+    torch.manual_seed(7)
+    attn = _Attention(512, None, 4, 128, 1e-6).cuda().half().eval()
+    for name in ("q_proj", "k_proj", "v_proj"):
+        setattr(attn, name, Int8Linear.from_linear(getattr(attn, name)))
+    x = torch.randn(1, 300, 512, device="cuda", dtype=torch.float16)
+    for got, ref in zip(attn._qkv(x, x), (attn.q_proj(x), attn.k_proj(x), attn.v_proj(x))):
+        assert torch.equal(got, ref)

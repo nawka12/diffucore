@@ -32,8 +32,8 @@ from .models import (
 from .models._attention import resolve_attention_backend, set_attention_backend
 from .models._fused import fused_glue_available, set_fused_glue
 from .models._int8 import (
-    adopt_int8_embedding, adopt_int8_layers, dequantize_linears, int8_fast_available, int8_layers,
-    quantize_linears,
+    adopt_int8_embedding, adopt_int8_layers, dequantize_linears, fused_gemm_applies, fused_gemm_error,
+    int8_fast_available, int8_layers, quantize_linears,
 )
 from .models.anima_dit import int8_layer_names
 from .models.krea2_dit import from_diffusers as krea2_from_diffusers
@@ -217,6 +217,17 @@ def load_checkpoint(
 _ANIMA_DIT_LEAF = "llm_adapter.blocks.0.cross_attn.q_proj.weight"
 
 
+def _load_fused_gemm(stage, policy: DevicePolicy) -> None:
+    """Build the Turing fused-rescale int8 GEMM now, so its one-time build
+    (~1 min) shows as a load stage instead of stalling the first step."""
+    if policy.compute_dtype != torch.float16 or not fused_gemm_applies(policy.device):
+        return
+    stage("int8: loading the fused-rescale GEMM (the first build takes ~1 min)")
+    why = fused_gemm_error(policy.device)
+    if why:
+        stage(f"int8: fused GEMM unavailable ({why}); using cuBLAS + rescale")
+
+
 def load_anima_checkpoint(
     dit_path: str,
     vae_path: str,
@@ -303,6 +314,8 @@ def load_anima_checkpoint(
         _stage(f"int8: quantized {n} layers")
     elif policy.int8:
         _stage("int8 skipped: needs CUDA sm75+ and Triton")
+    if int8_fast and (int8 or policy.int8):
+        _load_fused_gemm(_stage, policy)
     if policy.offload_stream:
         # Keep block 0 resident: TeaCache probes it outside the block's
         # __call__, where the stream hooks don't fire.
@@ -478,6 +491,8 @@ def load_krea2_dit(dit_path: str, policy: DevicePolicy, _stage=print, variant: s
         _stage(f"int8: quantized {n} layers")
     elif policy.int8:
         _stage("int8 skipped: needs CUDA sm75+ and Triton")
+    if int8_fast and (int8 or policy.int8):
+        _load_fused_gemm(_stage, policy)
     # fp16 tops out at 65504 and the bf16-trained residual stream reaches ~2.3e4.
     backbone.residual_scale = 0.25 if policy.compute_dtype == torch.float16 else 1.0
     if policy.offload_stream and masters == "file":
@@ -686,6 +701,8 @@ def load_moss_dit(dit_path: str, policy: DevicePolicy, _stage=print, masters: st
         _stage(f"int8: quantized {n} layers")
     elif policy.int8:
         _stage("int8 skipped: needs CUDA sm75+ and Triton")
+    if int8_fast and (int8 or policy.int8):
+        _load_fused_gemm(_stage, policy)
     # The bf16-trained stream peaks near fp16's max (6.2e4 of 65504); carry it
     # at 1/16, unless the file already does (a second 1/16 broke quality).
     prescaled = _moss_prescaled(dit_path)

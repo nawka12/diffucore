@@ -30,6 +30,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# C++ headers for the Turing int8 GEMM kernel (models/_int8.py).
+int8 = ["nvidia-cutlass==4.2.0.0"]
 
 [project.urls]
 Homepage = "https://example.com/diffucore"

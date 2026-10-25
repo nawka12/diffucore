@@ -16,13 +16,19 @@ A forward rotates and quantizes each activation row, runs the int8 GEMM
 (``torch._int_mm``, cuBLASLt) and rescales the int32 result. On CUDA with
 Triton the rotate+quantize and rescale steps are one row pass each, and an int8
 MLP fuses rescale + GELU + rotate + quantize between its GEMMs; elsewhere (no
-Triton, ``torch.compile``) the same math runs as torch ops.
+Triton, ``torch.compile``) the same math runs as torch ops. On Turing with the
+CUTLASS headers (pip ``nvidia-cutlass``) and a CUDA toolchain, the GEMM itself
+applies the rescale and writes fp16, same rounding, from
+``kernels/int8_gemm_sm75.cu``.
 """
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import json
 import zlib
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -39,6 +45,9 @@ GROUP = 256          # ConvRot group used when quantizing at load
 _broken = False
 _NO_FMA = {"enable_fp_fusion": False}
 _HADAMARD: dict = {}
+_KERNELS = Path(__file__).resolve().parent.parent / "kernels"
+_FUSED_MIN_ROWS = 32   # below this (LLM decode) the cuBLAS path stays
+_gemm_error = ""
 
 
 def int8_fast_available(device=None) -> bool:
@@ -149,8 +158,13 @@ class Int8Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x2 = x.reshape(-1, self.in_features)
         q, s = quantize_activation(x2, self.group)
-        y = rescale(int_mm(q, self.weight), s, self.scale, self.bias, x.dtype)
-        return y.reshape(*x.shape[:-1], self.out_features)
+        return self.matmul_quantized(q, s, x.dtype).reshape(*x.shape[:-1], self.out_features)
+
+    def matmul_quantized(self, q: torch.Tensor, s: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """This layer on rows already rotated and quantized by
+        :func:`quantize_activation` with this layer's group, as ``[M, N]``."""
+        y = scaled_mm(q, self.weight, s, self.scale, dtype) if self.bias is None else None
+        return y if y is not None else rescale(int_mm(q, self.weight), s, self.scale, self.bias, dtype)
 
     def extra_repr(self) -> str:
         return f"in_features={self.in_features}, out_features={self.out_features}, group={self.group}"
@@ -191,6 +205,75 @@ def int_mm(q: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         q = F.pad(q, (0, 0, 0, 32 - m))
     out = torch._int_mm(q, w.t())
     return out[:m] if m <= 16 else out
+
+
+def _cutlass_include() -> str | None:
+    """The CUTLASS C++ headers shipped inside the ``nvidia-cutlass`` wheel
+    (located, not imported: its Python side has heavy dependencies)."""
+    spec = importlib.util.find_spec("cutlass_library")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    inc = Path(list(spec.submodule_search_locations)[0]) / "source" / "include"
+    return str(inc) if (inc / "cutlass" / "cutlass.h").is_file() else None
+
+
+@functools.cache
+def _gemm_module(device_index: int):
+    """Build (first time ~1 min; torch caches the binary by source hash) and
+    import the fused-rescale GEMM, or None: it needs an sm75 GPU, the CUTLASS
+    headers and a CUDA toolchain. The reason for a None is kept in
+    ``_gemm_error``."""
+    global _gemm_error
+    from ._attention import _toolchain_available
+    inc = _cutlass_include()
+    if torch.cuda.get_device_capability(device_index) != (7, 5):
+        _gemm_error = "GPU is not Turing"
+    elif inc is None:
+        _gemm_error = "CUTLASS headers not installed (pip install nvidia-cutlass==4.2.0.0)"
+    elif not _toolchain_available():
+        _gemm_error = "no CUDA toolchain (needs nvcc, ninja and a C++ compiler)"
+    else:
+        try:
+            from torch.utils.cpp_extension import load
+            return load(
+                name="diffucore_int8_gemm_sm75", sources=[str(_KERNELS / "int8_gemm_sm75.cu")],
+                extra_include_paths=[inc],
+                extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_75,code=sm_75",
+                                   "--expt-relaxed-constexpr", "-fmad=false", "-DNDEBUG"],
+                extra_cflags=["-O3", "-std=c++20"], verbose=False,
+            )
+        except Exception as e:  # noqa: BLE001  any toolchain failure means "unavailable"
+            _gemm_error = str(e).strip().splitlines()[-1] if str(e).strip() else type(e).__name__
+    return None
+
+
+def fused_gemm_applies(device) -> bool:
+    """Whether the fused-rescale GEMM is meant for ``device`` (Turing, with the
+    fast int8 path)."""
+    device = torch.device(device)
+    return (device.type == "cuda" and int8_fast_available(device)
+            and torch.cuda.get_device_capability(device) == (7, 5))
+
+
+def fused_gemm_error(device) -> str:
+    """Build (or load) the fused-rescale GEMM for ``device`` now; "" when it is
+    in use, else why not."""
+    device = torch.device(device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return "" if _gemm_module(index) is not None else _gemm_error
+
+
+def scaled_mm(q: torch.Tensor, w: torch.Tensor, sx: torch.Tensor, sw: torch.Tensor, dtype: torch.dtype):
+    """``fp16(q @ w.T * sx[:, None] * sw)`` in one kernel, rounded exactly like
+    :func:`rescale`; None when the fused GEMM can't take this call (the caller
+    then runs the int32 path)."""
+    if (dtype != torch.float16 or not _fast(q) or q.shape[0] < _FUSED_MIN_ROWS
+            or q.shape[1] % 16 or w.shape[0] % 8):
+        return None
+    mod = _gemm_module(q.device.index)
+    if mod is None:
+        return None
+    return mod.scaled_mm(q, w, sx, sw)
 
 
 def _fast(t: torch.Tensor) -> bool:
@@ -246,6 +329,10 @@ def int8_mlp(x: torch.Tensor, l1: Int8Linear, l2: Int8Linear) -> torch.Tensor:
     x2 = x.reshape(-1, l1.in_features)
     if _fast(x2) and l1.bias is None and x.dtype in (torch.float16, torch.bfloat16):
         q, s = quantize_activation(x2, l1.group)
+        h = scaled_mm(q, l1.weight, s, l1.scale, x.dtype)
+        if h is not None:
+            q2, s2 = _gelu_quantize(h, l2.group)
+            return l2.matmul_quantized(q2, s2, x.dtype).reshape(*x.shape[:-1], l2.out_features)
         acc = int_mm(q, l1.weight)
         M, N = acc.shape
         q2 = torch.empty(M, N, device=acc.device, dtype=torch.int8)
@@ -256,6 +343,19 @@ def int8_mlp(x: torch.Tensor, l1: Int8Linear, l2: Int8Linear) -> torch.Tensor:
             y = rescale(int_mm(q2, l2.weight), s2, l2.scale, l2.bias, x.dtype)
             return y.reshape(*x.shape[:-1], l2.out_features)
     return l2(F.gelu(l1(x)))
+
+
+def _gelu_quantize(h: torch.Tensor, group: int):
+    """:func:`quantize_activation` of ``gelu(h)`` rounded to ``h.dtype``, in
+    one row pass: ``_gelu_rot_quant_kernel`` minus the rescale, for the fused
+    GEMM's already-rescaled output."""
+    M, N = h.shape
+    q = torch.empty(M, N, device=h.device, dtype=torch.int8)
+    s = torch.empty(M, device=h.device, dtype=torch.float32)
+    block = triton.next_power_of_2(N)
+    if _launch(_gelu_f16_rot_quant_kernel, (M,), h, q, s, N, BLOCK=block, ROT=bool(group), num_warps=_warps(block)):
+        return q, s
+    return quantize_activation(F.gelu(h.float()).to(h.dtype), group)
 
 
 if triton is not None:
@@ -324,7 +424,20 @@ if triton is not None:
         dt = tl.bfloat16 if BF16 else tl.float16
         a = _load_row(acc_ptr, row, offs, N, BLOCK).to(tl.float32)
         h = (a * (tl.load(sx_ptr + row) * _load_row(sw_ptr, 0, offs, N, BLOCK))).to(dt).to(tl.float32)
-        h = (0.5 * h * (1.0 + tl.math.erf(h * 0.7071067811865476))).to(dt).to(tl.float32)
+        h = _gelu(h, dt)
+        if ROT:
+            h = _hadamard_rows(h, BLOCK)
+        _store_quantized(h, q_ptr, s_ptr, row, offs, N, BLOCK)
+
+    @triton.jit
+    def _gelu(h, dt: tl.constexpr):
+        return (0.5 * h * (1.0 + tl.math.erf(h * 0.7071067811865476))).to(dt).to(tl.float32)
+
+    @triton.jit
+    def _gelu_f16_rot_quant_kernel(h_ptr, q_ptr, s_ptr, N: tl.constexpr, BLOCK: tl.constexpr, ROT: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.arange(0, BLOCK)
+        h = _gelu(_load_row(h_ptr, row, offs, N, BLOCK).to(tl.float32), tl.float16)
         if ROT:
             h = _hadamard_rows(h, BLOCK)
         _store_quantized(h, q_ptr, s_ptr, row, offs, N, BLOCK)

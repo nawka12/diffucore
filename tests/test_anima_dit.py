@@ -177,3 +177,21 @@ def test_cosmos_dit_runs_without_adapter():
     with torch.no_grad():
         out = dit(x, t, ctx)
     assert out.shape == x.shape
+
+
+def test_context_zero_pad_is_stripped_exactly(monkeypatch):
+    """Trailing all-zero context rows (the adapter's pad to 512) are left out
+    of cross-attention; the output matches attending over them."""
+    cfg = CosmosDiTConfig(model_channels=128, num_blocks=2, num_heads=4, head_dim=32)
+    dit = CosmosDiT(cfg).float().eval()
+    torch.manual_seed(0)
+    x = torch.randn(1, cfg.in_channels, 1, 8, 8)
+    t = torch.tensor([0.5])
+    ctx = torch.nn.functional.pad(torch.randn(1, 20, cfg.crossattn_emb_channels), (0, 0, 0, 44))
+    assert dit._strip_context_pad(ctx)[1] == 44
+    assert dit._strip_context_pad(torch.zeros(1, 8, 4))[0].shape[1] == 1
+    with torch.no_grad():
+        out = dit(x, t, ctx)
+        monkeypatch.setattr(CosmosDiT, "_strip_context_pad", lambda self, c: (c, 0))
+        ref = dit(x, t, ctx)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)

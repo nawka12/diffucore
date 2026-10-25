@@ -12,6 +12,7 @@ Latents are treated as T=1 video (``(B, C, H, W)`` reshaped on entry/exit).
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -23,7 +24,7 @@ from einops.layers.torch import Rearrange
 
 from . import _fused
 from ._attention import attention_blhd
-from ._int8 import Int8Linear, int8_mlp
+from ._int8 import Int8Linear, int8_mlp, quantize_activation
 from ._norm import RMSNorm
 from .llm_adapter import LLMAdapter, LLMAdapterConfig
 
@@ -283,25 +284,37 @@ class _Attention(nn.Module):
         self.attn_backend = "sdpa"
         self.fused_glue = False
 
-    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor], rope_emb: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context: Optional[torch.Tensor], rope_emb: Optional[torch.Tensor],
+                null_keys: int = 0) -> torch.Tensor:
+        """``null_keys``: zero context rows dropped before the call (see
+        :func:`attention_blhd`)."""
         ctx = x if context is None else context
         if self.fused_glue and _fused.usable(x, ctx):
-            out = self._forward_fused(x, ctx, rope_emb)
+            out = self._forward_fused(x, ctx, rope_emb, null_keys)
             if out is not None:
                 return out
-        q = rearrange(self.q_proj(x), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
-        k = rearrange(self.k_proj(ctx), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
-        v = rearrange(self.v_proj(ctx), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
+        q, k, v = (rearrange(p, "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
+                   for p in self._qkv(x, ctx))
         q = self.q_norm(q)
         k = self.k_norm(k)
         if self.is_selfattn and rope_emb is not None:
             q = _apply_rope(q, rope_emb)
             k = _apply_rope(k, rope_emb)
         # SDPA by default; "fa2_turing" / "int8_turing" swap in the sm75 kernels.
-        out = attention_blhd(q, k, v, self.attn_backend)
+        out = attention_blhd(q, k, v, self.attn_backend, null_keys)
         return self.output_proj(out)
 
-    def _forward_fused(self, x, ctx, rope_emb):
+    def _qkv(self, x: torch.Tensor, ctx: torch.Tensor):
+        """The q/k/v projections. In self-attention, int8 layers share one
+        rotated + quantized copy of ``x`` instead of quantizing it three times."""
+        projs = (self.q_proj, self.k_proj, self.v_proj)
+        if (self.is_selfattn and all(isinstance(p, Int8Linear) for p in projs)
+                and len({p.group for p in projs}) == 1):
+            q, s = quantize_activation(x.reshape(-1, x.shape[-1]), self.q_proj.group)
+            return tuple(p.matmul_quantized(q, s, x.dtype).view(*x.shape[:-1], -1) for p in projs)
+        return self.q_proj(x), self.k_proj(ctx), self.v_proj(ctx)
+
+    def _forward_fused(self, x, ctx, rope_emb, null_keys=0):
         """q/k RMSNorm and RoPE in one Triton pass each; None when a kernel
         can't take these inputs (the caller then runs eager)."""
         freqs = None
@@ -309,15 +322,15 @@ class _Attention(nn.Module):
             freqs = rope_emb.reshape(-1, self.head_dim // 2, 2, 2)
             if freqs.dtype != torch.float32 or not freqs.is_contiguous():
                 return None
-        qp, kp = self.q_proj(x), self.k_proj(ctx)
+        qp, kp, vp = self._qkv(x, ctx)
         if not (_fused.qk_ok(qp, self.n_heads, self.head_dim) and _fused.qk_ok(kp, self.n_heads, self.head_dim)):
             return None
         q = _fused.qk_norm_rope(qp, self.q_norm.weight, self.q_norm.eps, self.n_heads, self.head_dim, freqs)
         k = _fused.qk_norm_rope(kp, self.k_norm.weight, self.k_norm.eps, self.n_heads, self.head_dim, freqs)
         if q is None or k is None:
             return None
-        v = rearrange(self.v_proj(ctx), "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
-        return self.output_proj(attention_blhd(q, k, v, self.attn_backend))
+        v = rearrange(vp, "b s (h d) -> b s h d", h=self.n_heads, d=self.head_dim)
+        return self.output_proj(attention_blhd(q, k, v, self.attn_backend, null_keys))
 
 
 class _GPT2FeedForward(nn.Module):
@@ -397,14 +410,16 @@ class _Block(nn.Module):
         adaln_lora: torch.Tensor,       # (B, T, 3·D)
         carry: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         defer: bool = False,
+        null_keys: int = 0,
     ):
         """``carry`` is the previous block's deferred MLP residual ``(h, g)``:
         the true input is ``x + g * h``. With ``defer`` the block returns
         ``(x, carry)``; the fused path then leaves its own MLP residual to the
-        next block's first LayerNorm pass (eager returns ``(x, None)``)."""
+        next block's first LayerNorm pass (eager returns ``(x, None)``).
+        ``null_keys`` counts zero rows dropped off the end of ``ctx``."""
         if (self.fused_glue and _fused.usable(x) and x.dtype == torch.float32
                 and emb.dtype == torch.float16):
-            out = self._forward_fused(x, emb, ctx, rope_emb, adaln_lora, carry, defer)
+            out = self._forward_fused(x, emb, ctx, rope_emb, adaln_lora, carry, defer, null_keys)
             if out is not None:
                 return out
         if carry is not None:
@@ -435,7 +450,7 @@ class _Block(nn.Module):
 
         h = self.layer_norm_cross_attn(x) * (1 + ca_sc) + ca_s
         h_seq = rearrange(h, "b t h w d -> b (t h w) d").to(compute_dtype)
-        h_seq = self.cross_attn(h_seq, ctx, None)
+        h_seq = self.cross_attn(h_seq, ctx, None, null_keys)
         h = rearrange(h_seq, "b (t h w) d -> b t h w d", t=T, h=H, w=W).to(residual_dtype)
         x = x + ca_g.to(residual_dtype) * h
 
@@ -444,7 +459,7 @@ class _Block(nn.Module):
         x = x + ml_g.to(residual_dtype) * h
         return (x, None) if defer else x
 
-    def _forward_fused(self, x, emb, ctx, rope_emb, adaln_lora, carry=None, defer=False):
+    def _forward_fused(self, x, emb, ctx, rope_emb, adaln_lora, carry=None, defer=False, null_keys=0):
         """:meth:`forward` with each stage's residual add, LayerNorm, modulation
         and casts fused into one row pass. Never writes into ``x`` or ``carry``,
         so a None (kernel unusable) lets the caller rerun the block eagerly."""
@@ -476,7 +491,7 @@ class _Block(nn.Module):
         h = _fused.res_ln_mod(xa, h.reshape(N, D), sa_g, ca_sc1, ca_s, rpm, self.layer_norm_cross_attn.eps, xn)
         if h is None:
             return None
-        h = self.cross_attn(h.view(B, T * H * W, D), ctx, None)
+        h = self.cross_attn(h.view(B, T * H * W, D), ctx, None, null_keys)
         h = _fused.res_ln_mod(xn, h.reshape(N, D), ca_g, ml_sc1, ml_s, rpm, self.layer_norm_mlp.eps, xn)
         if h is None:
             return None
@@ -743,10 +758,35 @@ class CosmosDiT(nn.Module):
         self.blocks = nn.ModuleList([_Block(cfg) for _ in range(cfg.num_blocks)])
         self.final_layer = _FinalLayer(cfg)
         self.pos_embedder = _VideoRoPE3D(cfg)
+        self._ctx_lengths: list = []   # (weakref to context, its _version, kept rows)
 
     # ------------------------------------------------------------------ #
     # forward
     # ------------------------------------------------------------------ #
+
+    def _strip_context_pad(self, context: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """``(context without its trailing all-zero rows, how many were
+        dropped)``. The adapter output is zero-padded to 512 tokens while a
+        prompt is often 30-200; a zero row's key and value are exactly zero,
+        so cross-attention can skip them (see :func:`attention_blhd`). Finding
+        the length syncs with the host, so it is remembered per context tensor:
+        the pipelines pass the same cond and uncond tensors every step."""
+        if torch.compiler.is_compiling():
+            return context, 0
+        # Inference-mode tensors keep no version counter.
+        version = None if context.is_inference() else context._version
+        alive = [e for e in self._ctx_lengths if e[0]() is not None]
+        for ref, ver, n in alive:
+            if ref() is context and ver == version:
+                break
+        else:
+            L = context.shape[1]
+            nonzero = (context != 0).any(dim=-1).any(dim=0)
+            last = torch.where(nonzero, torch.arange(L, device=context.device), -1).max()
+            n = max(1, int(last) + 1)
+            alive = (alive + [(weakref.ref(context), version, n)])[-4:]
+        self._ctx_lengths = alive
+        return (context[:, :n], context.shape[1] - n) if n < context.shape[1] else (context, 0)
 
     def _embed(self, x_B_C_T_H_W: torch.Tensor, padding_mask: Optional[torch.Tensor]):
         if self.cfg.concat_padding_mask:
@@ -816,12 +856,13 @@ class CosmosDiT(nn.Module):
             x_B_T_H_W_D = x_B_T_H_W_D + teacache.forecast()
         else:
             residual_in = x_B_T_H_W_D
+            ctx, null_keys = self._strip_context_pad(context)
             # Fused blocks hand their MLP residual to the next block's first
             # LayerNorm pass instead of applying it in a pass of their own.
             carry = None
             for block in self.blocks:
-                x_B_T_H_W_D, carry = block(x_B_T_H_W_D, emb_B_T_D, context, rope_emb, adaln_lora_B_T_3D,
-                                           carry=carry, defer=True)
+                x_B_T_H_W_D, carry = block(x_B_T_H_W_D, emb_B_T_D, ctx, rope_emb, adaln_lora_B_T_3D,
+                                           carry=carry, defer=True, null_keys=null_keys)
             if carry is not None:
                 x_B_T_H_W_D = _finish_carry(x_B_T_H_W_D, carry)
             if teacache is not None:
