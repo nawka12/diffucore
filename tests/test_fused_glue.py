@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from diffucore.models import _fused
-from diffucore.models.anima_dit import (CosmosDiT, CosmosDiTConfig, _Attention, _Block, _VideoRoPE3D,
+from diffucore.models.anima_dit import (BlockPrefix, CosmosDiT, CosmosDiTConfig, _Attention, _Block, _VideoRoPE3D,
                                          _apply_carry, _finish_carry)
 
 _CFG = CosmosDiTConfig(model_channels=256, num_heads=2, head_dim=128, adaln_lora_dim=32,
@@ -132,6 +132,27 @@ def test_fused_dit_forward_matches_eager():
         out = dit(x, t, ctx).float()
     assert torch.isfinite(out).all()
     assert float((out - ref).norm() / ref.norm()) < 1e-3
+
+
+@_needs_fused
+@pytest.mark.parametrize("skip", [(0,), (1,), (2,), (3,), (1, 2), (2, 3)])
+def test_fused_resumed_skipped_pass_is_bit_exact(skip):
+    """Resuming carries the deferred residual of the block before the first skipped
+    one, and the uncond pass in between must not touch the saved state."""
+    torch.manual_seed(0)
+    cfg = CosmosDiTConfig(model_channels=128, num_blocks=4, num_heads=2, head_dim=64, crossattn_emb_channels=64)
+    dit = CosmosDiT(cfg).cuda().half().eval()
+    _fused.set_fused_glue(dit, True)
+    x = torch.randn(1, cfg.in_channels, 1, 16, 16).cuda().half()
+    t = torch.tensor([0.5]).cuda().half()
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels).cuda().half()
+    with torch.no_grad():
+        plain, full = dit(x, t, ctx).clone(), dit(x, t, ctx, skip_layers=skip).clone()
+        prefix = BlockPrefix(skip[0])
+        cond = dit(x, t, ctx, prefix=prefix).clone()
+        dit(x, t, torch.zeros_like(ctx))
+        resumed = dit(x, t, ctx, skip_layers=skip, prefix=prefix)
+    assert torch.equal(cond, plain) and torch.equal(resumed, full)
 
 
 @_needs_fused

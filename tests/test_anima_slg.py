@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from torch import nn
 
-from diffucore.models.anima_dit import AnimaDiT, CosmosDiT, CosmosDiTConfig
+from diffucore.models.anima_dit import AnimaDiT, BlockPrefix, CosmosDiT, CosmosDiTConfig
 from diffucore.pipelines import ImageToImage, Inpaint, TextToImage, _anima
 from diffucore.pipelines._anima import anima_img2img, anima_text_to_image
 from diffucore.runtime import ConditioningCache, DevicePolicy, stream_blocks
@@ -66,21 +66,61 @@ def test_skipping_a_streamed_block_is_transparent():
         assert torch.equal(dit(x, t, ctx, skip_layers=(2,)), want)
 
 
+@pytest.mark.parametrize("skip", [(0,), (1,), (3,), (1, 2), (0, 3), (2, 3)])
+def test_a_resumed_skipped_pass_is_the_full_one_and_runs_only_the_later_blocks(skip):
+    dit, cfg = _dit()
+    x, t, ctx = _inputs(cfg)
+    ran = []
+    for i, block in enumerate(dit.blocks):
+        block.register_forward_pre_hook(lambda m, a, i=i: ran.append(i))
+    with torch.no_grad():
+        plain, full = dit(x, t, ctx), dit(x, t, ctx, skip_layers=skip)
+        prefix = BlockPrefix(skip[0])
+        cond = dit(x, t, ctx, prefix=prefix)
+        dit(x, t, torch.zeros_like(ctx))   # the uncond pass runs in between
+        ran.clear()
+        resumed = dit(x, t, ctx, skip_layers=skip, prefix=prefix)
+    assert torch.equal(cond, plain) and torch.equal(resumed, full)
+    assert ran == [i for i in range(4) if i > skip[0] and i not in skip]
+
+
+def test_a_skipped_pass_without_a_captured_prefix_runs_in_full():
+    dit, cfg = _dit()
+    x, t, ctx = _inputs(cfg)
+    with torch.no_grad():
+        assert torch.equal(dit(x, t, ctx, skip_layers=(2,), prefix=BlockPrefix(2)), dit(x, t, ctx, skip_layers=(2,)))
+
+
+def test_resuming_a_streamed_block_is_transparent():
+    dit, cfg = _dit()
+    x, t, ctx = _inputs(cfg)
+    with torch.no_grad():
+        want = dit(x, t, ctx, skip_layers=(2,))
+    stream_blocks(dit, ("blocks",), torch.device("cpu"), torch.device("cpu"), keep_resident=(dit.blocks[0],))
+    prefix = BlockPrefix(2)
+    with torch.no_grad():
+        dit(x, t, ctx, prefix=prefix)
+        assert torch.equal(dit(x, t, ctx, skip_layers=(2,), prefix=prefix), want)
+
+
 class _ConstantDiT(nn.Module):
     """Constant velocity per branch, with the block list the pipeline validates
-    against. ``calls`` records ``(sigma, branch)`` per forward."""
+    against. ``calls`` records ``(sigma, branch)`` per forward, ``prefixes`` the
+    ``(branch, prefix)`` it was given."""
 
     def __init__(self, cond_ctx):
         super().__init__()
         self.blocks = nn.ModuleList(nn.Identity() for _ in range(6))
         self.cond_ctx = cond_ctx
         self.calls = []
+        self.prefixes = []
 
-    def forward(self, x, t, ctx, teacache=None, skip_layers=()):
+    def forward(self, x, t, ctx, teacache=None, skip_layers=(), prefix=None):
         is_cond = torch.equal(ctx, self.cond_ctx)
         assert not skip_layers or is_cond
         branch = "skip" if skip_layers else "cond" if is_cond else "uncond"
         self.calls.append((float(t.flatten()[0]), branch))
+        self.prefixes.append((branch, prefix))
         return torch.full_like(x, {"skip": _K, "cond": _C, "uncond": _U}[branch])
 
 
@@ -266,6 +306,23 @@ def test_closure_at_cfg_one_builds_on_the_skipped_branch(monkeypatch, path, scal
     velocities = _probe_sampler(monkeypatch)
     _run_path(path, model, cfg_scale=1.0, slg_layers=(2,), slg_scale=scale)
     assert velocities == pytest.approx([want] * 4)
+
+
+@pytest.mark.parametrize("path", ["euler", "t2i", "i2i", "inpaint"])
+def test_each_slg_step_shares_one_prefix_between_cond_and_skipped_only(monkeypatch, path):
+    model, _ = _bundle(monkeypatch)
+    kw = dict(cfg_scale=3.0, slg_layers=(4, 2), slg_scale=2.0, slg_start=0.5)
+    if path == "euler":
+        anima_text_to_image(model, "p", "n", steps=4, width=64, height=64, seed=5, sampler="euler", **kw)
+    else:
+        _run_path(path, model, **kw)
+    seen = model.backbone.prefixes
+    assert all(p is None for b, p in seen if b == "uncond")
+    cond = [p for b, p in seen if b == "cond"]
+    skipped = [p for b, p in seen if b == "skip"]
+    assert len(skipped) == 2 and cond[:-2] == [None] * (len(cond) - 2)
+    assert cond[-2] is skipped[0] and cond[-1] is skipped[1] and skipped[0] is not skipped[1]
+    assert skipped[0].index == 2
 
 
 class _Shift(nn.Module):

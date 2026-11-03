@@ -739,6 +739,17 @@ class TeaCache:
 # base DiT
 # --------------------------------------------------------------------------- #
 
+class BlockPrefix:
+    """The stream as a forward reached block ``index``. A skipped pass on the same
+    inputs resumes here: the blocks before its first skipped one would repeat the
+    same work. Blocks never write into their input, so the state survives other
+    forwards in between."""
+
+    def __init__(self, index: int):
+        self.index = index
+        self.state: Optional[Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None
+
+
 class CosmosDiT(nn.Module):
     """Cosmos-Predict2-style DiT backbone (the inner net of Anima)."""
 
@@ -818,6 +829,7 @@ class CosmosDiT(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         teacache: Optional["TeaCache"] = None,
         skip_layers: tuple[int, ...] = (),
+        prefix: Optional[BlockPrefix] = None,
     ) -> torch.Tensor:
         orig_shape = list(x.shape)
         x = _pad_to_patch_size(x, (self.cfg.patch_temporal, self.cfg.patch_spatial, self.cfg.patch_spatial))
@@ -861,8 +873,14 @@ class CosmosDiT(nn.Module):
             # Fused blocks hand their MLP residual to the next block's first
             # LayerNorm pass instead of applying it in a pass of their own.
             carry = None
+            start = 0
+            if skip_layers and prefix is not None and prefix.state is not None:
+                start = prefix.index
+                x_B_T_H_W_D, carry = prefix.state
             for i, block in enumerate(self.blocks):
-                if i not in skip_layers:
+                if prefix is not None and i == prefix.index:
+                    prefix.state = (x_B_T_H_W_D, carry)
+                if i >= start and i not in skip_layers:
                     x_B_T_H_W_D, carry = block(x_B_T_H_W_D, emb_B_T_D, ctx, rope_emb, adaln_lora_B_T_3D,
                                                carry=carry, defer=True, null_keys=null_keys)
             if carry is not None:
@@ -938,8 +956,9 @@ class AnimaDiT(CosmosDiT):
         padding_mask: Optional[torch.Tensor] = None,
         teacache: Optional["TeaCache"] = None,
         skip_layers: tuple[int, ...] = (),
+        prefix: Optional[BlockPrefix] = None,
     ) -> torch.Tensor:
         if t5xxl_ids is not None:
             context = self.preprocess_text_embeds(context, t5xxl_ids, t5xxl_weights=t5xxl_weights)
         return super().forward(x, timesteps, context, fps=fps, padding_mask=padding_mask, teacache=teacache,
-                               skip_layers=skip_layers)
+                               skip_layers=skip_layers, prefix=prefix)

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..models.anima_dit import TeaCache
+from ..models.anima_dit import BlockPrefix, TeaCache
 from ..runtime import (fp32_accumulation, no_cudnn_autotune, perf_context, staged, vae_decode_safe,
                        vae_fallback_to_fp32)
 from ._base import PipelineInfo, _step_progress, img2img_start, preprocess_image
@@ -136,6 +136,12 @@ def _report_teacache(tc_cond, tc_uncond) -> None:
         msg += (f" (cond), {tc_uncond.skips}/{tc_uncond.calls} (uncond); "
                 f"{tc_uncond.follow_misses} follow misses")
     print(msg, flush=True)
+
+
+def _slg_share(layers: tuple[int, ...], sigma: float, lo: float, hi: float) -> dict:
+    """Backbone kwargs for the cond and skipped passes of an SLG step, so the skipped
+    one resumes where it first differs. Empty outside the window."""
+    return {"prefix": BlockPrefix(layers[0])} if layers and lo < sigma <= hi else {}
 
 
 def _anima_slg(model: "ModelBundle", layers, scale: float, start: float, stop: float,
@@ -305,7 +311,8 @@ def anima_text_to_image(
                         x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
                         t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
-                        v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
+                        share = _slg_share(slg_layers, float(sigma), skip_lo, skip_hi)
+                        v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
                         if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
                             v = v_cond
                         else:
@@ -317,8 +324,8 @@ def anima_text_to_image(
                             v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                             _note_follow_miss(tc_cond, tc_uncond)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
-                        if slg_layers and skip_lo < float(sigma) <= skip_hi:
-                            v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers).squeeze(2)
+                        if share:
+                            v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                             v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
 
                         # CONST flow: denoised = x − σ·v; the Euler step
@@ -332,7 +339,8 @@ def anima_text_to_image(
                     x0 estimate ``x − σ·v`` in fp32."""
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
-                    v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
+                    share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
+                    v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
                     if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                         v = v_cond
                     else:
@@ -341,8 +349,8 @@ def anima_text_to_image(
                         v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                         _note_follow_miss(tc_cond, tc_uncond)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
-                    if slg_layers and skip_lo < float(sigma_b.max()) <= skip_hi:
-                        v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers).squeeze(2)
+                    if share:
+                        v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                         v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
                     return x_in.float() - sig * v.float()
@@ -528,7 +536,8 @@ def anima_img2img(
             def denoise(x_in, sigma_b):
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
-                v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond).squeeze(2)
+                share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
+                v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
                 if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                     v = v_cond
                 else:
@@ -537,8 +546,8 @@ def anima_img2img(
                     v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                     _note_follow_miss(tc_cond, tc_uncond)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
-                if slg_layers and skip_lo < float(sigma_b.max()) <= skip_hi:
-                    v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers).squeeze(2)
+                if share:
+                    v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                     v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 x0 = x_in.float() - sig * v.float()
