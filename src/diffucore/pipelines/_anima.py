@@ -147,13 +147,17 @@ def _slg_share(layers: tuple[int, ...], sigma: float, lo: float, hi: float) -> d
 def _anima_slg(model: "ModelBundle", layers, scale: float, start: float, stop: float,
                teacache_thresh: float) -> tuple[int, ...]:
     """Validated SLG blocks. TeaCache could reuse a cached cond while the skipped
-    pass computes fresh, and a CUDA Graph records one block list."""
+    pass computes fresh, a CUDA Graph records one block list, and a compiled forward
+    ignores ``skip_layers``, which would silently turn SLG off."""
     layers = validate_slg(layers, scale, start, stop, len(model.backbone.blocks))
     if layers and teacache_thresh > 0:
         raise ValueError("SLG is incompatible with TeaCache. Set the SLG scale to 0 or disable TeaCache.")
     if layers and model.policy.cuda_graphs:
         raise ValueError("SLG is incompatible with CUDA Graphs. Set the SLG scale to 0 or reload "
                          "the model without the CUDA Graphs flag.")
+    if layers and model.policy.compile:
+        raise ValueError("SLG is incompatible with torch.compile. Set the SLG scale to 0 or reload "
+                         "the model without the compile flag.")
     return layers
 
 

@@ -1,6 +1,6 @@
 """Anima Skip Layer Guidance, offline, CPU: the DiT's block skip, the guidance
-formula on all three sampling paths, its window, and the TeaCache / CUDA Graphs
-guards. The MOSS-Image reference pins the same formula in ``test_moss_image.py``.
+formula on all three sampling paths, its window, and the TeaCache / CUDA Graphs /
+compile guards. The MOSS-Image reference pins the same formula in ``test_moss_image.py``.
 """
 
 from __future__ import annotations
@@ -266,6 +266,18 @@ def test_slg_is_rejected_with_teacache_and_cuda_graphs_but_only_when_on(monkeypa
     with pytest.raises(ValueError, match="CUDA Graphs"):
         _i2i(graphs, **on)
     assert _anima._anima_slg(graphs, (2,), 0.0, 0.0, 1.0, 0.3) == ()
+
+
+def test_slg_is_rejected_on_a_compiled_backbone_but_only_when_on(monkeypatch):
+    model, _ = _bundle(monkeypatch)
+    model.policy = SimpleNamespace(cuda_graphs=False, compile=True, device=torch.device("cpu"),
+                                   compute_dtype=torch.float32)
+    on = dict(slg_layers=(2,), slg_scale=2.0)
+    with pytest.raises(ValueError, match="torch.compile"):
+        anima_text_to_image(model, "p", "n", steps=2, width=64, height=64, **on)
+    with pytest.raises(ValueError, match="torch.compile"):
+        _i2i(model, **on)
+    assert _anima._anima_slg(model, (2,), 0.0, 0.0, 1.0, 0.0) == ()
 
 
 def _probe_sampler(monkeypatch) -> list:
