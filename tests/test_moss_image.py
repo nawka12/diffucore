@@ -1034,3 +1034,167 @@ def test_load_moss_checkpoint_takes_an_official_text_encoder_folder(tmp_path):
     bundle = load_moss_checkpoint(dit, str(tmp_path), vae, policy=_cpu_policy())
     bundle.tokenizer = _StubTokenizer()
     assert TextToImage(bundle)("a cat", "", steps=2, cfg_scale=3.0, width=64, height=64, seed=1).size[0] > 0
+
+
+# Skip Layer Guidance
+
+from diffucore.pipelines import _moss as moss_module  # noqa: E402
+from diffucore.sampling import slg_window_bounds  # noqa: E402
+
+
+def _capture_latent(monkeypatch) -> list:
+    latents = []
+    monkeypatch.setattr(moss_module, "_decode", lambda model, x: (latents.append(x.clone()), "full")[::-1])
+    return latents
+
+
+def _reference_loop(bundle, sigmas, x, guidance, uncond_skip, slg_layers, slg_scale, slg_start, slg_stop):
+    """The denoising loop of the reference ``pipeline_moss_image.py`` on our DiT
+    (whose forward test 2 pins to the reference's), Euler with its window test."""
+    dit = bundle.backbone
+    with torch.inference_mode():
+        positive = dit.encode_text(moss_module.moss_encode(bundle, "a cat", "cpu"))
+        negative = dit.encode_text(moss_module.moss_encode(bundle, "bad", "cpu"))
+        num_steps = len(sigmas) - 1
+        for step_index in range(num_steps):
+            sigma = sigmas[step_index]
+            mod, head = dit.time_vectors(sigma[None])
+            skip_active = slg_start <= step_index / num_steps < slg_stop
+            prediction = dit(x, mod, head, positive).float()
+            conditional = prediction
+            if guidance != 1.0:
+                skip = uncond_skip if uncond_skip and skip_active else ()
+                uncond = dit(x, mod, head, negative, skip).float()
+                prediction = uncond + guidance * (prediction - uncond)
+            if slg_layers and slg_scale > 0 and skip_active:
+                skipped = dit(x, mod, head, positive, slg_layers).float()
+                if guidance == 1.0:
+                    prediction = skipped
+                prediction = prediction + slg_scale * (conditional - skipped)
+            x = x + (sigmas[step_index + 1] - sigma) * prediction
+    return x
+
+
+@pytest.mark.parametrize("guidance, uncond_skip, slg_layers, slg_scale, start, stop", [
+    (3.0, (1,), (0,), 2.0, 0.0, 1.0),      # CFG + uncond skip + SLG
+    (3.0, (1,), (0, 2), 2.0, 0.25, 0.75),  # both skips bounded by the window
+    (3.0, (1,), (), 0.0, 0.25, 0.75),      # the window bounds the uncond skip with SLG off
+    (3.0, (), (0,), 0.5, 0.1, 0.6),        # a window off the step grid
+    (1.0, (), (0,), 2.0, 0.0, 1.0),        # no CFG: skipped + s * (cond - skipped)
+    (1.0, (), (0,), 1.0, 0.0, 1.0),        # ... where s = 1 is plain cond
+    (1.0, (), (0,), 2.0, 0.5, 0.5),        # an empty window
+])
+def test_slg_matches_the_reference_loop(monkeypatch, guidance, uncond_skip, slg_layers, slg_scale, start, stop):
+    bundle = _tiny_bundle()
+    latents = _capture_latent(monkeypatch)
+    noise = torch.randn(1, 128, 4, 4, generator=torch.Generator().manual_seed(2))
+    moss_text_to_image(bundle, "a cat", "bad", steps=4, cfg_scale=guidance, width=64, height=64, noise=noise,
+                       uncond_skip_layers=uncond_skip, slg_layers=slg_layers, slg_scale=slg_scale,
+                       slg_start=start, slg_stop=stop)
+    want = _reference_loop(bundle, moss_sigmas(4), noise, guidance, uncond_skip, slg_layers, slg_scale, start, stop)
+    assert torch.allclose(latents[0], want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("n", [1, 3, 4, 7, 50])
+@pytest.mark.parametrize("start, stop", [(0, 1), (0.01, 0.2), (0.1, 0.15), (1 / 3, 2 / 3), (0.5, 0.5), (0.5, 1), (0, 0.01),
+                                         (0.2, 0.6), (1, 1)])
+def test_skip_window_is_the_reference_step_test(n, start, stop):
+    sigmas = moss_sigmas(n)
+    n = len(sigmas) - 1
+    lo, hi = slg_window_bounds(sigmas, start, stop)
+    assert [lo < float(sigmas[i]) <= hi for i in range(n)] == [start <= i / n < stop for i in range(n)]
+
+
+def test_slg_is_three_forwards_per_active_step_and_only_there():
+    bundle = _tiny_bundle()
+    calls = _spy_forward(bundle)
+    moss_text_to_image(bundle, "a cat", "bad", steps=4, cfg_scale=3.0, width=64, height=64, seed=1,
+                       uncond_skip_layers=(1,), slg_layers=(0, 2), slg_scale=2.0, slg_start=0.25, slg_stop=0.75)
+    outside, inside = [(), ()], [(), (1,), (0, 2)]
+    assert [c[1] for c in calls] == outside + inside + inside + outside
+    assert calls[2][0] == calls[4][0] != calls[3][0]   # SLG runs at the positive prompt's text length
+
+
+@pytest.mark.parametrize("off", [dict(slg_layers=(0,), slg_scale=0.0), dict(slg_layers=(), slg_scale=2.0),
+                                 dict(slg_layers=None, slg_scale=2.0)])
+def test_slg_off_is_bit_identical_with_no_extra_forward(off):
+    bundle = _tiny_bundle()
+    base = moss_text_to_image(bundle, "a cat", "bad", steps=2, cfg_scale=3.0, width=64, height=64, seed=4)
+    calls = _spy_forward(bundle)
+    out = moss_text_to_image(bundle, "a cat", "bad", steps=2, cfg_scale=3.0, width=64, height=64, seed=4, **off)
+    assert len(calls) == 4 and out.tobytes() == base.tobytes()
+
+
+def test_slg_outside_the_cfg_band_keeps_its_strength_on_plain_cond(monkeypatch):
+    """Constant branches, so each step's velocity is the formula. No reference
+    here: it has no CFG interval. Off-band is cond + s * (cond - skipped)."""
+    bundle = _tiny_bundle()
+    latents = _capture_latent(monkeypatch)
+    cond_len = moss_module.moss_encode(bundle, "a cat", "cpu").shape[1]
+    c, u, k = 1.0, 0.25, 0.5
+
+    def forward(x, mod, head, text, skip_layers=()):
+        return torch.full_like(x, k if skip_layers else c if text.shape[1] == cond_len else u)
+
+    bundle.backbone.forward = forward
+    noise = torch.zeros(1, 128, 4, 4)
+    moss_text_to_image(bundle, "a cat", "bad", steps=2, cfg_scale=3.0, cfg_interval_end=0.5, width=64, height=64,
+                       noise=noise, slg_layers=(0,), slg_scale=2.0)
+    sigmas = moss_sigmas(2)
+    in_band = u + 3.0 * (c - u) + 2.0 * (c - k)
+    off_band = c + 2.0 * (c - k)
+    want = float(sigmas[1] - sigmas[0]) * in_band + float(0 - sigmas[1]) * off_band
+    assert latents[0].mean().item() == pytest.approx(want, rel=1e-5)
+
+
+def test_second_order_evaluations_follow_the_slg_window():
+    bundle = _tiny_bundle()
+    seen = []
+    forward = bundle.backbone.forward
+    time_vectors = bundle.backbone.time_vectors
+    sigma_now = []
+    bundle.backbone.time_vectors = lambda t: (sigma_now.append(float(t[0])), time_vectors(t))[1]
+    bundle.backbone.forward = lambda x, mod, head, text, skip=(): (
+        seen.append((sigma_now[-1], tuple(skip))), forward(x, mod, head, text, skip))[1]
+    moss_text_to_image(bundle, "a cat", "", steps=4, cfg_scale=1.0, width=64, height=64, seed=1, sampler="heun",
+                       slg_layers=(0,), slg_scale=2.0, slg_start=0.5, slg_stop=1.0)
+    sigmas = moss_sigmas(4)
+    assert all(s <= float(sigmas[2]) for s, skip in seen if skip)
+    assert {s for s, skip in seen if skip} == {s for s, _ in seen if s <= float(sigmas[2])}
+
+
+@pytest.mark.parametrize("bad, match", [
+    (dict(slg_layers=(9,), slg_scale=2.0), "slg_layers"),
+    (dict(slg_layers=(9,), slg_scale=0.0), "slg_layers"),
+    (dict(slg_scale=-1.0), "slg_scale"),
+    (dict(slg_scale=float("nan")), "slg_scale"),
+    (dict(slg_scale=float("inf")), "slg_scale"),
+    (dict(slg_start=0.6, slg_stop=0.5), "slg_start"),
+    (dict(slg_start=-0.1), "slg_start"),
+    (dict(slg_stop=1.5), "slg_start"),
+])
+def test_slg_options_are_validated(bad, match):
+    bundle = _tiny_bundle()
+    with pytest.raises(ValueError, match=match):
+        moss_text_to_image(bundle, "a cat", "", steps=2, width=64, height=64, **bad)
+    with pytest.raises(ValueError, match=match):
+        moss_img2img(bundle, "a cat", _init_image(), steps=2, width=64, height=64, **bad)
+
+
+def test_every_pipeline_entry_point_runs_slg():
+    slg = dict(uncond_skip_layers=(1,), slg_layers=(0,), slg_scale=2.0, slg_start=0.5, slg_stop=1.0)
+    want = [(), ()] + [(), (1,), (0,)]
+    bundle = _tiny_i2i_bundle()
+    calls = _spy_forward(bundle)
+    TextToImage(bundle)("a cat", "bad", steps=2, cfg_scale=3.0, width=64, height=64, seed=1, **slg)
+    assert [c[1] for c in calls] == want
+    calls.clear()
+    # The window covers the strength-sliced schedule, like the CFG interval.
+    ImageToImage(bundle)("a cat", _init_image(), "bad", strength=0.5, steps=2, cfg_scale=3.0, width=64, height=64,
+                         seed=1, **slg)
+    assert [c[1] for c in calls] == want
+    calls.clear()
+    mask = Image.new("L", (64, 64), 255)
+    Inpaint(bundle)("a cat", _init_image(), mask, "bad", strength=0.5, steps=2, cfg_scale=3.0, width=64, height=64,
+                    seed=1, **slg)
+    assert [c[1] for c in calls] == want

@@ -30,6 +30,8 @@ from ..sampling import (
     flow_table_schedule,
     get_sampler,
     guidance_interval_bounds,
+    slg_window_bounds,
+    validate_slg,
 )
 
 # Samplers Anima can drive through a CONST x0 denoiser closure; the stochastic,
@@ -136,6 +138,19 @@ def _report_teacache(tc_cond, tc_uncond) -> None:
     print(msg, flush=True)
 
 
+def _anima_slg(model: "ModelBundle", layers, scale: float, start: float, stop: float,
+               teacache_thresh: float) -> tuple[int, ...]:
+    """Validated SLG blocks. TeaCache could reuse a cached cond while the skipped
+    pass computes fresh, and a CUDA Graph records one block list."""
+    layers = validate_slg(layers, scale, start, stop, len(model.backbone.blocks))
+    if layers and teacache_thresh > 0:
+        raise ValueError("SLG is incompatible with TeaCache. Set the SLG scale to 0 or disable TeaCache.")
+    if layers and model.policy.cuda_graphs:
+        raise ValueError("SLG is incompatible with CUDA Graphs. Set the SLG scale to 0 or reload "
+                         "the model without the CUDA Graphs flag.")
+    return layers
+
+
 def anima_text_to_image(
     model: "ModelBundle",
     prompt: str,
@@ -145,6 +160,10 @@ def anima_text_to_image(
     cfg_scale: float = 4.0,
     cfg_interval_start: float = 0.0,
     cfg_interval_end: float = 1.0,
+    slg_layers: "tuple[int, ...] | list[int] | None" = None,
+    slg_scale: float = 0.0,
+    slg_start: float = 0.0,
+    slg_stop: float = 1.0,
     shift: float = 3.0,
     width: int = 1024,
     height: int = 1024,
@@ -184,6 +203,11 @@ def anima_text_to_image(
     ``teacache_thresh`` > 0 enables TeaCache (arXiv:2411.19108); see
     :func:`_make_teacache` for ``teacache_forecast``, ``teacache_rule``,
     ``teacache_uncond_scale`` and ``teacache_sigma_floor``.
+
+    ``slg_layers`` with ``slg_scale`` > 0 adds Skip Layer Guidance: a third forward,
+    the cond branch with those blocks skipped, adding ``slg_scale·(cond − skipped)``
+    on steps ``slg_start <= i / n < slg_stop``. At CFG 1 it builds on the skipped
+    branch, so scale 1 is plain cond. Not with TeaCache or CUDA Graphs.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -195,6 +219,7 @@ def anima_text_to_image(
     # Spatial dims must be divisible by VAE-stride·patch = 8·2 = 16.
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
+    slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
 
     with perf_context(policy):
         # The post-adapter context depends only on the prompt pair, so a repeat
@@ -249,6 +274,7 @@ def anima_text_to_image(
 
         # CFG only while σ in (lo, hi]. (0, 1) = always.
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
+        skip_lo, skip_hi = slg_window_bounds(sigmas, slg_start, slg_stop)
 
         # 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
@@ -291,6 +317,9 @@ def anima_text_to_image(
                             v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                             _note_follow_miss(tc_cond, tc_uncond)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                        if slg_layers and skip_lo < float(sigma) <= skip_hi:
+                            v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers).squeeze(2)
+                            v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
 
                         # CONST flow: denoised = x − σ·v; the Euler step
                         # x + (σ_next − σ)·v is exact for a constant x0.
@@ -312,6 +341,9 @@ def anima_text_to_image(
                         v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                         _note_follow_miss(tc_cond, tc_uncond)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                    if slg_layers and skip_lo < float(sigma_b.max()) <= skip_hi:
+                        v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers).squeeze(2)
+                        v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
                     return x_in.float() - sig * v.float()
 
@@ -358,6 +390,10 @@ def anima_img2img(
     cfg_scale: float = 4.0,
     cfg_interval_start: float = 0.0,
     cfg_interval_end: float = 1.0,
+    slg_layers: "tuple[int, ...] | list[int] | None" = None,
+    slg_scale: float = 0.0,
+    slg_start: float = 0.0,
+    slg_stop: float = 1.0,
     shift: float = 3.0,
     width: int = 1024,
     height: int = 1024,
@@ -400,6 +436,7 @@ def anima_img2img(
         raise ValueError(f"strength must be in (0, 1], got {strength}")
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
+    slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -466,6 +503,7 @@ def anima_img2img(
 
         # Guidance interval over the sliced schedule. (0, 1) = always.
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
+        skip_lo, skip_hi = slg_window_bounds(sigmas, slg_start, slg_stop)
 
         # 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
@@ -499,6 +537,9 @@ def anima_img2img(
                     v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
                     _note_follow_miss(tc_cond, tc_uncond)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                if slg_layers and skip_lo < float(sigma_b.max()) <= skip_hi:
+                    v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers).squeeze(2)
+                    v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 x0 = x_in.float() - sig * v.float()
                 if mask_lat is not None:

@@ -11,6 +11,10 @@ block 22 on every step (``uncond_skip_layers``), as the reference does. Cond
 and uncond have different text lengths and run unpadded, so CFG is two
 sequential forwards. Noise, the CFG combine and the sampler update are fp32.
 
+Optional Skip Layer Guidance adds a third forward: the cond branch with
+``slg_layers`` skipped, and ``slg_scale·(cond − skipped)`` on top of CFG. The
+``[slg_start, slg_stop)`` step window bounds both SLG and the uncond skip.
+
 img2img / inpaint follow Anima's and Krea 2's conventions: the encode is the
 exact inverse of :func:`_decode` (VAE mean, 2x2 pixel-unshuffle, ``(z - mean) /
 std``), ComfyUI's denoise slice, the keep region pinned at each x0 estimate and
@@ -28,7 +32,7 @@ from PIL import Image
 from ..runtime import (fp32_accumulation, no_cudnn_autotune, perf_context, staged, vae_decode_safe,
                        vae_fallback_to_fp32)
 from ..sampling import flow_matching_dynamic_shift, flow_matching_schedule, flow_table_schedule, get_sampler
-from ..sampling import guidance_interval_bounds
+from ..sampling import guidance_interval_bounds, slg_window_bounds, validate_slg
 from ._anima import _ANIMA_SAMPLERS, _to_pil
 from ._base import PipelineInfo, _step_progress, preprocess_image
 from ._flux import _flux2_patchify_latents, _flux2_unpatchify_latents
@@ -135,7 +139,8 @@ def _skip_layers(model: "ModelBundle", requested) -> tuple[int, ...]:
 
 def _sample(model: "ModelBundle", key, hit, feats, x: torch.Tensor, sigmas: torch.Tensor, *,
             sampler: str, sampler_kwargs: dict, cfg_scale: float, cfg_lo: float, cfg_hi: float,
-            need_uncond: bool, skip_layers: tuple[int, ...], progress_callback, preview_callback,
+            need_uncond: bool, skip_layers: tuple[int, ...], slg_layers: tuple[int, ...], slg_scale: float,
+            skip_lo: float, skip_hi: float, progress_callback, preview_callback,
             mask_lat: torch.Tensor | None = None, z0: torch.Tensor | None = None) -> torch.Tensor:
     """Integrate ``x`` down ``sigmas``. With ``mask_lat`` (1 = repaint) the keep
     region of each x0 estimate is pinned to ``z0``."""
@@ -146,10 +151,16 @@ def _sample(model: "ModelBundle", key, hit, feats, x: torch.Tensor, sigmas: torc
 
     def velocity(x_in: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         mod, head = backbone.time_vectors(sigma.reshape(-1)[:1].float())
-        v = backbone(x_in, mod, head, cond_ctx).float()
-        if uncond_ctx is not None and cfg_lo < float(sigma.max()) <= cfg_hi:
-            v_uncond = backbone(x_in, mod, head, uncond_ctx, skip_layers).float()
-            v = v_uncond + cfg_scale * (v - v_uncond)
+        s = float(sigma.max())
+        skip_on = skip_lo < s <= skip_hi
+        v = cond = backbone(x_in, mod, head, cond_ctx).float()
+        if uncond_ctx is not None and cfg_lo < s <= cfg_hi:
+            v_uncond = backbone(x_in, mod, head, uncond_ctx, skip_layers if skip_on else ()).float()
+            v = v_uncond + cfg_scale * (cond - v_uncond)
+        if slg_layers and skip_on:
+            v_skip = backbone(x_in, mod, head, cond_ctx, slg_layers).float()
+            # CFG 1 builds on the skipped branch, so slg_scale 1 is plain cond (as the reference).
+            v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (cond - v_skip)
         return v
 
     def denoise(x_in, sigma_b):
@@ -197,6 +208,10 @@ def moss_text_to_image(
     cfg_interval_start: float = 0.0,
     cfg_interval_end: float = 1.0,
     uncond_skip_layers: "tuple[int, ...] | list[int] | None" = None,
+    slg_layers: "tuple[int, ...] | list[int] | None" = None,
+    slg_scale: float = 0.0,
+    slg_start: float = 0.0,
+    slg_stop: float = 1.0,
     shift: float = 5.0,
     width: int = 1024,
     height: int = 1024,
@@ -220,7 +235,8 @@ def moss_text_to_image(
     """Drive MOSS-Image text-to-image. ``steps`` / ``cfg_scale`` default to the
     reference's 50 / 3.0 (CFG 1 runs no uncond forward). ``uncond_skip_layers``
     are the blocks the uncond forward skips: None = the reference's (22,),
-    empty = none. ``noise`` overrides the seeded initial latent
+    empty = none. ``slg_layers`` and ``slg_scale`` > 0 enable Skip Layer Guidance
+    (see the module docstring). ``noise`` overrides the seeded initial latent
     ``(1, 128, H/16, W/16)``."""
     if sampler not in _MOSS_SAMPLERS:
         raise ValueError(f"MOSS sampler must be one of {sorted(_MOSS_SAMPLERS)}; got {sampler!r}")
@@ -231,6 +247,7 @@ def moss_text_to_image(
     steps = MOSS_DEFAULTS["steps"] if steps is None else steps
     cfg_scale = MOSS_DEFAULTS["cfg_scale"] if cfg_scale is None else cfg_scale
     skip_layers = _skip_layers(model, uncond_skip_layers)
+    slg_layers = validate_slg(slg_layers, slg_scale, slg_start, slg_stop, len(model.backbone.layers))
     policy = model.policy
     device = policy.device
 
@@ -241,6 +258,7 @@ def moss_text_to_image(
             bm_alpha1=bm_alpha1, bm_beta1=bm_beta1, bm_alpha2=bm_alpha2, bm_beta2=bm_beta2)
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
         need_uncond = cfg_scale != 1.0 and cfg_hi > cfg_lo
+        skip_lo, skip_hi = slg_window_bounds(sigmas, slg_start, slg_stop)
         hit, feats = _text_features(model, prompt, negative_prompt, need_uncond, device)
 
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
@@ -253,7 +271,8 @@ def moss_text_to_image(
                     sampler=sampler,
                     sampler_kwargs=_sampler_kwargs(sampler, gen, sched_shift, curvature, eta_max, gate_reduce),
                     cfg_scale=cfg_scale, cfg_lo=cfg_lo, cfg_hi=cfg_hi, need_uncond=need_uncond,
-                    skip_layers=skip_layers, progress_callback=progress_callback,
+                    skip_layers=skip_layers, slg_layers=slg_layers, slg_scale=slg_scale,
+                    skip_lo=skip_lo, skip_hi=skip_hi, progress_callback=progress_callback,
                     preview_callback=preview_callback)
         image, decode_mode = _decode(model, x)
         info = PipelineInfo(vae_decode_mode=decode_mode)
@@ -289,6 +308,10 @@ def moss_img2img(
     cfg_interval_start: float = 0.0,
     cfg_interval_end: float = 1.0,
     uncond_skip_layers: "tuple[int, ...] | list[int] | None" = None,
+    slg_layers: "tuple[int, ...] | list[int] | None" = None,
+    slg_scale: float = 0.0,
+    slg_start: float = 0.0,
+    slg_stop: float = 1.0,
     shift: float = 5.0,
     width: int = 1024,
     height: int = 1024,
@@ -326,6 +349,7 @@ def moss_img2img(
     steps = MOSS_DEFAULTS["steps"] if steps is None else steps
     cfg_scale = MOSS_DEFAULTS["cfg_scale"] if cfg_scale is None else cfg_scale
     skip_layers = _skip_layers(model, uncond_skip_layers)
+    slg_layers = validate_slg(slg_layers, slg_scale, slg_start, slg_stop, len(model.backbone.layers))
     policy = model.policy
     device = policy.device
 
@@ -337,6 +361,7 @@ def moss_img2img(
         sigmas = sigmas[-(steps + 1):]
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
         need_uncond = cfg_scale != 1.0 and cfg_hi > cfg_lo
+        skip_lo, skip_hi = slg_window_bounds(sigmas, slg_start, slg_stop)
         hit, feats = _text_features(model, prompt, negative_prompt, need_uncond, device)
 
         z0 = _encode_image(model, init_image, width, height)
@@ -354,7 +379,8 @@ def moss_img2img(
                     sampler=sampler,
                     sampler_kwargs=_sampler_kwargs(sampler, gen, sched_shift, curvature, eta_max, gate_reduce),
                     cfg_scale=cfg_scale, cfg_lo=cfg_lo, cfg_hi=cfg_hi, need_uncond=need_uncond,
-                    skip_layers=skip_layers, progress_callback=progress_callback,
+                    skip_layers=skip_layers, slg_layers=slg_layers, slg_scale=slg_scale,
+                    skip_lo=skip_lo, skip_hi=skip_hi, progress_callback=progress_callback,
                     preview_callback=preview_callback, mask_lat=mask_lat, z0=z0)
         image, decode_mode = _decode(model, x)
         if mask_image is not None:

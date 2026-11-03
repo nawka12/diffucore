@@ -31,6 +31,28 @@ def guidance_interval_bounds(sigmas, start: float, end: float) -> tuple[float, f
     return lo, hi
 
 
+def validate_slg(layers, scale: float, start: float, stop: float, depth: int) -> tuple[int, ...]:
+    """Validate Skip Layer Guidance options. The blocks to skip, empty when SLG is off."""
+    layers = tuple(sorted({int(i) for i in layers or ()}))
+    if any(not 0 <= i < depth for i in layers):
+        raise ValueError(f"slg_layers must be block indices in [0, {depth}); got {list(layers)}")
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError(f"slg_scale must be finite and >= 0; got {scale}")
+    if not 0 <= start <= stop <= 1:
+        raise ValueError(f"need 0 <= slg_start <= slg_stop <= 1; got {start}, {stop}")
+    return layers if scale > 0 else ()
+
+
+def slg_window_bounds(sigmas, start: float, stop: float) -> tuple[float, float]:
+    """The MOSS-Image reference's ``start <= i / n < stop`` as ``(lo, hi)`` with
+    skipping on while ``lo < sigma <= hi``, so mid-step evaluations follow their step."""
+    n = len(sigmas) - 1
+    steps = [i for i in range(n) if start <= i / n < stop]
+    if not steps:
+        return 0.0, 0.0
+    return guidance_interval_bounds(sigmas, steps[0] / n, (steps[-1] + 1) / n)
+
+
 class ModelDenoiser:
     """Wrap a backbone into an x0 estimator in sigma space.
 

@@ -132,3 +132,21 @@ def test_fused_dit_forward_matches_eager():
         out = dit(x, t, ctx).float()
     assert torch.isfinite(out).all()
     assert float((out - ref).norm() / ref.norm()) < 1e-3
+
+
+@_needs_fused
+@pytest.mark.parametrize("skip", [(0,), (1,), (2,), (3,), (1, 2)])
+def test_fused_dit_with_skipped_blocks_matches_eager(skip):
+    """The deferred residual of the block before a skipped one still lands, on
+    the next block run or after the loop when the last block is skipped."""
+    torch.manual_seed(0)
+    cfg = CosmosDiTConfig(model_channels=128, num_blocks=4, num_heads=2, head_dim=64, crossattn_emb_channels=64)
+    dit = CosmosDiT(cfg).cuda().half().eval()
+    x = torch.randn(1, cfg.in_channels, 1, 16, 16).cuda().half()
+    t = torch.tensor([0.5]).cuda().half()
+    ctx = torch.randn(1, 16, cfg.crossattn_emb_channels).cuda().half()
+    with torch.no_grad():
+        eager = dit(x, t, ctx, skip_layers=skip).float()
+        _fused.set_fused_glue(dit, True)
+        fused = dit(x, t, ctx, skip_layers=skip).float()
+    assert torch.allclose(fused, eager, atol=2e-2, rtol=2e-2), (fused - eager).abs().max().item()

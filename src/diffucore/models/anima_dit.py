@@ -542,7 +542,7 @@ class _FinalLayer(nn.Module):
         shift, scale = delta.chunk(2, dim=-1)
         shift = rearrange(shift, "b t d -> b t 1 1 d")
         scale = rearrange(scale, "b t d -> b t 1 1 d")
-        h = self.layer_norm(x) * (1 + scale) + shift
+        h = self.layer_norm(x).to(scale.dtype) * (1 + scale) + shift
         return self.linear(h)
 
 
@@ -817,6 +817,7 @@ class CosmosDiT(nn.Module):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         teacache: Optional["TeaCache"] = None,
+        skip_layers: tuple[int, ...] = (),
     ) -> torch.Tensor:
         orig_shape = list(x.shape)
         x = _pad_to_patch_size(x, (self.cfg.patch_temporal, self.cfg.patch_spatial, self.cfg.patch_spatial))
@@ -860,15 +861,19 @@ class CosmosDiT(nn.Module):
             # Fused blocks hand their MLP residual to the next block's first
             # LayerNorm pass instead of applying it in a pass of their own.
             carry = None
-            for block in self.blocks:
-                x_B_T_H_W_D, carry = block(x_B_T_H_W_D, emb_B_T_D, ctx, rope_emb, adaln_lora_B_T_3D,
-                                           carry=carry, defer=True, null_keys=null_keys)
+            for i, block in enumerate(self.blocks):
+                if i not in skip_layers:
+                    x_B_T_H_W_D, carry = block(x_B_T_H_W_D, emb_B_T_D, ctx, rope_emb, adaln_lora_B_T_3D,
+                                               carry=carry, defer=True, null_keys=null_keys)
             if carry is not None:
                 x_B_T_H_W_D = _finish_carry(x_B_T_H_W_D, carry)
             if teacache is not None:
                 teacache.update(x_B_T_H_W_D - residual_in)
 
-        out = self.final_layer(x_B_T_H_W_D.to(context.dtype), emb_B_T_D, adaln_lora_B_T_3D)
+        # Skipping a block can leave the stream beyond fp16's range: normalize it in
+        # fp32 first. The cast stays for a full forward, whose rounding it fixes.
+        final_in = x_B_T_H_W_D if skip_layers else x_B_T_H_W_D.to(context.dtype)
+        out = self.final_layer(final_in, emb_B_T_D, adaln_lora_B_T_3D)
         out = self._unpatchify(out)[:, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]]
         if teacache is not None and teacache.rule == "easy":
             teacache.record_output(out)
@@ -932,7 +937,9 @@ class AnimaDiT(CosmosDiT):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         teacache: Optional["TeaCache"] = None,
+        skip_layers: tuple[int, ...] = (),
     ) -> torch.Tensor:
         if t5xxl_ids is not None:
             context = self.preprocess_text_embeds(context, t5xxl_ids, t5xxl_weights=t5xxl_weights)
-        return super().forward(x, timesteps, context, fps=fps, padding_mask=padding_mask, teacache=teacache)
+        return super().forward(x, timesteps, context, fps=fps, padding_mask=padding_mask, teacache=teacache,
+                               skip_layers=skip_layers)
