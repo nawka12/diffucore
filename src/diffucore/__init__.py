@@ -8,7 +8,7 @@ End-to-end text-to-image, image-to-image, and inpainting for Stable Diffusion
 LoRA / LoKr adapters. See ``docs/ARCHITECTURE.md`` and ``docs/ROADMAP.md``.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 from .bundle import (ModelBundle, load_anima_checkpoint, load_checkpoint, load_flux_checkpoint,
                      load_krea2_checkpoint, load_moss_checkpoint)
