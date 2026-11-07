@@ -159,6 +159,43 @@ image = TextToImage(model)(prompt, steps=8, cfg_scale=1.0, scheduler="krea2", se
 # Raw: steps=28, cfg_scale=5.5
 ```
 
+### MOSS-Image (DiT)
+
+MOSS-Image is a 5 B DiT with the Qwen3.5-9B text encoder and the FLUX.2 small
+VAE (`flux2-vae_small.safetensors`). Its defaults are 50 steps and CFG 3.
+
+```python
+from diffucore import TextToImage
+from diffucore.bundle import load_moss_checkpoint
+import torch
+
+model = load_moss_checkpoint(
+    "moss_image_sft_int8_convrot.safetensors", "qwen3.5_9b_int8_convrot.safetensors",
+    "flux2-vae_small.safetensors", device="cuda", dtype=torch.float16,
+)
+image = TextToImage(model)(prompt, steps=50, cfg_scale=3.0, seed=0)
+```
+
+### Z-Image (DiT)
+
+Z-Image is a 6 B single-stream DiT with the Qwen3-4B text encoder and the FLUX.1
+VAE (`ae.safetensors`). The variant comes from the DiT filename: "turbo" in the
+name means Turbo. Turbo runs 8 steps at CFG 1 with no negative prompt; Base runs
+50 steps at CFG 5. ComfyUI bf16 and INT8 files load as-is (Turbo from
+`Comfy-Org/Z-Image-Turbo`, Base from `Comfy-Org/Z-Image`).
+
+```python
+from diffucore import TextToImage
+from diffucore.bundle import load_zimage_checkpoint
+
+model = load_zimage_checkpoint(
+    "z_image_turbo_int8_convrot.safetensors", "qwen_3_4b.safetensors",
+    "ae.safetensors", device="cuda",
+)
+image = TextToImage(model)(prompt, steps=8, cfg_scale=1.0, seed=0)
+# Base (z_image_int8_convrot.safetensors): steps=50, cfg_scale=5.0
+```
+
 ### FLUX (DiT)
 
 FLUX is a guidance-distilled rectified-flow MMDiT, so there's no negative-prompt
@@ -324,6 +361,8 @@ few-step multistep samplers (`dpmpp_2m`) need ≤0.01. Tune by eye, starting low
 | FLUX.1 (dev / schnell) | 1024² | t2i · img2img · inpaint ‡ | flow-matching MMDiT, T5-XXL + CLIP-L † |
 | FLUX.2 (Klein / Dev) | 1024² | t2i · img2img · inpaint ‡ | global-mod MMDiT, Qwen3 (Klein) / Mistral-3 (Dev) † |
 | Krea 2 (Raw / Turbo) | 1024² | t2i · img2img · inpaint ‡ | 12.8 B single-stream DiT, Qwen3-VL-4B + Qwen-Image VAE, bf16 / ComfyUI INT8 files § |
+| MOSS-Image | 1024² | t2i · img2img · inpaint ‡ | 5 B DiT, Qwen3.5-9B text encoder + FLUX.2 small VAE |
+| Z-Image (Turbo / Base) | 1024² | t2i · img2img · inpaint ‡ | 6 B single-stream DiT, Qwen3-4B text encoder + FLUX.1 VAE, bf16 / ComfyUI INT8 files |
 
 ‡ Soft, latent-mask inpaint (no dedicated inpaint model).
 
@@ -331,7 +370,7 @@ LoRA / LoKr adapters are supported on SD1.5 / SDXL / Anima. Krea 2 takes LoRA
 (ComfyUI or diffusers keys, not LoKr) as forward hooks instead of fused weights,
 so it works on streamed, file-backed and INT8 weights with no RAM snapshot.
 Diffusers-format Krea 2 transformers load from the `transformer/` folder, its
-repo root or its `*.index.json`.
+repo root or its `*.index.json`. MOSS-Image and Z-Image also take LoRA.
 
 § **Krea 2** is checked against the diffusers reference on real weights:
 tokenizer ids exact, text-encoder and DiT outputs within the bf16 reference's own
