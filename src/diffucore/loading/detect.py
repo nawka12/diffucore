@@ -5,7 +5,7 @@ SD checkpoints use the LDM layout; the UNet cross-attention context width
 (``attn2.to_k``) tells the families apart: 768 = SD1.x, 1024 = SD2.x,
 2048 = SDXL. Anima (Cosmos-Predict2 + Qwen3 + Qwen-Image VAE) is found by its
 LLM-adapter fingerprint, FLUX by its double-stream blocks, MOSS-Image by its
-shared block modulation.
+shared block modulation, Z-Image by its two learned pad tokens.
 """
 
 from __future__ import annotations
@@ -27,6 +27,14 @@ _KREA2_FINGERPRINT = "txtfusion.projector.weight"
 # ComfyUI files differ only in q/k/v, which these don't touch).
 _MOSS_FINGERPRINTS = ("shared_block_modulation.weight", "video_head_modulation.weight")
 
+# Z-Image: the two learned pad tokens, in the original / ComfyUI and the
+# diffusers layouts alike. Lumina 2 (Lumina Image 2.0, NetaYume) has them too;
+# its block modulation is SiLU + Linear (``adaLN_modulation.1``), Z-Image's a
+# bare Linear (``adaLN_modulation.0``).
+_ZIMAGE_FINGERPRINTS = ("cap_pad_token", "x_pad_token")
+_ZIMAGE_MODULATION = "layers.0.adaLN_modulation.0.weight"
+_LUMINA2_MODULATION = "layers.0.adaLN_modulation.1.weight"
+
 Shape = Sequence[int]
 
 
@@ -34,7 +42,7 @@ Shape = Sequence[int]
 class ModelSpec:
     """Everything the engine needs to know about a checkpoint before building it."""
 
-    architecture: str          # e.g. "sd15", "sdxl", "anima", "flux1", "flux2", "krea2", "moss_image"
+    architecture: str          # e.g. "sd15", "sdxl", "anima", "flux1", "flux2", "krea2", "moss_image", "z_image"
     prediction: str            # "eps" | "v" | "flow"
     zero_terminal_snr: bool    # rescale the schedule to zero terminal SNR (ZTSNR)
     latent_channels: int       # VAE latent channel count
@@ -129,6 +137,14 @@ def _moss_prefix(shapes: Mapping[str, Shape]) -> str | None:
     return None
 
 
+def _zimage_prefix(shapes: Mapping[str, Shape]) -> str | None:
+    first, second = _ZIMAGE_FINGERPRINTS
+    for k in shapes:
+        if k.endswith(first) and k[: -len(first)] + second in shapes:
+            return k[: -len(first)]
+    return None
+
+
 def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
     """Infer a :class:`ModelSpec` from a ``{key: shape}`` mapping.
 
@@ -157,6 +173,27 @@ def detect_architecture(shapes: Mapping[str, Shape]) -> ModelSpec:
             context_dim=2560,
             image_size=1024,
             latent_scale=1.0,
+        )
+
+    # Z-Image (Turbo and Base are the same network; the variant is not in the
+    # tensors, see ``load_zimage_checkpoint``).
+    zimage_prefix = _zimage_prefix(shapes)
+    if zimage_prefix is not None and zimage_prefix + _LUMINA2_MODULATION in shapes:
+        raise NotImplementedError(
+            "recognized a Lumina 2 checkpoint (Lumina Image 2.0 / NetaYume), which is not supported")
+    if zimage_prefix is not None and zimage_prefix + _ZIMAGE_MODULATION in shapes:
+        embedder = shapes.get(zimage_prefix + "x_embedder.weight") or shapes.get(
+            zimage_prefix + "all_x_embedder.2-1.weight")
+        cap = shapes.get(zimage_prefix + "cap_embedder.1.weight")
+        return ModelSpec(
+            architecture="z_image",
+            prediction="flow",
+            zero_terminal_snr=False,
+            latent_channels=int(embedder[1]) // 4 if embedder is not None else 16,
+            context_dim=int(cap[1]) if cap is not None else 2560,
+            image_size=1024,
+            latent_scale=0.3611,        # the FLUX.1 VAE
+            latent_shift=0.1159,
         )
 
     # MOSS-Image (Base and SFT are the same network): checked before FLUX.

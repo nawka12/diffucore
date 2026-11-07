@@ -26,6 +26,14 @@ tests/_moss_reference.py is that reference code, vendored for the oracle tests.
 MOSS-Image weights are not distributed with this product and carry their own
 license.
 
+The Z-Image DiT (src/diffucore/models/z_image_dit.py) and the sampling
+conventions in src/diffucore/pipelines/_zimage.py are ported from the
+ZImageTransformer2DModel and ZImagePipeline of diffusers (Apache License 2.0,
+Alibaba Z-Image Team and The HuggingFace Team); module names follow the
+released checkpoints so they load unchanged. tests/_zimage_reference.py is
+that reference code, trimmed, for the oracle tests. Z-Image weights are not
+distributed with this product and carry their own license.
+
 The Qwen3.5 text encoder (src/diffucore/models/qwen35_text.py) follows the
 Qwen3.5 text model in Hugging Face transformers (Apache License 2.0, The
 Hugging Face Team and the Qwen Team); its parameter names mirror the released

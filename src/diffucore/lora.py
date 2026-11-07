@@ -24,6 +24,13 @@ add into the row thirds of the fused ``proj.qkv`` output; the text embedder's
 ``.alpha`` tensor, else the file's metadata (``alpha``, or PEFT's
 ``lora_adapter_metadata``), else the rank. A LoRA that carries a weight of a
 different shape (a control adapter) is rejected.
+
+Z-Image reuses that machinery. Its q/k/v LoRAs (diffusers' ``attention.to_q`` /
+``to_k`` / ``to_v``) add into the row thirds of the fused ``attention.qkv``;
+``to_out.0``, ``all_x_embedder.2-1`` and ``all_final_layer.2-1`` are aliases of
+``attention.out``, ``x_embedder`` and ``final_layer``. Keys are bare,
+``diffusion_model.`` (ComfyUI, ai-toolkit), ``transformer.`` (diffusers PEFT) or
+kohya's ``lora_unet_`` mangling.
 """
 
 from __future__ import annotations
@@ -92,7 +99,7 @@ def apply_lora(bundle, path: str, multiplier: float = 1.0) -> LoraReport:
     """
     state = _lora_state(bundle)
     if _is_hooked(bundle):
-        attach = _moss_attach if _is_moss(bundle) else _krea2_attach
+        attach = _moss_attach if _is_moss(bundle) else _zimage_attach if _is_zimage(bundle) else _krea2_attach
         report, handles = attach(bundle, path, multiplier)
         state["stack"].append((path, multiplier))
         state.setdefault("hooks", []).append(handles)
@@ -357,9 +364,13 @@ def _is_moss(bundle) -> bool:
     return getattr(bundle.spec, "architecture", None) == "moss_image"
 
 
+def _is_zimage(bundle) -> bool:
+    return getattr(bundle.spec, "architecture", None) == "z_image"
+
+
 def _is_hooked(bundle) -> bool:
     """Families whose LoRAs are forward hooks rather than fused weights."""
-    return _is_krea2(bundle) or _is_moss(bundle)
+    return _is_krea2(bundle) or _is_moss(bundle) or _is_zimage(bundle)
 
 
 def _krea2_invalidate(bundle) -> None:
@@ -464,12 +475,13 @@ def _moss_metadata_alpha(path: str) -> float | None:
     return None
 
 
-def _moss_attach(bundle, path: str, multiplier: float):
-    """Hook each LoRA module onto its MOSS-Image layer; ``(report, hook handles)``."""
+def _moss_attach(bundle, path: str, multiplier: float, targets_of=_moss_targets, label: str = "MOSS-Image"):
+    """Hook each LoRA module onto its ``label`` (MOSS-Image) layer; ``(report,
+    hook handles)``. ``targets_of`` builds the name -> ``(layer, rows)`` table."""
     policy = getattr(bundle, "policy", None)
     device = policy.device if policy is not None else _CPU
     dtype = policy.compute_dtype if policy is not None else torch.float32
-    targets = _moss_targets(_eager(bundle.backbone))
+    targets = targets_of(_eager(bundle.backbone))
     state_dict = load_state_dict(path, device="cpu")
     file_alpha = _moss_metadata_alpha(path)
     unmatched = [k for k in state_dict
@@ -485,7 +497,7 @@ def _moss_attach(bundle, path: str, multiplier: float):
                 raise ValueError(
                     f"this LoRA changes the shape of {base}.{leaf} {tuple(have.shape)} -> "
                     f"{tuple(state_dict[key].shape)} (a control / adapter LoRA); only plain LoRAs "
-                    f"are supported for MOSS-Image")
+                    f"are supported for {label}")
 
     per_layer: dict = {}
     for name, factors in _group(state_dict).items():
@@ -517,8 +529,40 @@ def _moss_attach(bundle, path: str, multiplier: float):
             handles.append(module.register_forward_hook(_LoraSlices(sliced)))
     applied = sum(len(b) for _, b in per_layer.values())
     _krea2_invalidate(bundle)
-    print(f"[lora] MOSS-Image: {applied} modules hooked, {len(unmatched)} unmapped", flush=True)
+    print(f"[lora] {label}: {applied} modules hooked, {len(unmatched)} unmapped", flush=True)
     return LoraReport(applied=applied, unmatched=unmatched), handles
+
+
+def _zimage_targets(backbone) -> dict:
+    """LoRA module name -> ``(layer, (row_start, row_end) or None)`` for Z-Image,
+    under the original names, the diffusers aliases (``to_q/k/v`` as row thirds
+    of ``attention.qkv``), each with the bare, ``diffusion_model.`` and
+    ``transformer.`` prefixes and kohya's ``lora_unet_`` mangling."""
+    targets = {}
+    for name, module in backbone.named_modules():
+        if not isinstance(module, (nn.Linear, Int8Linear)):
+            continue
+        entries = {name: (module, None)}
+        if name == "x_embedder":
+            entries["all_x_embedder.2-1"] = (module, None)
+        elif name.startswith("final_layer."):
+            entries["all_final_layer.2-1." + name[len("final_layer."):]] = (module, None)
+        elif name.endswith(".attention.out"):
+            entries[name[:-3] + "to_out.0"] = (module, None)
+        elif name.endswith(".attention.qkv"):
+            third = module.out_features // 3
+            for i, c in enumerate(("to_q", "to_k", "to_v")):
+                entries[name[:-3] + c] = (module, (i * third, (i + 1) * third))
+        for key, target in entries.items():
+            for prefix in ("", "diffusion_model.", "transformer."):
+                targets[prefix + key] = target
+            targets["lora_unet_" + key.replace(".", "_")] = target
+    return targets
+
+
+def _zimage_attach(bundle, path: str, multiplier: float):
+    """Hook each LoRA module onto its Z-Image layer; ``(report, hook handles)``."""
+    return _moss_attach(bundle, path, multiplier, _zimage_targets, "Z-Image")
 
 
 __all__ = ["apply_lora", "remove_lora", "clear_loras", "LoraReport"]

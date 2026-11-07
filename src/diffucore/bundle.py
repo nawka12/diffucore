@@ -20,14 +20,14 @@ import torch
 import torch.nn as nn
 
 from .conditioning import (AnimaTokenizer, CLIPTokenizer, FluxTokenizer, Flux2Tokenizer, Krea2Tokenizer,
-                           MossTokenizer)
+                           MossTokenizer, ZImageTokenizer)
 from .loading import ModelSpec, detect_architecture, load_state_dict, read_header, read_metadata
 from .models import (
     AutoencoderKL, CLIPTextEncoder, OpenCLIPTextEncoder, UNetModel, VAEConfig,
     AnimaDiT, CosmosDiTConfig, QwenImageVAE, Qwen3TextEncoder, Qwen3Config,
     Qwen35TextEncoder, Qwen35Config,
     Flux, FluxConfig, T5TextEncoder, MistralConfig, MistralTextEncoder,
-    Krea2Config, Krea2DiT, MossConfig, MossDiT,
+    Krea2Config, Krea2DiT, MossConfig, MossDiT, ZImageConfig, ZImageDiT,
 )
 from .models._attention import resolve_attention_backend, set_attention_backend
 from .models._fused import fused_glue_available, set_fused_glue
@@ -42,6 +42,8 @@ from .models.moss_dit import drop_unused_keys as moss_drop_unused_keys
 from .models.moss_dit import from_diffusers as moss_from_diffusers
 from .models.moss_dit import int8_layer_names as moss_int8_layer_names
 from .models.qwen_image_vae import convert_qwen2d_state_dict
+from .models.z_image_dit import from_diffusers as zimage_from_diffusers
+from .models.z_image_dit import int8_layer_names as zimage_int8_layer_names
 from .models.unet import sdxl_unet_config
 from .models.vae import convert_diffusers_vae_state_dict
 from .runtime import (DevicePolicy, file_backed, maybe_compile_backbone, stream_blocks, stream_layers,
@@ -793,6 +795,197 @@ def load_moss_checkpoint(
         spec=spec,
         schedule=None,
         tokenizer=MossTokenizer(),
+        text_encoder=text_encoder,
+        backbone=backbone,
+        vae=vae,
+        text_encoder_2=None,
+        policy=policy,
+    )
+
+
+# ─── Z-Image (Turbo + Base) ──────────────────────────────────────────────────
+_ZIMAGE_DIT_LEAF = "cap_pad_token"
+_ZIMAGE_TE_LEAF = "layers.0.self_attn.q_norm.weight"
+# The conditioning is Qwen3-4B's hidden state after layer 35 of 36, so the last
+# layer and the final norm's input never run.
+_ZIMAGE_TE_LAYERS = 35
+_ZIMAGE_VARIANTS = ("turbo", "base")
+# The bf16-trained DiT overflows fp16 inside both branches (Base at 768^2: qkv
+# 1.3e6, attention output 3e6, feed-forward hidden 7e6 and output 6e7; fp16
+# max 65504), so fp16 carries them at 1/256 and 1/4096 (exact: RMSNorms follow).
+_ZIMAGE_FP16_ATTN_SCALE = 1 / 256
+_ZIMAGE_FP16_FFN_SCALE = 1 / 4096
+
+
+def _zimage_dit_state(path: str) -> dict:
+    """The DiT's state dict in the original (fused) layout, from a ComfyUI file
+    or the diffusers ``transformer`` shards (q/k/v fused here)."""
+    sd = {}
+    for f in _krea2_dit_files(path):
+        sd.update(load_state_dict(f, device="cpu"))
+    sd = _extract_component(sd, _ZIMAGE_DIT_LEAF)
+    if sd is None:
+        raise ValueError(f"{path!r} has no Z-Image DiT weights")
+    if any(k.startswith(("siglip_embedder.", "siglip_refiner.")) for k in sd):
+        raise NotImplementedError("Z-Image Omni (SigLIP) checkpoints are not supported")
+    if "all_x_embedder.2-1.weight" in sd:
+        sd = zimage_from_diffusers(sd)
+    return sd
+
+
+def _zimage_variant(dit_path: str, variant: str | None) -> str:
+    """``variant``, else "turbo" when the DiT's path says so (a diffusers
+    folder's leaf is just "transformer", so the whole path is read), else "base"."""
+    if variant is None:
+        p = Path(dit_path)
+        where = str(p) if p.is_dir() or p.name.endswith(".index.json") else p.name
+        variant = "turbo" if "turbo" in where.lower() else "base"
+    if variant not in _ZIMAGE_VARIANTS:
+        raise ValueError(f"Z-Image variant must be one of {_ZIMAGE_VARIANTS}; got {variant!r}")
+    return variant
+
+
+def _zimage_text_encoder(te_path: str) -> tuple[Qwen3TextEncoder, dict]:
+    """Qwen3-4B as a plain Qwen3 text encoder, without the layers the DiT never
+    reads. The file is ComfyUI's single ``qwen_3_4b`` or the diffusers
+    ``text_encoder`` shards."""
+    sd = {}
+    for f in _krea2_dit_files(te_path, "text_encoder"):
+        sd.update(load_state_dict(f, device="cpu"))
+    lm = _extract_component(sd, _ZIMAGE_TE_LEAF)
+    if lm is None:
+        raise ValueError(f"{te_path!r} has no Qwen3 language model (expected Qwen3-4B)")
+    n_layers = 1 + max(int(k.split(".")[1]) for k in lm if k.startswith("layers."))
+    if n_layers < _ZIMAGE_TE_LAYERS:
+        raise ValueError(f"the text encoder has {n_layers} layers; Z-Image needs Qwen3-4B (36)")
+    te_sd = {"model." + k: v for k, v in lm.items()
+             if not (k.startswith("layers.") and int(k.split(".")[1]) >= _ZIMAGE_TE_LAYERS)}
+    encoder = _build(Qwen3TextEncoder, _qwen3_config_from_sd(te_sd))
+    encoder.load_state_dict(te_sd, strict=True, assign=True)
+    return encoder, te_sd
+
+
+def load_zimage_dit(dit_path: str, policy: DevicePolicy, _stage=print, masters: str = "pinned") -> ZImageDiT:
+    """The Z-Image DiT alone, placed per ``policy`` (int8, streaming, attention
+    backend, fp16 residual scale). ``masters="file"`` streams the blocks
+    straight from the checkpoint's mmap (``offload="stream"`` only)."""
+    _stage("loading DiT weights (largest file)")
+    sd_dit = _zimage_dit_state(dit_path)
+    cfg = ZImageConfig.from_state_dict(sd_dit)
+    _stage(f"building DiT backbone ({cfg.n_layers} blocks)")
+    backbone = _build(ZImageDiT, cfg)
+    int8 = int8_layers(sd_dit)
+    if int8:
+        sd_dit = adopt_int8_layers(backbone, sd_dit, int8)
+    backbone.load_state_dict(sd_dit, strict=True, assign=True)
+    int8_fast = int8_fast_available(policy.device)
+    if int8 and not int8_fast:
+        _stage(f"INT8 file without a fast int8 path here (needs CUDA sm75+ and Triton): "
+               f"dequantizing {len(int8)} layers")
+        dequantize_linears(backbone, policy.compute_dtype,
+                           policy.device if policy.device.type == "cuda" else None)
+    elif int8:
+        _stage(f"INT8 file: {len(int8)} int8 layers")
+    elif policy.int8 and int8_fast:
+        n = quantize_linears(backbone, zimage_int8_layer_names(cfg), policy.device)
+        _stage(f"int8: quantized {n} layers")
+    elif policy.int8:
+        _stage("int8 skipped: needs CUDA sm75+ and Triton")
+    if int8_fast and (int8 or policy.int8):
+        _load_fused_gemm(_stage, policy)
+    fp16 = policy.compute_dtype == torch.float16
+    backbone.attn_scale = _ZIMAGE_FP16_ATTN_SCALE if fp16 else 1.0
+    backbone.ffn_scale = _ZIMAGE_FP16_FFN_SCALE if fp16 else 1.0
+    if policy.offload_stream and masters == "file":
+        keep = _krea2_resident_blocks(backbone, policy, "layers")
+        _stage(f"DiT: {len(keep)} of {cfg.n_layers} blocks kept on the GPU, the rest streamed "
+               f"from the file's mmap (no RAM copy)")
+        stream_blocks(backbone.eval(), ("layers",), policy.device, policy.offload_device,
+                      keep_resident=keep, num_blocks_per_group=policy.stream_blocks_per_group,
+                      masters="file", dtype=policy.compute_dtype)
+    elif policy.offload_stream:
+        _stage("streaming DiT blocks to GPU (low-VRAM mode)")
+        backbone = _place(backbone, policy.offload_device, policy.compute_dtype, sd_dit).eval()
+        stream_blocks(backbone, ("layers",), policy.device, policy.offload_device,
+                      num_blocks_per_group=policy.stream_blocks_per_group,
+                      prefetch=policy.stream_prefetch)
+    else:
+        unet_target = policy.offload_device if policy.offload_unet else policy.device
+        backbone = _place(backbone, unet_target, policy.compute_dtype, sd_dit).eval()
+
+    attn_backend = resolve_attention_backend(policy)
+    if attn_backend != "sdpa":
+        set_attention_backend(backbone, attn_backend)
+        _stage(f"attention backend: {attn_backend}")
+    backbone = maybe_compile_backbone(backbone, policy)
+    return backbone
+
+
+def load_zimage_checkpoint(
+    dit_path: str,
+    te_path: str,
+    vae_path: str,
+    *,
+    variant: str | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.float16,
+    policy: DevicePolicy | None = None,
+) -> ModelBundle:
+    """Load Z-Image (DiT + Qwen3-4B TE + FLUX.1 VAE). Turbo and Base share the
+    weight layout and differ only in sampling, so ``variant`` ("turbo" /
+    "base") is stamped on the spec; ``None`` reads it off the DiT filename."""
+    if policy is None:
+        policy = DevicePolicy(device=torch.device(device), compute_dtype=dtype)
+    _t0 = time.perf_counter()
+    def _stage(msg: str) -> None:
+        print(f"[load] (+{time.perf_counter() - _t0:.1f}s) {msg}", flush=True)
+
+    _stage("detecting architecture")
+    dit_files = _krea2_dit_files(dit_path)
+    shapes = {}
+    for f in dit_files:
+        shapes.update(read_header(f))
+    spec = detect_architecture(shapes)
+    if spec.architecture != "z_image":
+        raise ValueError(f"{dit_path!r} is not a Z-Image checkpoint (detected {spec.architecture!r})")
+    spec = replace(spec, variant=_zimage_variant(dit_path, variant))
+
+    idle_target = policy.offload_device if policy.offload_idle else policy.device
+    te_files = _krea2_dit_files(te_path, "text_encoder")
+    masters = _krea2_masters(policy, *dit_files, *te_files) if policy.offload_idle else "pinned"
+
+    _stage("loading VAE weights")
+    vae_sub = _extract_component(load_state_dict(vae_path, device="cpu"), _FLUX_VAE_LEAF)
+    if vae_sub is None or "bn.running_mean" in vae_sub:
+        raise ValueError(f"{vae_path!r} is not a FLUX.1 VAE (Z-Image uses the 16-channel FLUX.1 autoencoder)")
+    vae, vae_sub = _build_flux_vae(vae_sub, spec)
+    if vae.config.z_channels != spec.latent_channels:
+        raise ValueError(f"the VAE has {vae.config.z_channels} latent channels but the DiT reads "
+                         f"{spec.latent_channels}; Z-Image needs the FLUX.1 VAE")
+    vae = _place(vae, idle_target, policy.vae_dtype, vae_sub).eval()
+
+    _stage("loading text encoder (Qwen3-4B) weights")
+    text_encoder, te_sd = _zimage_text_encoder(te_path)
+    if text_encoder.cfg.hidden_size != spec.context_dim:
+        raise ValueError(f"the text encoder is {text_encoder.cfg.hidden_size} wide but the DiT reads "
+                         f"{spec.context_dim}; Z-Image needs Qwen3-4B")
+    if masters == "file" and policy.device.type == "cuda":
+        _stage("text encoder parked on the file's mmap, layers streamed (low RAM)")
+        layers = text_encoder.model.layers
+        text_encoder = file_backed(text_encoder.eval(), policy.compute_dtype, exclude=(layers,))
+        stream_layers(layers, policy.device, policy.compute_dtype)
+    elif masters == "file":
+        text_encoder = file_backed(text_encoder.eval(), policy.compute_dtype)
+    else:
+        text_encoder = _place(text_encoder, idle_target, policy.compute_dtype, te_sd).eval()
+
+    backbone = load_zimage_dit(dit_path, policy, _stage, masters)
+    _stage("model ready")
+
+    return ModelBundle(
+        spec=spec,
+        schedule=None,
+        tokenizer=ZImageTokenizer(),
         text_encoder=text_encoder,
         backbone=backbone,
         vae=vae,

@@ -202,6 +202,7 @@ from .anima_tokenizer import AnimaTokenized, AnimaTokenizer
 from .flux_tokenizer import FluxTokenized, FluxTokenizer, Flux2Tokenizer
 from .krea2_tokenizer import Krea2Tokenized, Krea2Tokenizer
 from .moss_tokenizer import MossTokenized, MossTokenizer
+from .z_image_tokenizer import ZImageTokenized, ZImageTokenizer
 
 __all__ = [
     "CLIPTokenizer", "Conditioner", "SDXLConditioner", "parse_prompt_attention",
@@ -209,4 +210,5 @@ __all__ = [
     "FluxTokenizer", "FluxTokenized", "Flux2Tokenizer",
     "Krea2Tokenizer", "Krea2Tokenized",
     "MossTokenizer", "MossTokenized",
+    "ZImageTokenizer", "ZImageTokenized",
 ]
