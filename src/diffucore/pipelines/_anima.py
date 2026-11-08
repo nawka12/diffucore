@@ -144,20 +144,42 @@ def _slg_share(layers: tuple[int, ...], sigma: float, lo: float, hi: float) -> d
     return {"prefix": BlockPrefix(layers[0])} if layers and lo < sigma <= hi else {}
 
 
+def _uncond_skip(layers: tuple[int, ...], sigma: float, lo: float, hi: float) -> dict:
+    """Backbone kwargs for the uncond pass: skip ``layers`` inside the window."""
+    return {"skip_layers": layers} if layers and lo < sigma <= hi else {}
+
+
+def _refuse_skip(model: "ModelBundle", teacache_thresh: float, what: str, off: str) -> None:
+    """TeaCache could reuse a residual cached from an unskipped pass, a CUDA Graph
+    records one block list, and a compiled forward ignores ``skip_layers``, which
+    would silently turn the skip off."""
+    if teacache_thresh > 0:
+        raise ValueError(f"{what} is incompatible with TeaCache. {off} or disable TeaCache.")
+    if model.policy.cuda_graphs:
+        raise ValueError(f"{what} is incompatible with CUDA Graphs. {off} or reload "
+                         "the model without the CUDA Graphs flag.")
+    if model.policy.compile:
+        raise ValueError(f"{what} is incompatible with torch.compile. {off} or reload "
+                         "the model without the compile flag.")
+
+
 def _anima_slg(model: "ModelBundle", layers, scale: float, start: float, stop: float,
                teacache_thresh: float) -> tuple[int, ...]:
-    """Validated SLG blocks. TeaCache could reuse a cached cond while the skipped
-    pass computes fresh, a CUDA Graph records one block list, and a compiled forward
-    ignores ``skip_layers``, which would silently turn SLG off."""
+    """Validated SLG blocks."""
     layers = validate_slg(layers, scale, start, stop, len(model.backbone.blocks))
-    if layers and teacache_thresh > 0:
-        raise ValueError("SLG is incompatible with TeaCache. Set the SLG scale to 0 or disable TeaCache.")
-    if layers and model.policy.cuda_graphs:
-        raise ValueError("SLG is incompatible with CUDA Graphs. Set the SLG scale to 0 or reload "
-                         "the model without the CUDA Graphs flag.")
-    if layers and model.policy.compile:
-        raise ValueError("SLG is incompatible with torch.compile. Set the SLG scale to 0 or reload "
-                         "the model without the compile flag.")
+    if layers:
+        _refuse_skip(model, teacache_thresh, "SLG", "Set the SLG scale to 0")
+    return layers
+
+
+def _anima_uncond_skip(model: "ModelBundle", layers, teacache_thresh: float) -> tuple[int, ...]:
+    """Validated blocks for the uncond pass to skip (none by default)."""
+    depth = len(model.backbone.blocks)
+    layers = tuple(sorted({int(i) for i in layers or ()}))
+    if any(not 0 <= i < depth for i in layers):
+        raise ValueError(f"uncond_skip_layers must be block indices in [0, {depth}); got {list(layers)}")
+    if layers:
+        _refuse_skip(model, teacache_thresh, "Uncond skip", "Clear the uncond skip blocks")
     return layers
 
 
@@ -174,6 +196,7 @@ def anima_text_to_image(
     slg_scale: float = 0.0,
     slg_start: float = 0.0,
     slg_stop: float = 1.0,
+    uncond_skip_layers: "tuple[int, ...] | list[int] | None" = None,
     shift: float = 3.0,
     width: int = 1024,
     height: int = 1024,
@@ -218,6 +241,10 @@ def anima_text_to_image(
     the cond branch with those blocks skipped, adding ``slg_scale·(cond − skipped)``
     on steps ``slg_start <= i / n < slg_stop``. At CFG 1 it builds on the skipped
     branch, so scale 1 is plain cond. Not with TeaCache or CUDA Graphs.
+
+    ``uncond_skip_layers`` skips those blocks in the uncond forward on the same
+    steps (ComfyUI's SkipLayerGuidanceDiTSimple): no extra forward, independent of
+    ``slg_scale``. Same restrictions as SLG.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -230,6 +257,7 @@ def anima_text_to_image(
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
+    uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
 
     with perf_context(policy):
         # The post-adapter context depends only on the prompt pair, so a repeat
@@ -325,7 +353,8 @@ def anima_text_to_image(
                             # the cond output first.
                             if policy.cuda_graphs:
                                 v_cond = v_cond.clone()
-                            v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
+                            v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                                                **_uncond_skip(uncond_skip, float(sigma), skip_lo, skip_hi)).squeeze(2)
                             _note_follow_miss(tc_cond, tc_uncond)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
                         if share:
@@ -350,7 +379,8 @@ def anima_text_to_image(
                     else:
                         if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                             v_cond = v_cond.clone()
-                        v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
+                        v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                                            **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
                         _note_follow_miss(tc_cond, tc_uncond)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     if share:
@@ -406,6 +436,7 @@ def anima_img2img(
     slg_scale: float = 0.0,
     slg_start: float = 0.0,
     slg_stop: float = 1.0,
+    uncond_skip_layers: "tuple[int, ...] | list[int] | None" = None,
     shift: float = 3.0,
     width: int = 1024,
     height: int = 1024,
@@ -449,6 +480,7 @@ def anima_img2img(
     if width % 16 or height % 16:
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
+    uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -547,7 +579,8 @@ def anima_img2img(
                 else:
                     if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                         v_cond = v_cond.clone()
-                    v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond).squeeze(2)
+                    v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                                        **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
                     _note_follow_miss(tc_cond, tc_uncond)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 if share:

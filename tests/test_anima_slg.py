@@ -19,6 +19,7 @@ from diffucore.runtime import ConditioningCache, DevicePolicy, stream_blocks
 from diffucore.sampling import flow_matching_schedule
 
 _C, _U, _K = 1.0, 0.25, 0.5   # the cond, uncond and skipped branches' constant velocities
+_S = 0.125                     # the uncond branch with blocks skipped
 
 
 def _dit():
@@ -117,11 +118,10 @@ class _ConstantDiT(nn.Module):
 
     def forward(self, x, t, ctx, teacache=None, skip_layers=(), prefix=None):
         is_cond = torch.equal(ctx, self.cond_ctx)
-        assert not skip_layers or is_cond
-        branch = "skip" if skip_layers else "cond" if is_cond else "uncond"
+        branch = ("skip" if is_cond else "uskip") if skip_layers else "cond" if is_cond else "uncond"
         self.calls.append((float(t.flatten()[0]), branch))
         self.prefixes.append((branch, prefix))
-        return torch.full_like(x, {"skip": _K, "cond": _C, "uncond": _U}[branch])
+        return torch.full_like(x, {"skip": _K, "cond": _C, "uncond": _U, "uskip": _S}[branch])
 
 
 class _StubVAE(nn.Module):
@@ -192,7 +192,9 @@ def test_at_cfg_one_slg_builds_on_the_skipped_branch(monkeypatch, scale, want):
 
 @pytest.mark.parametrize("off", [dict(slg_layers=(2,), slg_scale=0.0), dict(slg_layers=(), slg_scale=2.0),
                                  dict(slg_layers=None, slg_scale=2.0), dict(slg_layers=(2,), slg_scale=2.0,
-                                                                            slg_start=0.5, slg_stop=0.5)])
+                                                                            slg_start=0.5, slg_stop=0.5),
+                                 dict(uncond_skip_layers=()), dict(uncond_skip_layers=None),
+                                 dict(uncond_skip_layers=(2,), slg_start=0.5, slg_stop=0.5)])
 def test_slg_off_runs_no_extra_forward_and_is_identical(monkeypatch, off):
     model, latents = _bundle(monkeypatch)
     anima_text_to_image(model, "p", "n", steps=3, cfg_scale=3.0, width=64, height=64, seed=5)
@@ -360,3 +362,66 @@ def test_a_skipped_pass_survives_a_stream_beyond_fp16_range():
         assert torch.isfinite(dit(x, t, ctx, skip_layers=(1,))).all()
         dit.blocks = nn.ModuleList([_Shift(1e6), _Shift(0.0)])
         assert not torch.isfinite(dit(x, t, ctx)).all()   # what the skip path avoids
+
+
+# Uncond skip (ComfyUI's SkipLayerGuidanceDiTSimple): the uncond forward skips blocks inside the window.
+USKIP_CFG = _S + 3.0 * (_C - _S)
+
+
+@pytest.mark.parametrize("path", ["euler", "t2i", "i2i", "inpaint"])
+@pytest.mark.parametrize("slg, inside, last", [
+    ({}, USKIP_CFG, _C),
+    (dict(slg_layers=(4,), slg_scale=2.0), USKIP_CFG + 2.0 * (_C - _K), _C + 2.0 * (_C - _K)),
+])
+def test_uncond_skip_formula_and_window_on_every_path(monkeypatch, path, slg, inside, last):
+    model, latents = _bundle(monkeypatch)
+    kw = dict(cfg_scale=3.0, cfg_interval_end=0.75, uncond_skip_layers=(2,), slg_start=0.25, **slg)
+    extra = ["skip"] if slg else []
+    if path == "euler":
+        anima_text_to_image(model, "p", "n", steps=4, width=64, height=64, seed=5, sampler="euler", **kw)
+        sigmas = flow_matching_schedule(4, shift=3.0, device="cpu", dtype=torch.float32)
+        assert _moved(latents) == pytest.approx(_euler_move(sigmas, [CFG_ON, inside, inside, last]), rel=1e-4)
+    else:
+        velocities = _probe_sampler(monkeypatch)
+        _run_path(path, model, **kw)
+        assert velocities == pytest.approx([CFG_ON, inside, inside, last])
+    #        step 0: before the window   steps 1, 2: uncond skips blocks       step 3: off the CFG band
+    assert [b for _, b in model.backbone.calls] == ["cond", "uncond"] + (["cond", "uskip"] + extra) * 2 + ["cond"] + extra
+
+
+@pytest.mark.parametrize("cls, args", [
+    (TextToImage, ("p", "n")),
+    (ImageToImage, ("p", Image.new("RGB", (64, 64)), "n")),
+    (Inpaint, ("p", Image.new("RGB", (64, 64)), Image.new("L", (64, 64), 255), "n")),
+])
+def test_every_pipeline_entry_point_forwards_uncond_skip(monkeypatch, cls, args):
+    model, _ = _bundle(monkeypatch)
+    cls(model)(*args, steps=2, cfg_scale=3.0, width=64, height=64, seed=5, uncond_skip_layers=(2,))
+    assert [b for _, b in model.backbone.calls] == ["cond", "uskip"] * 2
+
+
+@pytest.mark.parametrize("bad", [(6,), (-1,)])
+def test_uncond_skip_blocks_are_validated(monkeypatch, bad):
+    model, _ = _bundle(monkeypatch)
+    with pytest.raises(ValueError, match="uncond_skip_layers"):
+        anima_text_to_image(model, "p", "n", steps=2, width=64, height=64, uncond_skip_layers=bad)
+    with pytest.raises(ValueError, match="uncond_skip_layers"):
+        _i2i(model, uncond_skip_layers=bad)
+
+
+def test_uncond_skip_is_rejected_with_teacache_cuda_graphs_and_compile_but_only_when_set(monkeypatch):
+    model, _ = _bundle(monkeypatch)
+    with pytest.raises(ValueError, match="Uncond skip is incompatible with TeaCache"):
+        anima_text_to_image(model, "p", "n", steps=2, width=64, height=64, teacache_thresh=0.3, uncond_skip_layers=(2,))
+    with pytest.raises(ValueError, match="TeaCache"):
+        _i2i(model, teacache_thresh=0.3, uncond_skip_layers=(2,))
+    graphs, _ = _bundle(monkeypatch, cuda_graphs=True)
+    with pytest.raises(ValueError, match="CUDA Graphs"):
+        anima_text_to_image(graphs, "p", "n", steps=2, width=64, height=64, uncond_skip_layers=(2,))
+    compiled, _ = _bundle(monkeypatch)
+    compiled.policy = SimpleNamespace(cuda_graphs=False, compile=True, device=torch.device("cpu"),
+                                      compute_dtype=torch.float32)
+    with pytest.raises(ValueError, match="torch.compile"):
+        _i2i(compiled, uncond_skip_layers=(2,))
+    assert _anima._anima_uncond_skip(graphs, (), 0.3) == ()
+    assert _anima._anima_uncond_skip(compiled, None, 0.0) == ()

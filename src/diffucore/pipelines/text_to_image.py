@@ -76,6 +76,7 @@ class TextToImage(_Pipeline):
                 seed=seed, sampler=sampler, scheduler=anima_scheduler,
                 cfg_interval_start=cfg_interval_start, cfg_interval_end=cfg_interval_end,
                 slg_layers=slg_layers, slg_scale=slg_scale, slg_start=slg_start, slg_stop=slg_stop,
+                uncond_skip_layers=uncond_skip_layers,
                 curvature=curvature, eta_max=eta_max, gate_reduce=gate_reduce,
                 beta_alpha=beta_alpha,
                 beta_beta=beta_beta, lq_threshold=lq_threshold,
