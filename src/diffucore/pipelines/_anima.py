@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from ..models.anima_dit import BlockPrefix, TeaCache
@@ -149,6 +150,62 @@ def _uncond_skip(layers: tuple[int, ...], sigma: float, lo: float, hi: float) ->
     return {"skip_layers": layers} if layers and lo < sigma <= hi else {}
 
 
+_LOWRES_K = 2          # layout-band downsample factor (and the latent grid it needs: k * patch)
+_LOWRES_GRID = _LOWRES_K * 2
+
+
+def _lowres_backbone(backbone, lowres_sigma: float):
+    """Wrap ``backbone`` so every call at σ >= ``lowres_sigma`` (the layout band) runs on a
+    2x-downsampled latent and returns a full-res velocity; the sampler itself stays full res.
+
+    x_σ = (1-σ)·x0 + σ·ε averaged over k x k pixels keeps the signal and cuts the noise std
+    by k, so pool(x_σ)/a with a = (1-σ) + σ/k is a flow sample at σ' = (σ/k)/a. The backbone
+    predicts x0 there, which is upsampled and turned back into the velocity at (x, σ).
+    ``lowres_sigma`` <= 0 returns ``backbone`` itself: the call path is unchanged. Low-res calls
+    drop ``teacache`` (its state is shape-bound); other kwargs, e.g. SLG's ``prefix`` and
+    ``skip_layers``, pass through (one σ per step, so one resolution per step)."""
+    if lowres_sigma <= 0:
+        return backbone
+    k = _LOWRES_K
+
+    def call(x, t, ctx, *a, **kw):
+        s = float(t.flatten()[0])
+        if s < lowres_sigma:
+            return backbone(x, t, ctx, *a, **kw)
+        if "teacache" in kw:
+            kw["teacache"] = None
+        xf = x.squeeze(2).float()
+        h, w = xf.shape[-2:]
+        ph, pw = -h % _LOWRES_GRID, -w % _LOWRES_GRID
+        xp = F.pad(xf, (0, pw, 0, ph), mode="replicate") if ph or pw else xf
+        amp = (1.0 - s) + s / k
+        s2 = (s / k) / amp
+        xl = F.avg_pool2d(xp, k) / amp
+        vl = backbone(xl.to(x.dtype).unsqueeze(2), torch.full_like(t, s2), ctx, *a, **kw).squeeze(2).float()
+        x0 = F.interpolate(xl - s2 * vl, scale_factor=k, mode="bilinear", align_corners=False)
+        if ph or pw:
+            x0 = x0[..., :h, :w]
+        return ((xf - x0) / s).to(x.dtype).unsqueeze(2)
+
+    return call
+
+
+def _anima_lowres(model: "ModelBundle", lowres_sigma: float) -> float:
+    """Validated half-res layout threshold (0 = off). A CUDA Graph records one input shape
+    and a compiled forward would recompile for the second one."""
+    lowres_sigma = float(lowres_sigma or 0.0)
+    if not 0.0 <= lowres_sigma <= 1.0:
+        raise ValueError(f"lowres_sigma must be in [0, 1]; got {lowres_sigma}")
+    if lowres_sigma > 0:
+        if model.policy.cuda_graphs:
+            raise ValueError("Half-res layout is incompatible with CUDA Graphs. Set lowres_sigma to 0 "
+                             "or reload the model without the CUDA Graphs flag.")
+        if model.policy.compile:
+            raise ValueError("Half-res layout is incompatible with torch.compile. Set lowres_sigma to 0 "
+                             "or reload the model without the compile flag.")
+    return lowres_sigma
+
+
 def _refuse_skip(model: "ModelBundle", teacache_thresh: float, what: str, off: str) -> None:
     """TeaCache could reuse a residual cached from an unskipped pass, a CUDA Graph
     records one block list, and a compiled forward ignores ``skip_layers``, which
@@ -219,6 +276,7 @@ def anima_text_to_image(
     teacache_rule: str = "drift",
     teacache_uncond_scale: float = 1.0,
     teacache_sigma_floor: float = 0.0,
+    lowres_sigma: float = 0.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -245,6 +303,10 @@ def anima_text_to_image(
     ``uncond_skip_layers`` skips those blocks in the uncond forward on the same
     steps (ComfyUI's SkipLayerGuidanceDiTSimple): no extra forward, independent of
     ``slg_scale``. Same restrictions as SLG.
+
+    ``lowres_sigma`` > 0 runs every backbone call at σ >= that value on a 2x-downsampled
+    latent (see :func:`_lowres_backbone`): faster, but changes the image for a given seed.
+    Not with CUDA Graphs or torch.compile.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -258,6 +320,7 @@ def anima_text_to_image(
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
     uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
+    lowres_sigma = _anima_lowres(model, lowres_sigma)
 
     with perf_context(policy):
         # The post-adapter context depends only on the prompt pair, so a repeat
@@ -316,6 +379,7 @@ def anima_text_to_image(
 
         # 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
+        run = _lowres_backbone(backbone, lowres_sigma)
         # One TeaCache stream per CFG branch; their modulated inputs coincide.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
@@ -344,7 +408,7 @@ def anima_text_to_image(
                         t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
                         share = _slg_share(slg_layers, float(sigma), skip_lo, skip_hi)
-                        v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
+                        v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
                         if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
                             v = v_cond
                         else:
@@ -353,12 +417,12 @@ def anima_text_to_image(
                             # the cond output first.
                             if policy.cuda_graphs:
                                 v_cond = v_cond.clone()
-                            v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                            v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
                                                 **_uncond_skip(uncond_skip, float(sigma), skip_lo, skip_hi)).squeeze(2)
                             _note_follow_miss(tc_cond, tc_uncond)
                             v = v_uncond + cfg_scale * (v_cond - v_uncond)
                         if share:
-                            v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
+                            v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                             v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
 
                         # CONST flow: denoised = x − σ·v; the Euler step
@@ -373,18 +437,18 @@ def anima_text_to_image(
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
                     share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
-                    v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
+                    v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
                     if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                         v = v_cond
                     else:
                         if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                             v_cond = v_cond.clone()
-                        v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                        v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
                                             **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
                         _note_follow_miss(tc_cond, tc_uncond)
                         v = v_uncond + cfg_scale * (v_cond - v_uncond)
                     if share:
-                        v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
+                        v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                         v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
                     return x_in.float() - sig * v.float()
@@ -459,6 +523,7 @@ def anima_img2img(
     teacache_rule: str = "drift",
     teacache_uncond_scale: float = 1.0,
     teacache_sigma_floor: float = 0.0,
+    lowres_sigma: float = 0.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -481,6 +546,7 @@ def anima_img2img(
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
     uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
+    lowres_sigma = _anima_lowres(model, lowres_sigma)
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -551,6 +617,7 @@ def anima_img2img(
 
         # 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
+        run = _lowres_backbone(backbone, lowres_sigma)
         # One TeaCache stream per CFG branch.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
@@ -573,18 +640,18 @@ def anima_img2img(
                 x_5d = x_in.to(dtype).unsqueeze(2)
                 t = sigma_b.to(dtype)
                 share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
-                v_cond = backbone(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
+                v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
                 if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
                     v = v_cond
                 else:
                     if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
                         v_cond = v_cond.clone()
-                    v_uncond = backbone(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                    v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
                                         **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
                     _note_follow_miss(tc_cond, tc_uncond)
                     v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 if share:
-                    v_skip = backbone(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
+                    v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                     v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                 sig = sigma_b.float().view(-1, 1, 1, 1)
                 x0 = x_in.float() - sig * v.float()
