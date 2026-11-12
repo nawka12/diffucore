@@ -1167,6 +1167,96 @@ def test_cogent3_pump_rate_registered_in_sampler_table():
     assert abs((lam[1] - lam[0]) - fn.keywords["pump_h_ref"]) < 1e-5
 
 
+# ── cogent3_pump_onset: the onset band sub-stepped ────────────────────
+
+_PUMP_KW = dict(pump_strength=0.08, pump_h_ref=K.PUMP_H_REF)
+
+
+def _onset_setup(steps=12):
+    torch.manual_seed(11)
+    target = torch.randn(1, 4, 8, 8)
+    return (_anneal_sigma_dependent_model(target), torch.randn(1, 4, 8, 8),
+            S.flow_matching_schedule(steps, shift=3.0))
+
+
+def _onset_run(fn, model, x_init, sigmas, **kw):
+    return fn(model, x_init.clone(), sigmas, model_type="flow", shift=3.0,
+              generator=torch.Generator().manual_seed(5), **_PUMP_KW, **kw)
+
+
+def test_onset_substeps_one_is_bit_exact_pump_rate():
+    model, x_init, sigmas = _onset_setup()
+    ref = _onset_run(K.sample_cogent3, model, x_init, sigmas)
+    got = _onset_run(K.sample_cogent3_onset, model, x_init, sigmas, substeps=1)
+    assert torch.equal(ref, got)
+
+
+def test_onset_equals_cogent3_on_the_expanded_grid():
+    model, x_init, sigmas = _onset_setup()
+    fine, _ = K._expand_onset_sigmas(sigmas, 2, K.ONSET_SIGMA)
+    assert len(fine) > len(sigmas)
+    ref = _onset_run(K.sample_cogent3, model, x_init, fine)
+    got = _onset_run(K.sample_cogent3_onset, model, x_init, sigmas)
+    assert torch.equal(ref, got)
+
+
+def test_onset_expanded_grid_properties():
+    sigmas = S.flow_matching_schedule(20, shift=3.0)
+    fine, outer = K._expand_onset_sigmas(sigmas, 3, 0.9)
+    assert fine.dtype == sigmas.dtype and fine.device == sigmas.device
+    assert bool((fine[1:] < fine[:-1]).all())
+    assert set(sigmas.tolist()) <= set(fine.tolist())
+    assert len(outer) == len(fine) - 1
+    assert outer == sorted(outer) and set(outer) == set(range(len(sigmas) - 1))
+    assert fine[1] == sigmas[1]                                  # the first interval, from 1.0, is not split
+    assert fine[0] == 1.0 and outer[0] == 0 and outer[1] == 1
+    inserted = set(fine.tolist()) - set(sigmas.tolist())
+    assert inserted and min(inserted) > 0.9
+    # an interval is split only when it ends at or above the threshold
+    for i in range(len(sigmas) - 1):
+        assert outer.count(i) == (3 if 0 < float(sigmas[i]) < 1.0 and float(sigmas[i + 1]) >= 0.9 else 1)
+    # uniform in lambda inside a split interval
+    idx = [j for j, o in enumerate(outer) if o == 2]
+    lam = [math.log((1 - float(fine[j])) / float(fine[j])) for j in idx + [idx[-1] + 1]]
+    steps = [b - a for a, b in zip(lam, lam[1:])]
+    assert max(steps) - min(steps) < 1e-4
+
+
+def test_onset_straddling_interval_is_not_split_and_low_grids_are_unchanged():
+    sigmas = torch.tensor([1.0, 0.95, 0.92, 0.85, 0.5, 0.2, 0.0])
+    fine, outer = K._expand_onset_sigmas(sigmas, 2, 0.9)
+    assert outer.count(2) == 1                                   # 0.92 -> 0.85 crosses 0.9
+    assert 0.85 not in set(fine.tolist()) - set(sigmas.tolist())
+    assert outer.count(1) == 2                                   # 0.95 -> 0.92 is inside
+    low = torch.tensor([0.8, 0.5, 0.2, 0.0])
+    fine, outer = K._expand_onset_sigmas(low, 4, 0.9)
+    assert torch.equal(fine, low) and outer == [0, 1, 2]
+
+
+def test_onset_callback_fires_once_per_outer_step_in_order():
+    model, x_init, sigmas = _onset_setup()
+    seen = []
+    _onset_run(K.sample_cogent3_onset, model, x_init, sigmas,
+               callback=lambda i, sigma, x, denoised: seen.append((i, float(sigma))))
+    assert [i for i, _ in seen] == list(range(len(sigmas) - 1))
+    # the reported sigma is the last sub-step's, inside the outer interval
+    for i, s in seen:
+        assert float(sigmas[i + 1]) <= s <= float(sigmas[i]) + 1e-6
+
+
+def test_onset_rejects_bad_substeps():
+    model, x_init, sigmas = _onset_setup(4)
+    with pytest.raises(ValueError, match="substeps"):
+        K.sample_cogent3_onset(model, x_init, sigmas, substeps=0, model_type="flow", shift=3.0)
+
+
+def test_cogent3_pump_onset_registered_in_sampler_table():
+    fn = K.get_sampler("cogent3_pump_onset")
+    assert fn.func is K.sample_cogent3_onset
+    ref = K.get_sampler("cogent3_pump_rate").keywords
+    assert fn.keywords == ref
+
+
 # ── sampler allowlist consistency ─────────────────────────────────────
 # Pipelines gate on a family allowlist and separately on a flow-aware set;
 # drifting apart fails only at generation time (how `cogent` once shipped broken).

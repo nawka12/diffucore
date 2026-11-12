@@ -75,6 +75,7 @@ from .samplers import (
     sample_secant_anneal,
     sample_cogent,
     sample_cogent3,
+    sample_cogent3_onset,
     get_sampler,
     SAMPLERS,
 )
@@ -152,6 +153,7 @@ __all__ = [
     "sample_secant_anneal",
     "sample_cogent",
     "sample_cogent3",
+    "sample_cogent3_onset",
     "get_sampler",
     "SAMPLERS",
 ]

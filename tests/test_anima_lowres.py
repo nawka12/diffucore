@@ -12,7 +12,8 @@ from PIL import Image
 from torch import nn
 
 from diffucore.pipelines import _anima
-from diffucore.pipelines._anima import _anima_lowres, _lowres_backbone, anima_text_to_image
+from diffucore.pipelines._anima import (_anima_lowres, _lowres_backbone, _onset_lowres_sigma,
+                                        anima_text_to_image)
 from diffucore.runtime import ConditioningCache, DevicePolicy
 
 
@@ -161,3 +162,24 @@ def test_refused_on_cuda_graphs_and_compile(monkeypatch, flags, what):
     assert _anima_lowres(model, 0.0) == 0.0          # off is never refused
     with pytest.raises(ValueError, match="lowres_sigma"):
         _anima_lowres(model, 1.5)
+
+
+def test_onset_sampler_switches_the_half_res_band_on_and_never_below_it():
+    f = lambda v: _onset_lowres_sigma("cogent3_pump_onset", v)
+    assert f(0.0) == 0.9 and f(None) == 0.9
+    assert f(0.95) == 0.9 and f(0.85) == 0.85
+    assert _onset_lowres_sigma("cogent3_pump_rate", 0.0) == 0.0
+    assert _onset_lowres_sigma("dpmpp_2m", 0.95) == 0.95
+    assert f(1.5) == 1.5                                  # left for _anima_lowres to refuse
+
+
+def test_pipeline_onset_sampler_runs_half_res_and_keeps_the_refusals(monkeypatch):
+    bb = _Recorder()
+    anima_text_to_image(_model(monkeypatch, bb), "p", "n", steps=6, cfg_scale=3.0, width=128, height=128,
+                        seed=1, sampler="cogent3_pump_onset")
+    sizes = [hw for _, hw in bb.shapes]
+    assert sizes[0] == (8, 8) and sizes[-1] == (16, 16)
+    assert len(sizes) > 6                                 # the band was sub-stepped
+    with pytest.raises(ValueError, match="CUDA Graphs"):
+        anima_text_to_image(_model(monkeypatch, _Recorder(), cuda_graphs=True), "p", "n", steps=2,
+                            width=64, height=64, seed=1, sampler="cogent3_pump_onset")

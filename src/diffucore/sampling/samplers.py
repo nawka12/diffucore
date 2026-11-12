@@ -58,6 +58,7 @@ __all__ = [
     "sample_secant_anneal",
     "sample_cogent",
     "sample_cogent3",
+    "sample_cogent3_onset",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -1286,6 +1287,54 @@ def sample_cogent3(
 
 # σ at and above which Anima's layout is decided (and where the half-res band runs).
 ONSET_SIGMA = 0.90
+
+
+def _expand_onset_sigmas(sigmas: torch.Tensor, substeps: int, substep_sigma: float):
+    """Split each interval that lies wholly in the band (``σ_next >= substep_sigma``,
+    ``σ < 1``) into ``substeps`` pieces uniform in λ = log((1 − σ)/σ). Returns the
+    fine grid (every original point kept) and, per fine interval, its outer step."""
+    if substeps < 1:
+        raise ValueError(f"substeps must be >= 1; got {substeps}")
+    pieces, outer = [], []
+    for i in range(len(sigmas) - 1):
+        pieces.append(sigmas[i:i + 1])
+        s0, s1 = float(sigmas[i]), float(sigmas[i + 1])
+        if substeps > 1 and s0 < 1.0 and s1 > 0.0 and s1 >= substep_sigma:
+            l0, l1 = math.log((1.0 - s0) / s0), math.log((1.0 - s1) / s1)
+            inner = [1.0 / (1.0 + math.exp(l0 + (l1 - l0) * k / substeps)) for k in range(1, substeps)]
+            pieces.append(sigmas.new_tensor(inner))
+            outer += [i] * substeps
+        else:
+            outer.append(i)
+    pieces.append(sigmas[-1:])
+    return torch.cat(pieces), outer
+
+
+def sample_cogent3_onset(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    substeps: int = 2,
+    substep_sigma: float = ONSET_SIGMA,
+    callback: Callback = None,
+    **kwargs,
+) -> torch.Tensor:
+    """COGENT3 with the onset band sub-stepped: every interval wholly at
+    σ >= ``substep_sigma`` is split into ``substeps`` pieces uniform in λ (the first
+    interval, from σ = 1, is never split), then :func:`sample_cogent3` runs on that
+    grid. Pairs with the half-res layout band, which makes those extra evaluations
+    cheap. ``substeps=1`` is plain :func:`sample_cogent3`. ``callback`` fires once
+    per original step, with the original index, after its last sub-step's evaluation."""
+    fine, outer = _expand_onset_sigmas(sigmas, substeps, substep_sigma)
+    if callback is None:
+        return sample_cogent3(model, x, fine, **kwargs)
+
+    def on_step(j, sigma, x_j, denoised):
+        if j == len(outer) - 1 or outer[j + 1] != outer[j]:
+            callback(outer[j], sigma, x_j, denoised)
+
+    return sample_cogent3(model, x, fine, callback=on_step, **kwargs)
 
 
 def sample_heunpp2(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None) -> torch.Tensor:
@@ -2589,6 +2638,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "cogent3": sample_cogent3,
     "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),
     "cogent3_pump_rate": partial(sample_cogent3, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
+    "cogent3_pump_onset": partial(sample_cogent3_onset, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
 }
 
 

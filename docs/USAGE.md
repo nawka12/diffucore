@@ -120,6 +120,10 @@ image = TextToImage(model)(
   σ ≈ 0.24 (like `secant_tilt`; `pump_taper` stops it at ≈ 0.67), σ 0.985–0.89,
   where anatomy forms, keeps as many steps as `pump_taper`, and σ 0.89–0.45,
   where fine detail settles, as many as `secant_tilt`. It ignores `shift`.
+  `cogent3_pump_onset` (Anima) is `cogent3_pump_rate` with every interval wholly at
+  σ >= 0.90 split in two (uniform in λ) and that band run at half resolution
+  (`lowres_sigma` defaults to 0.90 for it). Same step count, faster, aimed at
+  prompt coherence and hands/anatomy.
   `fdg_low` (Anima, 1 = off) scales the coarse part of the CFG delta by that factor below σ 0.90 (frequency-decoupled guidance); fine detail keeps the full CFG scale.
 
 ### Anima (DiT)
