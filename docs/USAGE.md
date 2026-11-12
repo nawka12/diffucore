@@ -120,6 +120,7 @@ image = TextToImage(model)(
   σ ≈ 0.24 (like `secant_tilt`; `pump_taper` stops it at ≈ 0.67), σ 0.985–0.89,
   where anatomy forms, keeps as many steps as `pump_taper`, and σ 0.89–0.45,
   where fine detail settles, as many as `secant_tilt`. It ignores `shift`.
+  `fdg_low` (Anima, 1 = off) scales the coarse part of the CFG delta by that factor below σ 0.90 (frequency-decoupled guidance); fine detail keeps the full CFG scale.
 
 ### Anima (DiT)
 

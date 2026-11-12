@@ -1284,6 +1284,10 @@ def sample_cogent3(
     return x
 
 
+# σ at and above which Anima's layout is decided (and where the half-res band runs).
+ONSET_SIGMA = 0.90
+
+
 def sample_heunpp2(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None) -> torch.Tensor:
     """Heun++: away from the schedule end, takes a third evaluation and blends
     the three derivatives with sigma-proportional weights. After the MIT

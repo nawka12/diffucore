@@ -34,6 +34,7 @@ from ..sampling import (
     slg_window_bounds,
     validate_slg,
 )
+from ..sampling.samplers import ONSET_SIGMA
 
 # Samplers Anima can drive through a CONST x0 denoiser closure; the stochastic,
 # flow-aware ones also take ``model_type``/``shift``.
@@ -206,6 +207,40 @@ def _anima_lowres(model: "ModelBundle", lowres_sigma: float) -> float:
     return lowres_sigma
 
 
+def _fdg_lowpass(d: torch.Tensor) -> torch.Tensor:
+    """The coarse part of ``d``: one Laplacian-pyramid level (5-tap binomial blur, half-size
+    resample and back, blur)."""
+    c, (h, w) = d.shape[1], d.shape[-2:]
+    k1 = d.new_tensor([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+    k = (k1[:, None] * k1[None, :]).expand(c, 1, 5, 5)
+
+    def blur(z):
+        return F.conv2d(F.pad(z, (2, 2, 2, 2), mode="reflect"), k, groups=c)
+
+    lo = F.interpolate(blur(d), size=(h // 2, w // 2), mode="bilinear", align_corners=False)
+    return blur(F.interpolate(lo, size=(h, w), mode="bilinear", align_corners=False))
+
+
+def _cfg_combine(v_cond, v_uncond, scale: float, fdg_low: float, sigma: float):
+    """CFG, or below the layout band (σ < ``ONSET_SIGMA``) frequency-decoupled guidance
+    (Sadat et al. 2025): the coarse part of the guidance delta gets ``scale·fdg_low``, the
+    fine part keeps ``scale``. The split is linear, so doing it on the velocity equals doing
+    it on x0. Above the band the coarse guidance stays whole: it decides the layout."""
+    d = v_cond - v_uncond
+    v = v_uncond + scale * d
+    if fdg_low >= 1.0 or sigma >= ONSET_SIGMA:
+        return v
+    return v - (scale * (1.0 - fdg_low)) * _fdg_lowpass(d.float()).to(d.dtype)
+
+
+def _anima_fdg(fdg_low: float) -> float:
+    """Validated coarse-guidance factor (1 = plain CFG)."""
+    fdg_low = float(fdg_low)
+    if not 0.0 <= fdg_low <= 1.0:
+        raise ValueError(f"fdg_low must be in [0, 1]; got {fdg_low}")
+    return fdg_low
+
+
 def _refuse_skip(model: "ModelBundle", teacache_thresh: float, what: str, off: str) -> None:
     """TeaCache could reuse a residual cached from an unskipped pass, a CUDA Graph
     records one block list, and a compiled forward ignores ``skip_layers``, which
@@ -277,6 +312,7 @@ def anima_text_to_image(
     teacache_uncond_scale: float = 1.0,
     teacache_sigma_floor: float = 0.0,
     lowres_sigma: float = 0.0,
+    fdg_low: float = 1.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -306,6 +342,8 @@ def anima_text_to_image(
 
     ``lowres_sigma`` > 0 runs every backbone call at σ >= that value on a 2x-downsampled
     latent (see :func:`_lowres_backbone`): faster, but changes the image for a given seed.
+    ``fdg_low`` < 1 scales the coarse part of the CFG delta by that factor below σ 0.90
+    (see :func:`_cfg_combine`).
     Not with CUDA Graphs or torch.compile.
     """
     if sampler not in _ANIMA_SAMPLERS:
@@ -321,6 +359,7 @@ def anima_text_to_image(
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
     uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
     lowres_sigma = _anima_lowres(model, lowres_sigma)
+    fdg_low = _anima_fdg(fdg_low)
 
     with perf_context(policy):
         # The post-adapter context depends only on the prompt pair, so a repeat
@@ -420,7 +459,7 @@ def anima_text_to_image(
                             v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
                                                 **_uncond_skip(uncond_skip, float(sigma), skip_lo, skip_hi)).squeeze(2)
                             _note_follow_miss(tc_cond, tc_uncond)
-                            v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                            v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma))
                         if share:
                             v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                             v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
@@ -446,7 +485,7 @@ def anima_text_to_image(
                         v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
                                             **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
                         _note_follow_miss(tc_cond, tc_uncond)
-                        v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                        v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma_b.max()))
                     if share:
                         v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                         v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
@@ -524,6 +563,7 @@ def anima_img2img(
     teacache_uncond_scale: float = 1.0,
     teacache_sigma_floor: float = 0.0,
     lowres_sigma: float = 0.0,
+    fdg_low: float = 1.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -547,6 +587,7 @@ def anima_img2img(
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
     uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
     lowres_sigma = _anima_lowres(model, lowres_sigma)
+    fdg_low = _anima_fdg(fdg_low)
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
 
@@ -649,7 +690,7 @@ def anima_img2img(
                     v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
                                         **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
                     _note_follow_miss(tc_cond, tc_uncond)
-                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                    v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma_b.max()))
                 if share:
                     v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                     v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
