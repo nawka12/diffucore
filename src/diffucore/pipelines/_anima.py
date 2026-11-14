@@ -46,7 +46,7 @@ _ANIMA_SAMPLERS = {
     "infinity_realism", "infinity_omega", "infinity_aether",
     "lms", "lcm",
     "sa_solver", "sa_solver_pece",
-    "secant", "secant_anneal",
+    "secant", "secant_anneal", "secant_onset",
     "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "seeds_2", "seeds_3",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
 }
@@ -55,7 +55,7 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_3m_sde", "euler_ancestral", "euler_ancestral_anneal", "secant_anneal",
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-    "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
+    "secant_onset", "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
 # noise at σ_max == 1.
@@ -207,11 +207,15 @@ def _anima_lowres(model: "ModelBundle", lowres_sigma: float) -> float:
     return lowres_sigma
 
 
+_ONSET_SAMPLERS = ("cogent3_pump_onset", "secant_onset")
+
+
 def _onset_lowres_sigma(sampler: str, lowres_sigma: float) -> float:
-    """``cogent3_pump_onset`` runs its sub-stepped band at half res: on when the caller left
-    it off, and never below the band it sub-steps. Out-of-range values pass on to validation."""
+    """``cogent3_pump_onset`` and ``secant_onset`` run their sub-stepped band at half res: on
+    when the caller left it off, and never below the band it sub-steps. Out-of-range values
+    pass on to validation."""
     lowres_sigma = float(lowres_sigma or 0.0)
-    if sampler != "cogent3_pump_onset" or not 0.0 <= lowres_sigma <= 1.0:
+    if sampler not in _ONSET_SAMPLERS or not 0.0 <= lowres_sigma <= 1.0:
         return lowres_sigma
     return ONSET_SIGMA if lowres_sigma == 0.0 else min(lowres_sigma, ONSET_SIGMA)
 
@@ -506,14 +510,14 @@ def anima_text_to_image(
                     kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
                 elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
                     kwargs = dict(model_type="flow", shift=sched_shift)
-                if sampler in ("secant", "secant_anneal"):
+                if sampler in ("secant", "secant_anneal", "secant_onset"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
                 # aether is stochastic but takes no model_type/shift.
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
-                if sampler in ("euler_ancestral_anneal", "secant_anneal", "cogent", "cogent3", "cogent3_pump",
-                               "cogent3_pump_rate", "cogent3_pump_onset"):
+                if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
+                               "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
                     kwargs["eta_max"] = eta_max
                 if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
                     kwargs["gate_reduce"] = gate_reduce
@@ -714,14 +718,14 @@ def anima_img2img(
                 kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
             elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
                 kwargs = dict(model_type="flow", shift=sched_shift)
-            if sampler in ("secant", "secant_anneal"):
+            if sampler in ("secant", "secant_anneal", "secant_onset"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
             # aether is stochastic but takes no model_type/shift.
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
-            if sampler in ("euler_ancestral_anneal", "secant_anneal", "cogent", "cogent3", "cogent3_pump",
-                           "cogent3_pump_rate", "cogent3_pump_onset"):
+            if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
+                           "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
                 kwargs["eta_max"] = eta_max
             if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
                 kwargs["gate_reduce"] = gate_reduce

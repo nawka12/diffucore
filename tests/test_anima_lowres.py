@@ -171,6 +171,10 @@ def test_onset_sampler_switches_the_half_res_band_on_and_never_below_it():
     assert _onset_lowres_sigma("cogent3_pump_rate", 0.0) == 0.0
     assert _onset_lowres_sigma("dpmpp_2m", 0.95) == 0.95
     assert f(1.5) == 1.5                                  # left for _anima_lowres to refuse
+    g = lambda v: _onset_lowres_sigma("secant_onset", v)
+    assert g(0.0) == 0.9 and g(None) == 0.9
+    assert g(0.95) == 0.9 and g(0.85) == 0.85
+    assert _onset_lowres_sigma("secant_anneal", 0.0) == 0.0
 
 
 def test_pipeline_onset_sampler_runs_half_res_and_keeps_the_refusals(monkeypatch):
@@ -183,3 +187,12 @@ def test_pipeline_onset_sampler_runs_half_res_and_keeps_the_refusals(monkeypatch
     with pytest.raises(ValueError, match="CUDA Graphs"):
         anima_text_to_image(_model(monkeypatch, _Recorder(), cuda_graphs=True), "p", "n", steps=2,
                             width=64, height=64, seed=1, sampler="cogent3_pump_onset")
+
+
+def test_pipeline_secant_onset_runs_half_res(monkeypatch):
+    bb = _Recorder()
+    anima_text_to_image(_model(monkeypatch, bb), "p", "n", steps=6, cfg_scale=3.0, width=128, height=128,
+                        seed=1, sampler="secant_onset")
+    sizes = [hw for _, hw in bb.shapes]
+    assert sizes[0] == (8, 8) and sizes[-1] == (16, 16)
+    assert len(sizes) > 6

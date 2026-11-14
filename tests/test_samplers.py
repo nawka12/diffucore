@@ -1257,6 +1257,44 @@ def test_cogent3_pump_onset_registered_in_sampler_table():
     assert fn.keywords == ref
 
 
+# ── secant_onset: secant_anneal with the onset band sub-stepped ───────
+
+
+def _secant_onset_run(fn, model, x_init, sigmas, **kw):
+    return fn(model, x_init.clone(), sigmas, model_type="flow", shift=3.0,
+              generator=torch.Generator().manual_seed(5), **kw)
+
+
+def test_secant_onset_substeps_one_is_bit_exact_secant_anneal():
+    model, x_init, sigmas = _onset_setup()
+    ref = _secant_onset_run(K.sample_secant_anneal, model, x_init, sigmas)
+    got = _secant_onset_run(K.sample_secant_onset, model, x_init, sigmas, substeps=1)
+    assert torch.equal(ref, got)
+
+
+def test_secant_onset_equals_secant_anneal_on_the_expanded_grid():
+    model, x_init, sigmas = _onset_setup()
+    fine, _ = K._expand_onset_sigmas(sigmas, 2, K.ONSET_SIGMA)
+    assert len(fine) > len(sigmas)
+    ref = _secant_onset_run(K.sample_secant_anneal, model, x_init, fine)
+    got = _secant_onset_run(K.sample_secant_onset, model, x_init, sigmas)
+    assert torch.equal(ref, got)
+
+
+def test_secant_onset_callback_fires_once_per_outer_step_in_order():
+    model, x_init, sigmas = _onset_setup()
+    seen = []
+    _secant_onset_run(K.sample_secant_onset, model, x_init, sigmas,
+                      callback=lambda i, sigma, x, denoised: seen.append((i, float(sigma))))
+    assert [i for i, _ in seen] == list(range(len(sigmas) - 1))
+    for i, s in seen:
+        assert float(sigmas[i + 1]) <= s <= float(sigmas[i]) + 1e-6
+
+
+def test_secant_onset_registered_in_sampler_table():
+    assert K.get_sampler("secant_onset") is K.sample_secant_onset
+
+
 # ── sampler allowlist consistency ─────────────────────────────────────
 # Pipelines gate on a family allowlist and separately on a flow-aware set;
 # drifting apart fails only at generation time (how `cogent` once shipped broken).

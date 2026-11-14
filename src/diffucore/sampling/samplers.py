@@ -59,6 +59,7 @@ __all__ = [
     "sample_cogent",
     "sample_cogent3",
     "sample_cogent3_onset",
+    "sample_secant_onset",
     "get_sampler",
     "SAMPLERS",
 ]
@@ -1326,15 +1327,39 @@ def sample_cogent3_onset(
     grid. Pairs with the half-res layout band, which makes those extra evaluations
     cheap. ``substeps=1`` is plain :func:`sample_cogent3`. ``callback`` fires once
     per original step, with the original index, after its last sub-step's evaluation."""
+    return _sample_onset(sample_cogent3, model, x, sigmas, substeps, substep_sigma, callback, **kwargs)
+
+
+def _sample_onset(inner, model, x, sigmas, substeps, substep_sigma, callback, **kwargs):
+    """Run ``inner`` on the onset-expanded grid, firing ``callback`` once per original step."""
     fine, outer = _expand_onset_sigmas(sigmas, substeps, substep_sigma)
     if callback is None:
-        return sample_cogent3(model, x, fine, **kwargs)
+        return inner(model, x, fine, **kwargs)
 
     def on_step(j, sigma, x_j, denoised):
         if j == len(outer) - 1 or outer[j + 1] != outer[j]:
             callback(outer[j], sigma, x_j, denoised)
 
-    return sample_cogent3(model, x, fine, callback=on_step, **kwargs)
+    return inner(model, x, fine, callback=on_step, **kwargs)
+
+
+def sample_secant_onset(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    substeps: int = 2,
+    substep_sigma: float = ONSET_SIGMA,
+    callback: Callback = None,
+    **kwargs,
+) -> torch.Tensor:
+    """SECANT-ANNEAL with the onset band sub-stepped, as in :func:`sample_cogent3_onset`:
+    every interval wholly at σ >= ``substep_sigma`` is split into ``substeps`` λ-uniform
+    pieces, then :func:`sample_secant_anneal` runs on that grid. Below the band it is
+    secant_anneal on the caller's grid, so the CFG/SLG step windows stay where they were.
+    ``substeps=1`` is plain :func:`sample_secant_anneal`; ``callback`` fires once per
+    original step."""
+    return _sample_onset(sample_secant_anneal, model, x, sigmas, substeps, substep_sigma, callback, **kwargs)
 
 
 def sample_heunpp2(model: Denoiser, x: torch.Tensor, sigmas: torch.Tensor, *, callback: Callback = None) -> torch.Tensor:
@@ -2639,6 +2664,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),
     "cogent3_pump_rate": partial(sample_cogent3, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
     "cogent3_pump_onset": partial(sample_cogent3_onset, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
+    "secant_onset": sample_secant_onset,
 }
 
 
