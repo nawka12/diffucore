@@ -125,6 +125,7 @@ image = TextToImage(model)(
   (`lowres_sigma` defaults to 0.90 for it). Same step count, faster, aimed at
   prompt coherence and hands/anatomy.
   `secant_onset` (Anima) is `secant_anneal` with the same onset treatment: every interval wholly at σ >= 0.90 split in two and run at half resolution. Below 0.90 it is secant_anneal on your grid, so the CFG/SLG windows stay put. Pairs with `beta_mix`.
+  `lowres_calibrated` (Anima, default False): half-res calls condition the DiT on a calibrated σ (NoiseShift-style table, `_lowres_cond_sigma`) instead of the pooled σ'. No effect while the half-res band is off.
   `fdg_low` (Anima, 1 = off) scales the coarse part of the CFG delta by that factor below σ 0.90 (frequency-decoupled guidance); fine detail keeps the full CFG scale.
 
 ### Anima (DiT)

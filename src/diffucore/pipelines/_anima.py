@@ -12,6 +12,7 @@ per-branch TeaCache can then skip the uncond forward entirely.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
@@ -155,7 +156,30 @@ _LOWRES_K = 2          # layout-band downsample factor (and the latent grid it n
 _LOWRES_GRID = _LOWRES_K * 2
 
 
-def _lowres_backbone(backbone, lowres_sigma: float):
+# Calibrated half-res conditioning (NoiseShift, arXiv 2510.02307, re-fit for the pooled band):
+# the backbone is told σ_c with λ(σ_c) = λ(σ) + γ(σ)·log k, λ = log((1 − σ)/σ); γ = 1 is the
+# pooled σ'. γ minimised the half-res x0's distance to the full-res model's pooled x0 on
+# AnimaFranken v1.3, 6 images x 2 noises per σ (9-26% lower error than γ = 1).
+_LOWRES_CAL_SIGMA = (0.90, 0.97, 0.98, 0.99, 0.997)
+_LOWRES_CAL_GAMMA = (1.2, 1.2, 1.3, 1.6, 2.0)
+
+
+def _lowres_cond_sigma(s: float, k: int) -> float:
+    """The calibrated conditioning σ for a half-res call at σ = ``s``."""
+    if s >= 1.0:
+        return 1.0
+    xs, gs = _LOWRES_CAL_SIGMA, _LOWRES_CAL_GAMMA
+    if s <= xs[0]:
+        gamma = gs[0]
+    elif s >= xs[-1]:
+        gamma = gs[-1]
+    else:
+        j = next(i for i in range(1, len(xs)) if s <= xs[i])
+        gamma = gs[j - 1] + (gs[j] - gs[j - 1]) * (s - xs[j - 1]) / (xs[j] - xs[j - 1])
+    return 1.0 / (1.0 + math.exp(math.log((1.0 - s) / s) + gamma * math.log(k)))
+
+
+def _lowres_backbone(backbone, lowres_sigma: float, calibrated: bool = False):
     """Wrap ``backbone`` so every call at σ >= ``lowres_sigma`` (the layout band) runs on a
     2x-downsampled latent and returns a full-res velocity; the sampler itself stays full res.
 
@@ -164,7 +188,8 @@ def _lowres_backbone(backbone, lowres_sigma: float):
     predicts x0 there, which is upsampled and turned back into the velocity at (x, σ).
     ``lowres_sigma`` <= 0 returns ``backbone`` itself: the call path is unchanged. Low-res calls
     drop ``teacache`` (its state is shape-bound); other kwargs, e.g. SLG's ``prefix`` and
-    ``skip_layers``, pass through (one σ per step, so one resolution per step)."""
+    ``skip_layers``, pass through (one σ per step, so one resolution per step). ``calibrated``
+    tells the backbone :func:`_lowres_cond_sigma` instead of σ' and reads its x0 at that σ."""
     if lowres_sigma <= 0:
         return backbone
     k = _LOWRES_K
@@ -182,6 +207,8 @@ def _lowres_backbone(backbone, lowres_sigma: float):
         amp = (1.0 - s) + s / k
         s2 = (s / k) / amp
         xl = F.avg_pool2d(xp, k) / amp
+        if calibrated:
+            s2 = _lowres_cond_sigma(s, k)
         vl = backbone(xl.to(x.dtype).unsqueeze(2), torch.full_like(t, s2), ctx, *a, **kw).squeeze(2).float()
         x0 = F.interpolate(xl - s2 * vl, scale_factor=k, mode="bilinear", align_corners=False)
         if ph or pw:
@@ -325,6 +352,7 @@ def anima_text_to_image(
     teacache_uncond_scale: float = 1.0,
     teacache_sigma_floor: float = 0.0,
     lowres_sigma: float = 0.0,
+    lowres_calibrated: bool = False,
     fdg_low: float = 1.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
@@ -355,6 +383,8 @@ def anima_text_to_image(
 
     ``lowres_sigma`` > 0 runs every backbone call at σ >= that value on a 2x-downsampled
     latent (see :func:`_lowres_backbone`): faster, but changes the image for a given seed.
+    ``lowres_calibrated`` makes those calls condition on a calibrated σ instead of the
+    pooled σ' (no effect while the half-res band is off).
     ``fdg_low`` < 1 scales the coarse part of the CFG delta by that factor below σ 0.90
     (see :func:`_cfg_combine`).
     Not with CUDA Graphs or torch.compile.
@@ -431,7 +461,7 @@ def anima_text_to_image(
 
         # 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
-        run = _lowres_backbone(backbone, lowres_sigma)
+        run = _lowres_backbone(backbone, lowres_sigma, lowres_calibrated)
         # One TeaCache stream per CFG branch; their modulated inputs coincide.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
@@ -576,6 +606,7 @@ def anima_img2img(
     teacache_uncond_scale: float = 1.0,
     teacache_sigma_floor: float = 0.0,
     lowres_sigma: float = 0.0,
+    lowres_calibrated: bool = False,
     fdg_low: float = 1.0,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
@@ -671,7 +702,7 @@ def anima_img2img(
 
         # 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
-        run = _lowres_backbone(backbone, lowres_sigma)
+        run = _lowres_backbone(backbone, lowres_sigma, lowres_calibrated)
         # One TeaCache stream per CFG branch.
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,

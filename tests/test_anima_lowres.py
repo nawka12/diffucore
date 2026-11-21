@@ -3,6 +3,7 @@ off path, odd-size pad/crop, the TeaCache kwarg, and the pipeline wiring. Offlin
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -12,8 +13,8 @@ from PIL import Image
 from torch import nn
 
 from diffucore.pipelines import _anima
-from diffucore.pipelines._anima import (_anima_lowres, _lowres_backbone, _onset_lowres_sigma,
-                                        anima_text_to_image)
+from diffucore.pipelines._anima import (_anima_lowres, _lowres_backbone, _lowres_cond_sigma,
+                                        _onset_lowres_sigma, anima_text_to_image)
 from diffucore.runtime import ConditioningCache, DevicePolicy
 
 
@@ -196,3 +197,39 @@ def test_pipeline_secant_onset_runs_half_res(monkeypatch):
     sizes = [hw for _, hw in bb.shapes]
     assert sizes[0] == (8, 8) and sizes[-1] == (16, 16)
     assert len(sizes) > 6
+
+
+_CAL_BAND = (0.9, 0.95, 0.98, 0.99, 0.997)
+
+
+def test_lowres_cond_sigma_sits_below_the_pooled_sigma():
+    assert _lowres_cond_sigma(1.0, 2) == 1.0
+    pooled = [(s / 2) / ((1 - s) + s / 2) for s in _CAL_BAND]
+    cal = [_lowres_cond_sigma(s, 2) for s in _CAL_BAND]
+    assert all(c < p for c, p in zip(cal, pooled))
+    assert cal == sorted(cal) and len(set(cal)) == len(cal)
+    assert _lowres_cond_sigma(0.9, 2) == pytest.approx(1 / (1 + math.exp(math.log(0.1 / 0.9) + 1.2 * math.log(2))), abs=1e-9)
+
+
+def _half_res_t(monkeypatch, **kw):
+    bb = _Recorder()
+    anima_text_to_image(_model(monkeypatch, bb), "p", "n", steps=6, cfg_scale=1.0, width=128, height=128,
+                        seed=1, **kw)
+    return bb.shapes
+
+
+def test_pipeline_calibrated_half_res_calls_see_a_lower_sigma(monkeypatch):
+    plain = _half_res_t(monkeypatch, lowres_sigma=0.9)
+    cal = _half_res_t(monkeypatch, lowres_sigma=0.9, lowres_calibrated=True)
+    half = [(a, b) for (a, hw), (b, _) in zip(plain, cal) if hw == (8, 8)]
+    assert half and [hw for _, hw in plain] == [hw for _, hw in cal]
+    assert all(b <= a for a, b in half)            # both map σ = 1 to 1
+    assert any(b < a for a, b in half)
+    assert {a for a, _ in half} != {b for _, b in half}
+    assert [t for t, hw in plain if hw == (16, 16)] == [t for t, hw in cal if hw == (16, 16)]
+
+
+def test_calibration_is_a_no_op_while_the_band_is_off(monkeypatch):
+    off = _half_res_t(monkeypatch, lowres_sigma=0.0)
+    cal = _half_res_t(monkeypatch, lowres_sigma=0.0, lowres_calibrated=True)
+    assert cal == off and {hw for _, hw in cal} == {(16, 16)}
