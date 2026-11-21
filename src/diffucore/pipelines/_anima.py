@@ -281,6 +281,61 @@ def _anima_fdg(fdg_low: float) -> float:
     return fdg_low
 
 
+class _Forecast:
+    """EWMA forecast of x0 (galpt/infinity-diffusion, sampler/milstein-ewma): on a planned
+    share of the low-noise steps the model is skipped and the running average of the x0
+    estimates it produced earlier stands in for it. The plan is fixed up front: of the steps
+    1..n-2 with σ < ``sigma_limit``, ``int(ratio * n)`` are picked, spread evenly."""
+
+    BETA = 0.8
+
+    def __init__(self, sigmas, ratio: float, sigma_limit: float):
+        sig = [float(s) for s in sigmas]
+        self.total = len(sig) - 1
+        cand = [i for i in range(1, self.total - 1) if sig[i] < sigma_limit]
+        n = len(cand)
+        budget = min(int(ratio * self.total), n)
+        self.steps = frozenset(c for j, c in enumerate(cand)
+                               if n and (j + 1) * budget // n > j * budget // n)
+        self._pending = {i: sig[i] for i in self.steps}
+        self.level = None
+        self.used = 0
+
+    def observe(self, x0: torch.Tensor) -> None:
+        x0 = x0.float()
+        self.level = x0.clone() if self.level is None else self.BETA * x0 + (1.0 - self.BETA) * self.level
+
+    def step(self, i: int) -> bool:
+        """Closed-form loop: is step ``i`` forecast?"""
+        hit = i in self.steps and self.level is not None
+        self.used += hit
+        return hit
+
+    def take(self, sigma: float) -> bool:
+        """Registry samplers: is this model call the first one at a planned step's σ?"""
+        if self.level is None:
+            return False
+        for i, s in self._pending.items():
+            if abs(s - sigma) <= 1e-5 * s:
+                del self._pending[i]
+                self.used += 1
+                return True
+        return False
+
+    def report(self) -> None:
+        print(f"[forecast] {self.used}/{self.total} steps forecast", flush=True)
+
+
+def _anima_forecast(sigmas, ratio: float, sigma_limit: float) -> "_Forecast | None":
+    """The forecast plan for ``sigmas``, or None when off (``ratio`` 0)."""
+    ratio, sigma_limit = float(ratio or 0.0), float(sigma_limit)
+    if not 0.0 <= ratio < 1.0:
+        raise ValueError(f"forecast_ratio must be in [0, 1); got {ratio}")
+    if not 0.0 < sigma_limit <= 1.0:
+        raise ValueError(f"forecast_sigma must be in (0, 1]; got {sigma_limit}")
+    return _Forecast(sigmas, ratio, sigma_limit) if ratio > 0 else None
+
+
 def _refuse_skip(model: "ModelBundle", teacache_thresh: float, what: str, off: str) -> None:
     """TeaCache could reuse a residual cached from an unskipped pass, a CUDA Graph
     records one block list, and a compiled forward ignores ``skip_layers``, which
@@ -354,6 +409,8 @@ def anima_text_to_image(
     lowres_sigma: float = 0.0,
     lowres_calibrated: bool = False,
     fdg_low: float = 1.0,
+    forecast_ratio: float = 0.0,
+    forecast_sigma: float = 0.75,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -388,6 +445,10 @@ def anima_text_to_image(
     ``fdg_low`` < 1 scales the coarse part of the CFG delta by that factor below σ 0.90
     (see :func:`_cfg_combine`).
     Not with CUDA Graphs or torch.compile.
+
+    ``forecast_ratio`` > 0 skips the model on that share of the steps below σ ``forecast_sigma``
+    and feeds the sampler an EWMA of earlier x0 estimates instead (see :class:`_Forecast`);
+    it changes the image for a given seed.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -458,6 +519,7 @@ def anima_text_to_image(
         # CFG only while σ in (lo, hi]. (0, 1) = always.
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
         skip_lo, skip_hi = slg_window_bounds(sigmas, slg_start, slg_stop)
+        forecast = _anima_forecast(sigmas, forecast_ratio, forecast_sigma)
 
         # 4. integrate the rectified-flow ODE/SDE
         backbone = model.backbone
@@ -489,33 +551,41 @@ def anima_text_to_image(
                         x_5d = x.unsqueeze(2)                     # (B, C, 1, H, W)
                         t = torch.full((1,), sigma.item(), device=device, dtype=dtype)
 
-                        share = _slg_share(slg_layers, float(sigma), skip_lo, skip_hi)
-                        v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
-                        if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
-                            v = v_cond
+                        if forecast is not None and forecast.step(i):
+                            v = ((x.float() - forecast.level) / sigma).to(dtype)
+                            denoised = forecast.level.to(dtype)
                         else:
-                            # CUDA Graphs returns a view of the static output
-                            # buffer, which the uncond replay overwrites: clone
-                            # the cond output first.
-                            if policy.cuda_graphs:
-                                v_cond = v_cond.clone()
-                            v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
-                                                **_uncond_skip(uncond_skip, float(sigma), skip_lo, skip_hi)).squeeze(2)
-                            _note_follow_miss(tc_cond, tc_uncond)
-                            v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma))
-                        if share:
-                            v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
-                            v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
+                            share = _slg_share(slg_layers, float(sigma), skip_lo, skip_hi)
+                            v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
+                            if cfg_scale == 1.0 or not (cfg_lo < float(sigma) <= cfg_hi):
+                                v = v_cond
+                            else:
+                                # CUDA Graphs returns a view of the static output
+                                # buffer, which the uncond replay overwrites: clone
+                                # the cond output first.
+                                if policy.cuda_graphs:
+                                    v_cond = v_cond.clone()
+                                v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                                                    **_uncond_skip(uncond_skip, float(sigma), skip_lo, skip_hi)).squeeze(2)
+                                _note_follow_miss(tc_cond, tc_uncond)
+                                v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma))
+                            if share:
+                                v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
+                                v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
 
-                        # CONST flow: denoised = x − σ·v; the Euler step
-                        # x + (σ_next − σ)·v is exact for a constant x0.
-                        denoised = x - sigma.to(dtype) * v
+                            # CONST flow: denoised = x − σ·v; the Euler step
+                            # x + (σ_next − σ)·v is exact for a constant x0.
+                            denoised = x - sigma.to(dtype) * v
+                            if forecast is not None:
+                                forecast.observe(denoised)
                         x = x + (sigma_next - sigma).to(dtype) * v
                         on_step(i, sigma, x, denoised)
             else:  # registry samplers: CONST x0 estimate, fp32 solver math like ComfyUI
                 def denoise(x_in, sigma_b):
                     """``model(x, σ) -> x0``: CFG velocity, returned as the CONST
                     x0 estimate ``x − σ·v`` in fp32."""
+                    if forecast is not None and forecast.take(float(sigma_b.max())):
+                        return forecast.level.clone()
                     x_5d = x_in.to(dtype).unsqueeze(2)
                     t = sigma_b.to(dtype)
                     share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
@@ -533,7 +603,10 @@ def anima_text_to_image(
                         v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
                         v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
                     sig = sigma_b.float().view(-1, 1, 1, 1)
-                    return x_in.float() - sig * v.float()
+                    x0 = x_in.float() - sig * v.float()
+                    if forecast is not None:
+                        forecast.observe(x0)
+                    return x0
 
                 kwargs = {}
                 if sampler in _FLOW_AWARE_SAMPLERS:
@@ -555,6 +628,8 @@ def anima_text_to_image(
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
+        if forecast is not None:
+            forecast.report()
 
         # 5. process_out then decode, tiled when requested or when free VRAM
         # can't host an untiled decode.
@@ -608,6 +683,8 @@ def anima_img2img(
     lowres_sigma: float = 0.0,
     lowres_calibrated: bool = False,
     fdg_low: float = 1.0,
+    forecast_ratio: float = 0.0,
+    forecast_sigma: float = 0.75,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -699,6 +776,7 @@ def anima_img2img(
         # Guidance interval over the sliced schedule. (0, 1) = always.
         cfg_lo, cfg_hi = guidance_interval_bounds(sigmas, cfg_interval_start, cfg_interval_end)
         skip_lo, skip_hi = slg_window_bounds(sigmas, slg_start, slg_stop)
+        forecast = _anima_forecast(sigmas, forecast_ratio, forecast_sigma)
 
         # 4. integrate against a CONST x0 closure (keep region pinned for inpaint)
         backbone = model.backbone
@@ -722,24 +800,29 @@ def anima_img2img(
                 uncond_ctx = cached_ctx["uncond_ctx"].to(device)
 
             def denoise(x_in, sigma_b):
-                x_5d = x_in.to(dtype).unsqueeze(2)
-                t = sigma_b.to(dtype)
-                share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
-                v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
-                if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
-                    v = v_cond
+                if forecast is not None and forecast.take(float(sigma_b.max())):
+                    x0 = forecast.level.clone()
                 else:
-                    if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
-                        v_cond = v_cond.clone()
-                    v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
-                                        **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
-                    _note_follow_miss(tc_cond, tc_uncond)
-                    v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma_b.max()))
-                if share:
-                    v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
-                    v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
-                sig = sigma_b.float().view(-1, 1, 1, 1)
-                x0 = x_in.float() - sig * v.float()
+                    x_5d = x_in.to(dtype).unsqueeze(2)
+                    t = sigma_b.to(dtype)
+                    share = _slg_share(slg_layers, float(sigma_b.max()), skip_lo, skip_hi)
+                    v_cond = run(x_5d, t, cond_ctx, teacache=tc_cond, **share).squeeze(2)
+                    if cfg_scale == 1.0 or not (cfg_lo < float(sigma_b.max()) <= cfg_hi):
+                        v = v_cond
+                    else:
+                        if policy.cuda_graphs:  # the uncond replay overwrites v_cond's buffer
+                            v_cond = v_cond.clone()
+                        v_uncond = run(x_5d, t, uncond_ctx, teacache=tc_uncond,
+                                            **_uncond_skip(uncond_skip, float(sigma_b.max()), skip_lo, skip_hi)).squeeze(2)
+                        _note_follow_miss(tc_cond, tc_uncond)
+                        v = _cfg_combine(v_cond, v_uncond, cfg_scale, fdg_low, float(sigma_b.max()))
+                    if share:
+                        v_skip = run(x_5d, t, cond_ctx, skip_layers=slg_layers, **share).squeeze(2)
+                        v = (v if cfg_scale != 1.0 else v_skip) + slg_scale * (v_cond - v_skip)
+                    sig = sigma_b.float().view(-1, 1, 1, 1)
+                    x0 = x_in.float() - sig * v.float()
+                    if forecast is not None:
+                        forecast.observe(x0)
                 if mask_lat is not None:
                     x0 = x0 * mask_lat + z0_f * (1.0 - mask_lat)
                 return x0
@@ -764,6 +847,8 @@ def anima_img2img(
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
+        if forecast is not None:
+            forecast.report()
 
         # 5. decode
         with torch.no_grad(), staged([model.vae], device, policy.offload_idle):

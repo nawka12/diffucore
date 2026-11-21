@@ -68,6 +68,8 @@ class Inpaint(_Pipeline):
         lowres_sigma: float = 0.0,
         lowres_calibrated: bool = False,
         fdg_low: float = 1.0,
+        forecast_ratio: float = 0.0,
+        forecast_sigma: float = 0.75,
         deepcache_interval: int = 1,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
@@ -105,6 +107,8 @@ class Inpaint(_Pipeline):
                 lowres_sigma=lowres_sigma,
                 lowres_calibrated=lowres_calibrated,
                 fdg_low=fdg_low,
+                forecast_ratio=forecast_ratio,
+                forecast_sigma=forecast_sigma,
                 progress_callback=progress_callback, preview_callback=preview_callback,
                 return_info=return_info,
             )
