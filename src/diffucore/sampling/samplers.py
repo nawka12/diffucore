@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache, partial
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -60,6 +60,8 @@ __all__ = [
     "sample_cogent3",
     "sample_cogent3_onset",
     "sample_cogent3_reward",
+    "sample_secant_anneal_reward",
+    "sample_cogent3_onset_reward",
     "REWARD_SAMPLERS",
     "reward_particle_seed",
     "reward_score_index",
@@ -921,34 +923,33 @@ def sample_secant(
     return x
 
 
-def sample_secant_anneal(
-    model: Denoiser,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    eta_max: float = 1.0,
-    s_noise: float = 1.0,
-    curvature: float = 0.25,
-    generator: Optional[torch.Generator] = None,
-    callback: Callback = None,
-    model_type: str = "flow",
-    shift: float = 1.0,
-) -> torch.Tensor:
-    """SECANT-ANNEAL (flow only): σ-annealed ancestral burn-in
-    (:func:`sample_euler_ancestral_anneal`) plus the x0-secant correction of
-    :func:`sample_secant` toward ``σ_down``.
+class _SecantAnnealState:
+    """What :func:`_secant_anneal_steps` carries between steps: the latent and the
+    previous x0 and sigma. Enough to stop a run and resume it."""
+    __slots__ = ("x", "old_x0", "old_sigma")
 
-    ``eta`` is large exactly where the secant weight is ≈0 and vice versa, so
-    high σ behaves like ``euler_ancestral_anneal`` and low σ like ``secant``.
-    ``curvature=0`` recovers ``euler_ancestral_anneal``; ``eta_max=0`` recovers
-    ``secant``. ``shift`` is unused."""
-    if model_type != "flow":
-        raise ValueError("secant_anneal is rectified-flow only (model_type='flow')")
-    del shift
+    def __init__(self, x: torch.Tensor):
+        self.x = x
+        self.old_x0 = self.old_sigma = None
+
+
+def _secant_anneal_steps(
+    model: Denoiser,
+    state: _SecantAnnealState,
+    sigmas: torch.Tensor,
+    i_start: int,
+    i_stop: int,
+    *,
+    eta_max: float,
+    s_noise: float,
+    curvature: float,
+    generator: Optional[torch.Generator],
+    callback: Callback,
+) -> None:
+    """Run secant_anneal steps ``i_start .. i_stop - 1`` on ``state`` in place."""
+    x, old_x0, old_sigma = state.x, state.old_x0, state.old_sigma
     s_in = x.new_ones([x.shape[0]])
-    old_x0 = None
-    old_sigma = None
-    for i in range(len(sigmas) - 1):
+    for i in range(i_start, i_stop):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * s_in)
         if callback is not None:
@@ -976,7 +977,37 @@ def sample_secant_anneal(
                 x = (alpha_next / alpha_down) * x + _noise_like(x, generator) * s_noise * renoise_coeff
         old_x0 = denoised
         old_sigma = sigma
-    return x
+    state.x, state.old_x0, state.old_sigma = x, old_x0, old_sigma
+
+
+def sample_secant_anneal(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    curvature: float = 0.25,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "flow",
+    shift: float = 1.0,
+) -> torch.Tensor:
+    """SECANT-ANNEAL (flow only): σ-annealed ancestral burn-in
+    (:func:`sample_euler_ancestral_anneal`) plus the x0-secant correction of
+    :func:`sample_secant` toward ``σ_down``.
+
+    ``eta`` is large exactly where the secant weight is ≈0 and vice versa, so
+    high σ behaves like ``euler_ancestral_anneal`` and low σ like ``secant``.
+    ``curvature=0`` recovers ``euler_ancestral_anneal``; ``eta_max=0`` recovers
+    ``secant``. ``shift`` is unused."""
+    if model_type != "flow":
+        raise ValueError("secant_anneal is rectified-flow only (model_type='flow')")
+    del shift
+    state = _SecantAnnealState(x)
+    _secant_anneal_steps(model, state, sigmas, 0, len(sigmas) - 1, eta_max=eta_max, s_noise=s_noise,
+                         curvature=curvature, generator=generator, callback=callback)
+    return state.x
 
 
 def _validate_gate_reduce(reduce: str) -> None:
@@ -1340,7 +1371,7 @@ def sample_cogent3(
 
 
 # Particle counts of the registry reward samplers.
-REWARD_SAMPLERS = {"cogent3_reward": 6}
+REWARD_SAMPLERS = {"cogent3_reward": 6, "secant_anneal_reward": 6, "cogent3_pump_onset_reward": 3}
 REWARD_SCORE_SIGMA = 0.90
 
 
@@ -1357,6 +1388,44 @@ def reward_score_index(sigmas: torch.Tensor, score_sigma: float = REWARD_SCORE_S
         if s <= score_sigma:
             return i if 1 <= i <= len(sigmas) - 2 else None
     return None
+
+
+def _best_of_k(
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    i_score: int,
+    k: int,
+    score_fn: Callable[[torch.Tensor, float], float],
+    generator: Optional[torch.Generator],
+    new_state: Callable[[torch.Tensor], Any],
+    steps: Callable[[Any, int, int, Optional[torch.Generator]], None],
+    info: Optional[dict],
+) -> torch.Tensor:
+    """The best-of-``k`` driver of the reward samplers. ``steps(state, i_start, i_stop,
+    generator)`` advances a ``new_state(x)`` in place; particle 0 uses ``generator``,
+    particle ``j`` a fresh one seeded :func:`reward_particle_seed`. Every particle runs
+    steps ``0 .. i_score - 1`` and is scored; the best (lowest ``j`` on a tie) finishes."""
+    if generator is not None:
+        seed, device = generator.initial_seed(), generator.device
+    else:
+        seed, device = int(torch.randint(0, 2 ** 62, (1,))), x.device
+    gens = [generator] + [torch.Generator(device).manual_seed(reward_particle_seed(seed, j))
+                          for j in range(1, k)]
+    sigma_score = float(sigmas[i_score])
+    states, scores = [], []
+    for j in range(k):
+        state = new_state(x)
+        steps(state, 0, i_score, gens[j])
+        score = float(score_fn(state.x, sigma_score))
+        states.append(state)
+        scores.append(score if score == score else -math.inf)
+    pick = max(range(k), key=lambda j: (scores[j], -j))
+    if info is not None:
+        info.update(k=k, pick=pick, scores=list(scores), score_step=i_score, score_sigma=sigma_score)
+    winner = states[pick]
+    del states
+    steps(winner, i_score, len(sigmas) - 1, gens[pick])
+    return winner.x
 
 
 def sample_cogent3_reward(
@@ -1404,28 +1473,46 @@ def sample_cogent3_reward(
     _validate_gate_reduce(gate_reduce)
     _check_pump_latent(x, pump_strength)
     sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
-    if generator is not None:
-        seed, device = generator.initial_seed(), generator.device
-    else:
-        seed, device = int(torch.randint(0, 2 ** 62, (1,))), x.device
-    gens = [generator] + [torch.Generator(device).manual_seed(reward_particle_seed(seed, j))
-                          for j in range(1, k)]
-    sigma_score = float(sigmas[i_score])
-    states, scores = [], []
-    for j in range(k):
-        state = _Cogent3State(x)
-        _cogent3_steps(model, state, sigmas, 0, i_score, generator=gens[j], callback=callback, **kw)
-        score = float(score_fn(state.x, sigma_score))
-        states.append(state)
-        scores.append(score if score == score else -math.inf)
-    pick = max(range(k), key=lambda j: (scores[j], -j))
-    if info is not None:
-        info.update(k=k, pick=pick, scores=list(scores), score_step=i_score, score_sigma=sigma_score)
-    winner = states[pick]
-    del states
-    _cogent3_steps(model, winner, sigmas, i_score, len(sigmas) - 1, generator=gens[pick],
-                   callback=callback, **kw)
-    return winner.x
+    return _best_of_k(
+        x, sigmas, i_score, k, score_fn, generator, _Cogent3State,
+        lambda state, i0, i1, gen: _cogent3_steps(
+            model, state, sigmas, i0, i1, generator=gen, callback=callback, **kw),
+        info)
+
+
+def sample_secant_anneal_reward(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    k: int,
+    score_fn: Optional[Callable[[torch.Tensor, float], float]] = None,
+    score_sigma: float = REWARD_SCORE_SIGMA,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    curvature: float = 0.25,
+    model_type: str = "flow",
+    shift: float = 1.0,
+    info: Optional[dict] = None,
+) -> torch.Tensor:
+    """SECANT-ANNEAL with the best-of-``k`` layout pick of :func:`sample_cogent3_reward`:
+    same particles, seeding, scoring, tie rule, callback order and ``info``.
+    ``score_fn=None`` or ``k <= 1`` is plain :func:`sample_secant_anneal`."""
+    i_score = reward_score_index(sigmas, score_sigma) if len(sigmas) > 1 else None
+    if score_fn is None or k <= 1 or i_score is None:
+        return sample_secant_anneal(model, x, sigmas, eta_max=eta_max, s_noise=s_noise,
+                                    curvature=curvature, generator=generator, callback=callback,
+                                    model_type=model_type, shift=shift)
+    if model_type != "flow":
+        raise ValueError("secant_anneal is rectified-flow only (model_type='flow')")
+    return _best_of_k(
+        x, sigmas, i_score, k, score_fn, generator, _SecantAnnealState,
+        lambda state, i0, i1, gen: _secant_anneal_steps(
+            model, state, sigmas, i0, i1, eta_max=eta_max, s_noise=s_noise, curvature=curvature,
+            generator=gen, callback=callback),
+        info)
 
 
 # σ at and above which Anima's layout is decided (and where the half-res band runs).
@@ -1483,6 +1570,23 @@ def _sample_onset(inner, model, x, sigmas, substeps, substep_sigma, callback, **
             callback(outer[j], sigma, x_j, denoised)
 
     return inner(model, x, fine, callback=on_step, **kwargs)
+
+
+def sample_cogent3_onset_reward(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    substeps: int = 2,
+    substep_sigma: float = ONSET_SIGMA,
+    callback: Callback = None,
+    **kwargs,
+) -> torch.Tensor:
+    """:func:`sample_cogent3_reward` on the onset-expanded grid of :func:`sample_cogent3_onset`.
+    Sub-steps only land in intervals wholly at σ >= ``substep_sigma`` (>= the score sigma),
+    so the scoring step is an original grid point and ``callback`` still fires once per
+    original step per particle. Without a ``score_fn`` it is plain :func:`sample_cogent3_onset`."""
+    return _sample_onset(sample_cogent3_reward, model, x, sigmas, substeps, substep_sigma, callback, **kwargs)
 
 
 def sample_secant_onset(
@@ -2807,6 +2911,9 @@ SAMPLERS: dict[str, Denoiser] = {
     "cogent3_pump_rate": partial(sample_cogent3, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
     "cogent3_pump_onset": partial(sample_cogent3_onset, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
     "cogent3_reward": partial(sample_cogent3_reward, k=REWARD_SAMPLERS["cogent3_reward"]),
+    "secant_anneal_reward": partial(sample_secant_anneal_reward, k=REWARD_SAMPLERS["secant_anneal_reward"]),
+    "cogent3_pump_onset_reward": partial(sample_cogent3_onset_reward, pump_strength=0.08, pump_h_ref=PUMP_H_REF,
+                                         k=REWARD_SAMPLERS["cogent3_pump_onset_reward"]),
     "secant_onset": sample_secant_onset,
 }
 

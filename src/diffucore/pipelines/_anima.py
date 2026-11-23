@@ -51,7 +51,7 @@ _ANIMA_SAMPLERS = {
     "secant", "secant_anneal", "secant_onset",
     "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "seeds_2", "seeds_3",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-    "cogent3_reward",
+    "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
@@ -59,7 +59,7 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
     "secant_onset", "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
-    "cogent3_reward",
+    "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
 # noise at σ_max == 1.
@@ -237,11 +237,12 @@ def _anima_lowres(model: "ModelBundle", lowres_sigma: float) -> float:
     return lowres_sigma
 
 
-_ONSET_SAMPLERS = ("cogent3_pump_onset", "secant_onset")
+_ONSET_SAMPLERS = ("cogent3_pump_onset", "secant_onset", "cogent3_pump_onset_reward")
 
 
 def _onset_lowres_sigma(sampler: str, lowres_sigma: float, reward: bool = False) -> float:
-    """``cogent3_pump_onset`` and ``secant_onset`` run their sub-stepped band at half res: on
+    """``cogent3_pump_onset``, ``secant_onset`` and ``cogent3_pump_onset_reward`` run their
+    sub-stepped band at half res: on
     when the caller left it off, and never below the band it sub-steps. The reward samplers
     do the same, but only with a ``reward`` function (without one they are plain cogent3).
     Out-of-range values pass on to validation."""
@@ -371,7 +372,7 @@ def _dpmpp_2m_lookahead(denoise, x: torch.Tensor, sigma: float, evals: int, shif
 
 def _reward_score_fn(model: "ModelBundle", reward_fn, cond_ctx, uncond_ctx, cfg_scale: float,
                      cfg_lo: float, cfg_hi: float, shift: float, tick: Callable[[], None]):
-    """``score_fn(x, sigma)`` for :func:`~diffucore.sampling.samplers.sample_cogent3_reward`:
+    """``score_fn(x, sigma)`` for the reward samplers (:data:`~diffucore.sampling.samplers.REWARD_SAMPLERS`):
     a cheap look at where particle ``x`` is heading. A 6-call deterministic DPM++(2M)
     lookahead to x0 with every call at half res (same CFG band, no SLG, no TeaCache), the
     x0 2x average-pooled, VAE-decoded and handed to ``reward_fn`` (``[B, 3, H, W]`` in
@@ -524,9 +525,9 @@ def anima_text_to_image(
     it changes the image for a given seed.
 
     ``reward_fn`` (images ``[B, 3, H, W]`` in [-1, 1] to ``Tensor[B]``) switches the
-    ``cogent3_reward`` samplers from plain cogent3 to a best-of-k layout pick: it scores a
-    half-res lookahead of each particle (see :func:`_reward_score_fn`) and forces the
-    half-res layout band. Not with the EWMA forecast, whose x0 average would mix particles.
+    ``cogent3_reward`` and ``secant_anneal_reward`` samplers from their plain sampler to a
+    best-of-k layout pick: it scores a half-res lookahead of each particle (see
+    :func:`_reward_score_fn`) and forces the half-res layout band. Not with the EWMA forecast, whose x0 average would mix particles.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
@@ -699,7 +700,7 @@ def anima_text_to_image(
                     kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
                 elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
                     kwargs = dict(model_type="flow", shift=sched_shift)
-                if sampler in ("secant", "secant_anneal", "secant_onset"):
+                if sampler in ("secant", "secant_anneal", "secant_onset", "secant_anneal_reward"):
                     kwargs.setdefault("generator", gen)
                     kwargs["curvature"] = curvature
                 # aether is stochastic but takes no model_type/shift.
@@ -707,10 +708,10 @@ def anima_text_to_image(
                     kwargs["generator"] = gen
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
                                "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                               "cogent3_reward"):
+                               "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward"):
                     kwargs["eta_max"] = eta_max
                 if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                               "cogent3_reward"):
+                               "cogent3_reward", "cogent3_pump_onset_reward"):
                     kwargs["gate_reduce"] = gate_reduce
                 total, done = len(sigmas) - 1, [0]
                 if sampler in REWARD_SAMPLERS:
@@ -933,7 +934,7 @@ def anima_img2img(
                 kwargs = dict(generator=gen, model_type="flow", shift=sched_shift)
             elif sampler in ("exp_heun_2_x0", "uni_pc", "uni_pc_bh2"):  # deterministic, flow-aware
                 kwargs = dict(model_type="flow", shift=sched_shift)
-            if sampler in ("secant", "secant_anneal", "secant_onset"):
+            if sampler in ("secant", "secant_anneal", "secant_onset", "secant_anneal_reward"):
                 kwargs.setdefault("generator", gen)
                 kwargs["curvature"] = curvature
             # aether is stochastic but takes no model_type/shift.
@@ -941,10 +942,10 @@ def anima_img2img(
                 kwargs["generator"] = gen
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
                            "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                           "cogent3_reward"):
+                           "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward"):
                 kwargs["eta_max"] = eta_max
             if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                           "cogent3_reward"):
+                           "cogent3_reward", "cogent3_pump_onset_reward"):
                 kwargs["gate_reduce"] = gate_reduce
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
