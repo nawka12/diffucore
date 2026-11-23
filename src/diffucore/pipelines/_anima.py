@@ -13,6 +13,7 @@ per-branch TeaCache can then skip the uncond forward entirely.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
@@ -35,7 +36,7 @@ from ..sampling import (
     slg_window_bounds,
     validate_slg,
 )
-from ..sampling.samplers import ONSET_SIGMA
+from ..sampling.samplers import ONSET_SIGMA, REWARD_SAMPLERS, reward_score_index
 
 # Samplers Anima can drive through a CONST x0 denoiser closure; the stochastic,
 # flow-aware ones also take ``model_type``/``shift``.
@@ -50,6 +51,7 @@ _ANIMA_SAMPLERS = {
     "secant", "secant_anneal", "secant_onset",
     "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "seeds_2", "seeds_3",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
+    "cogent3_reward",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
@@ -57,6 +59,7 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
     "secant_onset", "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
+    "cogent3_reward",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
 # noise at σ_max == 1.
@@ -237,12 +240,14 @@ def _anima_lowres(model: "ModelBundle", lowres_sigma: float) -> float:
 _ONSET_SAMPLERS = ("cogent3_pump_onset", "secant_onset")
 
 
-def _onset_lowres_sigma(sampler: str, lowres_sigma: float) -> float:
+def _onset_lowres_sigma(sampler: str, lowres_sigma: float, reward: bool = False) -> float:
     """``cogent3_pump_onset`` and ``secant_onset`` run their sub-stepped band at half res: on
-    when the caller left it off, and never below the band it sub-steps. Out-of-range values
-    pass on to validation."""
+    when the caller left it off, and never below the band it sub-steps. The reward samplers
+    do the same, but only with a ``reward`` function (without one they are plain cogent3).
+    Out-of-range values pass on to validation."""
     lowres_sigma = float(lowres_sigma or 0.0)
-    if sampler not in _ONSET_SAMPLERS or not 0.0 <= lowres_sigma <= 1.0:
+    if (sampler not in _ONSET_SAMPLERS and not (reward and sampler in REWARD_SAMPLERS)
+            or not 0.0 <= lowres_sigma <= 1.0):
         return lowres_sigma
     return ONSET_SIGMA if lowres_sigma == 0.0 else min(lowres_sigma, ONSET_SIGMA)
 
@@ -336,6 +341,73 @@ def _anima_forecast(sigmas, ratio: float, sigma_limit: float) -> "_Forecast | No
     return _Forecast(sigmas, ratio, sigma_limit) if ratio > 0 else None
 
 
+_REWARD_LOOKAHEAD_EVALS = 6
+
+
+def _dpmpp_2m_lookahead(denoise, x: torch.Tensor, sigma: float, evals: int, shift: float) -> torch.Tensor:
+    """Deterministic DPM-Solver++(2M) (flow, eta 0) from ``(x, sigma)`` to 0 in ``evals``
+    model calls, on a shift-``shift`` grid even in the shifted timestep; returns the final x0."""
+    u0 = sigma / (shift - (shift - 1.0) * sigma)
+    sig = [shift * u / (1.0 + (shift - 1.0) * u) for u in np.linspace(u0, 0.0, evals + 1)]
+    sig[0] = sigma
+    ones = x.new_ones([x.shape[0]])
+    lam = lambda s: math.log((1.0 - s) / s)
+    d_prev = h_prev = None
+    for i in range(evals):
+        s, sn = sig[i], sig[i + 1]
+        d = denoise(x, s * ones)
+        if sn <= 0:
+            return d
+        h = lam(sn) - lam(s)
+        if d_prev is None:
+            dd = d
+        else:
+            r = h_prev / h
+            dd = (1.0 + 1.0 / (2.0 * r)) * d - (1.0 / (2.0 * r)) * d_prev
+        x = (sn / s) * (x - (1.0 - s) * dd) + (1.0 - sn) * dd
+        d_prev, h_prev = d, h
+    return x
+
+
+def _reward_score_fn(model: "ModelBundle", reward_fn, cond_ctx, uncond_ctx, cfg_scale: float,
+                     cfg_lo: float, cfg_hi: float, shift: float, tick: Callable[[], None]):
+    """``score_fn(x, sigma)`` for :func:`~diffucore.sampling.samplers.sample_cogent3_reward`:
+    a cheap look at where particle ``x`` is heading. A 6-call deterministic DPM++(2M)
+    lookahead to x0 with every call at half res (same CFG band, no SLG, no TeaCache), the
+    x0 2x average-pooled, VAE-decoded and handed to ``reward_fn`` (``[B, 3, H, W]`` in
+    [-1, 1] to ``Tensor[B]``). ``tick`` runs before each model call (cancel point)."""
+    policy = model.policy
+    dtype = policy.compute_dtype
+    backbone = model.backbone
+    run = _lowres_backbone(backbone, 1e-4)
+
+    def denoise(x_in, sigma_b):
+        tick()
+        s = float(sigma_b.max())
+        x_5d, t = x_in.to(dtype).unsqueeze(2), sigma_b.to(dtype)
+        v = run(x_5d, t, cond_ctx).squeeze(2)
+        if cfg_scale != 1.0 and cfg_lo < s <= cfg_hi:
+            v = _cfg_combine(v, run(x_5d, t, uncond_ctx).squeeze(2), cfg_scale, 1.0, s)
+        return x_in.float() - sigma_b.float().view(-1, 1, 1, 1) * v.float()
+
+    def score_fn(x, sigma):
+        x0 = _dpmpp_2m_lookahead(denoise, x.float(), sigma, _REWARD_LOOKAHEAD_EVALS, shift)
+        z = F.avg_pool2d(x0, 2)
+        with torch.no_grad():
+            image, _ = vae_decode_safe(model.vae, model.vae.process_out(z.to(policy.vae_dtype)), policy)
+        return float(reward_fn(image.float())[0])
+
+    return score_fn
+
+
+def _counting(callback, counter: list):
+    """``callback`` that also counts its calls in ``counter[0]``."""
+    def wrapped(*args):
+        counter[0] += 1
+        callback(*args)
+    return wrapped
+
+
 def _refuse_skip(model: "ModelBundle", teacache_thresh: float, what: str, off: str) -> None:
     """TeaCache could reuse a residual cached from an unskipped pass, a CUDA Graph
     records one block list, and a compiled forward ignores ``skip_layers``, which
@@ -411,6 +483,7 @@ def anima_text_to_image(
     fdg_low: float = 1.0,
     forecast_ratio: float = 0.0,
     forecast_sigma: float = 0.75,
+    reward_fn: "Callable[[torch.Tensor], torch.Tensor] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -449,9 +522,18 @@ def anima_text_to_image(
     ``forecast_ratio`` > 0 skips the model on that share of the steps below σ ``forecast_sigma``
     and feeds the sampler an EWMA of earlier x0 estimates instead (see :class:`_Forecast`);
     it changes the image for a given seed.
+
+    ``reward_fn`` (images ``[B, 3, H, W]`` in [-1, 1] to ``Tensor[B]``) switches the
+    ``cogent3_reward`` samplers from plain cogent3 to a best-of-k layout pick: it scores a
+    half-res lookahead of each particle (see :func:`_reward_score_fn`) and forces the
+    half-res layout band. Not with the EWMA forecast, whose x0 average would mix particles.
     """
     if sampler not in _ANIMA_SAMPLERS:
         raise ValueError(f"Anima sampler must be one of {sorted(_ANIMA_SAMPLERS)}; got {sampler!r}")
+    reward = reward_fn is not None and sampler in REWARD_SAMPLERS
+    if reward and float(forecast_ratio or 0.0) > 0:
+        raise ValueError(f"{sampler} is incompatible with the EWMA forecast (its x0 average would "
+                         "mix the particles). Set forecast_ratio to 0 or pick another sampler.")
     if scheduler not in _ANIMA_SCHEDULERS:
         raise ValueError(f"Anima scheduler must be one of {_ANIMA_SCHEDULERS}; got {scheduler!r}")
     policy = model.policy
@@ -462,7 +544,7 @@ def anima_text_to_image(
         raise ValueError(f"width/height must be divisible by 16; got {width}x{height}")
     slg_layers = _anima_slg(model, slg_layers, slg_scale, slg_start, slg_stop, teacache_thresh)
     uncond_skip = _anima_uncond_skip(model, uncond_skip_layers, teacache_thresh)
-    lowres_sigma = _anima_lowres(model, _onset_lowres_sigma(sampler, lowres_sigma))
+    lowres_sigma = _anima_lowres(model, _onset_lowres_sigma(sampler, lowres_sigma, reward))
     fdg_low = _anima_fdg(fdg_low)
 
     with perf_context(policy):
@@ -528,9 +610,12 @@ def anima_text_to_image(
         tc_cond, tc_uncond = _make_teacache(teacache_thresh, teacache_coefficients, cfg_scale,
                                             teacache_forecast, teacache_rule,
                                             teacache_uncond_scale, teacache_sigma_floor)
+        # The reward samplers decode their lookaheads, so the VAE is on the device for the run.
+        i_score = reward_score_index(sigmas) if reward else None
+        vae_stage = staged([model.vae], device, policy.offload_idle) if i_score is not None else nullcontext()
         # staged() outside inference_mode: weights moved under inference mode
         # become inference tensors that break later in-place LoRA.
-        with staged([backbone], device, policy.offload_unet), torch.inference_mode():
+        with vae_stage, staged([backbone], device, policy.offload_unet), torch.inference_mode():
             # Run the LLM-Adapter once per generation (both contexts come off the
             # cache on a hit) and feed the DiT the prepared context.
             if cached_ctx is None:
@@ -543,6 +628,7 @@ def anima_text_to_image(
             else:
                 cond_ctx = cached_ctx["cond_ctx"].to(device)
                 uncond_ctx = cached_ctx["uncond_ctx"].to(device)
+            reward_info = None
             if sampler == "euler":
                 total = len(sigmas) - 1
                 with _step_progress(total, progress_callback, preview_callback) as on_step:
@@ -620,11 +706,26 @@ def anima_text_to_image(
                 if sampler == "infinity_aether":
                     kwargs["generator"] = gen
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
-                               "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
+                               "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
+                               "cogent3_reward"):
                     kwargs["eta_max"] = eta_max
-                if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
+                if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
+                               "cogent3_reward"):
                     kwargs["gate_reduce"] = gate_reduce
-                with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
+                total, done = len(sigmas) - 1, [0]
+                if sampler in REWARD_SAMPLERS:
+                    # Progress counts every particle step plus the winner's remaining ones, so it
+                    # only moves forward; the lookahead calls re-send the current count, which is
+                    # where a cancel lands between particle steps.
+                    reward_info = kwargs["info"] = {}
+                    if i_score is not None:
+                        total += (REWARD_SAMPLERS[sampler] - 1) * i_score
+                        kwargs["score_fn"] = _reward_score_fn(
+                            model, reward_fn, cond_ctx, uncond_ctx, cfg_scale, cfg_lo, cfg_hi, sched_shift,
+                            lambda: progress_callback(done[0], total) if progress_callback else None)
+                with _step_progress(total, progress_callback, preview_callback) as on_step:
+                    if "score_fn" in kwargs:
+                        on_step = _counting(on_step, done)
                     x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)
 
         _report_teacache(tc_cond, tc_uncond)
@@ -637,7 +738,7 @@ def anima_text_to_image(
             z = model.vae.process_out(x.to(policy.vae_dtype))
             image, decode_mode = vae_decode_safe(model.vae, z, policy)
         image = _to_pil(image)
-        info = PipelineInfo(vae_decode_mode=decode_mode)
+        info = PipelineInfo(vae_decode_mode=decode_mode, reward=reward_info or None)
         return (image, info) if return_info else image
 
 
@@ -839,9 +940,11 @@ def anima_img2img(
             if sampler == "infinity_aether":
                 kwargs["generator"] = gen
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
-                           "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
+                           "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
+                           "cogent3_reward"):
                 kwargs["eta_max"] = eta_max
-            if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset"):
+            if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
+                           "cogent3_reward"):
                 kwargs["gate_reduce"] = gate_reduce
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)

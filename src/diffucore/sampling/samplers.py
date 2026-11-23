@@ -59,6 +59,10 @@ __all__ = [
     "sample_cogent",
     "sample_cogent3",
     "sample_cogent3_onset",
+    "sample_cogent3_reward",
+    "REWARD_SAMPLERS",
+    "reward_particle_seed",
+    "reward_score_index",
     "sample_secant_onset",
     "get_sampler",
     "SAMPLERS",
@@ -1152,53 +1156,7 @@ def _ou_step_var(h: float, eta: float) -> float:
     return h if z < 1e-8 else -math.expm1(-z) / (2.0 * eta)
 
 
-def sample_cogent3(
-    model: Denoiser,
-    x: torch.Tensor,
-    sigmas: torch.Tensor,
-    *,
-    eta_max: float = 1.0,
-    s_noise: float = 1.0,
-    pump_strength: float = 0.0,
-    pump_end: float = 0.45,
-    pump_span: float = 0.25,
-    pump_h_ref: Optional[float] = None,
-    generator: Optional[torch.Generator] = None,
-    callback: Callback = None,
-    model_type: str = "ve",
-    shift: float = 1.0,
-    gate_reduce: str = "all",
-    gate_stats: Optional[list] = None,
-) -> torch.Tensor:
-    """COGENT3: COGENT's measured gate carried to third order. One evaluation
-    per step; all families.
-
-    The DPM-Solver++(3M) core with the 2nd-order term scaled by
-    :func:`_coherence_gate` and the 3rd-order term by
-    :func:`_cogent3_curvature_gate` (no floor). With both gates at 1 and
-    ``eta_max=0`` it is :func:`sample_dpmpp_3m_sde` (``eta=0``) bit-for-bit.
-    Prefers 24+ steps. ``eta_max``, ``gate_reduce``, ``model_type`` and
-    ``shift`` work as in :func:`sample_cogent`. ``gate_stats``, if given,
-    collects one :func:`_coherence_gate` stats dict per correctable step.
-
-    ``pump_strength > 0`` (the ``cogent3_pump`` sampler) adds a high-σ coherence
-    pump, the load-bearing mechanism of :func:`sample_infinity_aether` with a
-    hard low-σ shutoff::
-
-        nu  = pump_strength · sigma_next · clamp((sigma_frac − pump_end)/pump_span, 0, 1)
-        x  += nu · (1 − C) · noise
-
-    where ``C`` is the structure-tensor coherence of the denoised prediction.
-    The gate uses the family-invariant ``sigma_frac``, the amplitude absolute
-    ``sigma_next``, and it never touches the final latent. ``pump_h_ref`` (the
-    ``cogent3_pump_rate`` sampler) scales each injection by
-    ``sqrt(V(h)/V(pump_h_ref))`` (:func:`_ou_step_var`) so the dose is the same
-    at any step count; ``None`` is the fixed per-step pump. The pump needs a 4-D
-    latent; ``pump_strength=0`` is plain cogent3 and draws no extra noise.
-    """
-    _validate_gate_reduce(gate_reduce)
-    if len(sigmas) <= 1:
-        return x
+def _check_pump_latent(x: torch.Tensor, pump_strength: float) -> None:
     if pump_strength > 0 and x.ndim != 4:
         raise ValueError(
             f"cogent3's coherence pump needs a 4-D [B, C, H, W] latent (the "
@@ -1206,13 +1164,48 @@ def sample_cogent3(
             f"packs the latent into a [B, L, C·p²] token sequence, so use plain "
             f"cogent3 (pump_strength=0) there."
         )
+
+
+class _Cogent3State:
+    """What :func:`_cogent3_steps` carries between steps: the latent, the last three
+    x0 estimates and the last two λ-steps. Enough to stop a run and resume it."""
+    __slots__ = ("x", "denoised_1", "denoised_2", "denoised_3", "h_1", "h_2")
+
+    def __init__(self, x: torch.Tensor):
+        self.x = x
+        self.denoised_1 = self.denoised_2 = self.denoised_3 = None
+        self.h_1 = self.h_2 = None
+
+
+def _cogent3_steps(
+    model: Denoiser,
+    state: _Cogent3State,
+    sigmas: torch.Tensor,
+    i_start: int,
+    i_stop: int,
+    *,
+    eta_max: float,
+    s_noise: float,
+    pump_strength: float,
+    pump_end: float,
+    pump_span: float,
+    pump_h_ref: Optional[float],
+    generator: Optional[torch.Generator],
+    callback: Callback,
+    model_type: str,
+    gate_reduce: str,
+    gate_stats: Optional[list] = None,
+) -> None:
+    """Run cogent3 steps ``i_start .. i_stop - 1`` on ``state`` in place. ``sigmas``
+    must already have its first sigma offset (:func:`_offset_first_sigma_for_snr`),
+    which happens once per run, not per segment."""
+    x = state.x
     s_in = x.new_ones([x.shape[0]])
     lambda_fn = lambda sigma: _half_log_snr(sigma, model_type)
-    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
-    denoised_1, denoised_2, denoised_3 = None, None, None
-    h, h_1, h_2 = None, None, None
+    denoised_1, denoised_2, denoised_3 = state.denoised_1, state.denoised_2, state.denoised_3
+    h, h_1, h_2 = None, state.h_1, state.h_2
     _stats = None
-    for i in range(len(sigmas) - 1):
+    for i in range(i_start, i_stop):
         sigma, sigma_next = sigmas[i], sigmas[i + 1]
         denoised = model(x, sigma * s_in)
         if callback is not None:
@@ -1283,7 +1276,156 @@ def sample_cogent3(
                     x = x + (nu * (1.0 - c)).to(x.dtype) * _noise_like(x, generator)
         denoised_1, denoised_2, denoised_3 = denoised, denoised_1, denoised_2
         h_1, h_2 = h, h_1
-    return x
+    state.x = x
+    state.denoised_1, state.denoised_2, state.denoised_3 = denoised_1, denoised_2, denoised_3
+    state.h_1, state.h_2 = h_1, h_2
+
+
+def sample_cogent3(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    pump_strength: float = 0.0,
+    pump_end: float = 0.45,
+    pump_span: float = 0.25,
+    pump_h_ref: Optional[float] = None,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+    gate_reduce: str = "all",
+    gate_stats: Optional[list] = None,
+) -> torch.Tensor:
+    """COGENT3: COGENT's measured gate carried to third order. One evaluation
+    per step; all families.
+
+    The DPM-Solver++(3M) core with the 2nd-order term scaled by
+    :func:`_coherence_gate` and the 3rd-order term by
+    :func:`_cogent3_curvature_gate` (no floor). With both gates at 1 and
+    ``eta_max=0`` it is :func:`sample_dpmpp_3m_sde` (``eta=0``) bit-for-bit.
+    Prefers 24+ steps. ``eta_max``, ``gate_reduce``, ``model_type`` and
+    ``shift`` work as in :func:`sample_cogent`. ``gate_stats``, if given,
+    collects one :func:`_coherence_gate` stats dict per correctable step.
+
+    ``pump_strength > 0`` (the ``cogent3_pump`` sampler) adds a high-σ coherence
+    pump, the load-bearing mechanism of :func:`sample_infinity_aether` with a
+    hard low-σ shutoff::
+
+        nu  = pump_strength · sigma_next · clamp((sigma_frac − pump_end)/pump_span, 0, 1)
+        x  += nu · (1 − C) · noise
+
+    where ``C`` is the structure-tensor coherence of the denoised prediction.
+    The gate uses the family-invariant ``sigma_frac``, the amplitude absolute
+    ``sigma_next``, and it never touches the final latent. ``pump_h_ref`` (the
+    ``cogent3_pump_rate`` sampler) scales each injection by
+    ``sqrt(V(h)/V(pump_h_ref))`` (:func:`_ou_step_var`) so the dose is the same
+    at any step count; ``None`` is the fixed per-step pump. The pump needs a 4-D
+    latent; ``pump_strength=0`` is plain cogent3 and draws no extra noise.
+    """
+    _validate_gate_reduce(gate_reduce)
+    if len(sigmas) <= 1:
+        return x
+    _check_pump_latent(x, pump_strength)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    state = _Cogent3State(x)
+    _cogent3_steps(
+        model, state, sigmas, 0, len(sigmas) - 1, eta_max=eta_max, s_noise=s_noise,
+        pump_strength=pump_strength, pump_end=pump_end, pump_span=pump_span,
+        pump_h_ref=pump_h_ref, generator=generator, callback=callback,
+        model_type=model_type, gate_reduce=gate_reduce, gate_stats=gate_stats)
+    return state.x
+
+
+# Particle counts of the registry reward samplers.
+REWARD_SAMPLERS = {"cogent3_reward": 6}
+REWARD_SCORE_SIGMA = 0.90
+
+
+def reward_particle_seed(seed: int, j: int) -> int:
+    """Generator seed of reward particle ``j``; particle 0 keeps the run's own seed."""
+    return seed if j == 0 else (seed * 1000003 + 7919 * j) % (2 ** 63)
+
+
+def reward_score_index(sigmas: torch.Tensor, score_sigma: float = REWARD_SCORE_SIGMA) -> Optional[int]:
+    """The first step index whose sigma is <= ``score_sigma``: where the reward sampler
+    scores its particles. ``None`` when that leaves nothing to pick over (the grid starts
+    at or below it, or it is only reached at the final sigma)."""
+    for i, s in enumerate(sigmas.tolist()):
+        if s <= score_sigma:
+            return i if 1 <= i <= len(sigmas) - 2 else None
+    return None
+
+
+def sample_cogent3_reward(
+    model: Denoiser,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    k: int,
+    score_fn: Optional[Callable[[torch.Tensor, float], float]] = None,
+    score_sigma: float = REWARD_SCORE_SIGMA,
+    generator: Optional[torch.Generator] = None,
+    callback: Callback = None,
+    eta_max: float = 1.0,
+    s_noise: float = 1.0,
+    pump_strength: float = 0.0,
+    pump_end: float = 0.45,
+    pump_span: float = 0.25,
+    pump_h_ref: Optional[float] = None,
+    model_type: str = "ve",
+    shift: float = 1.0,
+    gate_reduce: str = "all",
+    info: Optional[dict] = None,
+) -> torch.Tensor:
+    """COGENT3 with a best-of-``k`` pick of the layout.
+
+    ``k`` particles start from the same ``x`` and run :func:`sample_cogent3` one after
+    another (batch 1) down to the first step whose sigma is <= ``score_sigma``, each on
+    its own generator: particle 0 uses ``generator``, particle ``j`` a fresh one seeded
+    :func:`reward_particle_seed` of ``generator.initial_seed()``. ``score_fn(x_j, sigma)``
+    rates each particle (higher is better); the best one, the lowest ``j`` on a tie,
+    resumes from its stored state and finishes the run, so its image is exactly what that
+    particle would have given alone. ``score_fn=None`` or ``k <= 1`` is plain cogent3.
+
+    ``callback`` fires for every step of every particle (its index is the step within
+    that particle) and then for the winner's remaining steps. ``info``, if given, gets
+    ``k``, ``pick``, ``scores``, ``score_step`` and ``score_sigma``.
+
+    """
+    kw = dict(eta_max=eta_max, s_noise=s_noise, pump_strength=pump_strength, pump_end=pump_end,
+              pump_span=pump_span, pump_h_ref=pump_h_ref, model_type=model_type,
+              gate_reduce=gate_reduce)
+    i_score = reward_score_index(sigmas, score_sigma) if len(sigmas) > 1 else None
+    if score_fn is None or k <= 1 or i_score is None:
+        return sample_cogent3(model, x, sigmas, generator=generator, callback=callback, shift=shift, **kw)
+    _validate_gate_reduce(gate_reduce)
+    _check_pump_latent(x, pump_strength)
+    sigmas = _offset_first_sigma_for_snr(sigmas, model_type, shift)
+    if generator is not None:
+        seed, device = generator.initial_seed(), generator.device
+    else:
+        seed, device = int(torch.randint(0, 2 ** 62, (1,))), x.device
+    gens = [generator] + [torch.Generator(device).manual_seed(reward_particle_seed(seed, j))
+                          for j in range(1, k)]
+    sigma_score = float(sigmas[i_score])
+    states, scores = [], []
+    for j in range(k):
+        state = _Cogent3State(x)
+        _cogent3_steps(model, state, sigmas, 0, i_score, generator=gens[j], callback=callback, **kw)
+        score = float(score_fn(state.x, sigma_score))
+        states.append(state)
+        scores.append(score if score == score else -math.inf)
+    pick = max(range(k), key=lambda j: (scores[j], -j))
+    if info is not None:
+        info.update(k=k, pick=pick, scores=list(scores), score_step=i_score, score_sigma=sigma_score)
+    winner = states[pick]
+    del states
+    _cogent3_steps(model, winner, sigmas, i_score, len(sigmas) - 1, generator=gens[pick],
+                   callback=callback, **kw)
+    return winner.x
 
 
 # σ at and above which Anima's layout is decided (and where the half-res band runs).
@@ -2664,6 +2806,7 @@ SAMPLERS: dict[str, Denoiser] = {
     "cogent3_pump": partial(sample_cogent3, pump_strength=0.08),
     "cogent3_pump_rate": partial(sample_cogent3, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
     "cogent3_pump_onset": partial(sample_cogent3_onset, pump_strength=0.08, pump_h_ref=PUMP_H_REF),
+    "cogent3_reward": partial(sample_cogent3_reward, k=REWARD_SAMPLERS["cogent3_reward"]),
     "secant_onset": sample_secant_onset,
 }
 

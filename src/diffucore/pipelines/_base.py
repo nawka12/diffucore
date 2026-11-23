@@ -66,6 +66,7 @@ class PipelineInfo:
     """Runtime details produced during generation."""
 
     vae_decode_mode: str = "unknown"
+    reward: "dict | None" = None   # cogent3_reward pick: k, pick, scores, score_step, score_sigma
 
 
 def img2img_start(steps: int, strength: float) -> int:
