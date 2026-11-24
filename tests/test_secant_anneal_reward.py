@@ -226,7 +226,8 @@ def test_degenerate_grids_fall_back_to_plain():
 def test_registry_and_reward_samplers():
     fn = K.get_sampler(NAME)
     assert fn.func is K.sample_secant_anneal_reward and fn.keywords == {"k": 6}
-    assert K.REWARD_SAMPLERS == {"cogent3_reward": 6, NAME: 6, "cogent3_pump_onset_reward": 3}
+    assert K.REWARD_SAMPLERS == {"cogent3_reward": 6, NAME: 6, "cogent3_pump_onset_reward": 3,
+                               "cogent3_pump_rate_reward": 6}
     assert "sample_secant_anneal_reward" in K.__all__
     from diffucore.sampling import sample_secant_anneal_reward
     assert sample_secant_anneal_reward is K.sample_secant_anneal_reward

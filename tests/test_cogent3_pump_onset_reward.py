@@ -39,7 +39,7 @@ def test_registry_and_reward_samplers():
     assert fn.func is K.sample_cogent3_onset_reward
     assert fn.keywords == {"k": K.REWARD_SAMPLERS[NAME], "pump_strength": 0.08, "pump_h_ref": K.PUMP_H_REF}
     assert K.REWARD_SAMPLERS[NAME] >= 3
-    assert set(K.REWARD_SAMPLERS) == {"cogent3_reward", "secant_anneal_reward", NAME}
+    assert set(K.REWARD_SAMPLERS) == {"cogent3_reward", "secant_anneal_reward", NAME, "cogent3_pump_rate_reward"}
     assert "sample_cogent3_onset_reward" in K.__all__
     from diffucore.sampling import sample_cogent3_onset_reward
     assert sample_cogent3_onset_reward is K.sample_cogent3_onset_reward

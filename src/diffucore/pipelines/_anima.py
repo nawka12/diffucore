@@ -51,7 +51,7 @@ _ANIMA_SAMPLERS = {
     "secant", "secant_anneal", "secant_onset",
     "exp_heun_2_x0", "uni_pc", "uni_pc_bh2", "seeds_2", "seeds_3",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-    "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
+    "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward", "cogent3_pump_rate_reward",
 }
 _FLOW_AWARE_SAMPLERS = {
     "er_sde", "dpm_2_ancestral", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_2m_sde_heun",
@@ -59,7 +59,7 @@ _FLOW_AWARE_SAMPLERS = {
     "dpmpp_2s_ancestral", "res_multistep_ancestral", "lcm",
     "cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
     "secant_onset", "sa_solver", "sa_solver_pece", "seeds_2", "seeds_3",
-    "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
+    "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward", "cogent3_pump_rate_reward",
 }
 # "ddim_uniform" is omitted: it starts below σ_max, but the init here is pure
 # noise at σ_max == 1.
@@ -525,7 +525,7 @@ def anima_text_to_image(
     it changes the image for a given seed.
 
     ``reward_fn`` (images ``[B, 3, H, W]`` in [-1, 1] to ``Tensor[B]``) switches the
-    ``cogent3_reward`` and ``secant_anneal_reward`` samplers from their plain sampler to a
+    reward samplers (:data:`~diffucore.sampling.samplers.REWARD_SAMPLERS`) from their plain sampler to a
     best-of-k layout pick: it scores a half-res lookahead of each particle (see
     :func:`_reward_score_fn`) and forces the half-res layout band. Not with the EWMA forecast, whose x0 average would mix particles.
     """
@@ -708,10 +708,11 @@ def anima_text_to_image(
                     kwargs["generator"] = gen
                 if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
                                "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                               "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward"):
+                               "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
+                               "cogent3_pump_rate_reward"):
                     kwargs["eta_max"] = eta_max
                 if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                               "cogent3_reward", "cogent3_pump_onset_reward"):
+                               "cogent3_reward", "cogent3_pump_onset_reward", "cogent3_pump_rate_reward"):
                     kwargs["gate_reduce"] = gate_reduce
                 total, done = len(sigmas) - 1, [0]
                 if sampler in REWARD_SAMPLERS:
@@ -942,10 +943,11 @@ def anima_img2img(
                 kwargs["generator"] = gen
             if sampler in ("euler_ancestral_anneal", "secant_anneal", "secant_onset", "cogent", "cogent3",
                            "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                           "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward"):
+                           "cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
+                           "cogent3_pump_rate_reward"):
                 kwargs["eta_max"] = eta_max
             if sampler in ("cogent", "cogent3", "cogent3_pump", "cogent3_pump_rate", "cogent3_pump_onset",
-                           "cogent3_reward", "cogent3_pump_onset_reward"):
+                           "cogent3_reward", "cogent3_pump_onset_reward", "cogent3_pump_rate_reward"):
                 kwargs["gate_reduce"] = gate_reduce
             with _step_progress(len(sigmas) - 1, progress_callback, preview_callback) as on_step:
                 x = get_sampler(sampler)(denoise, x.float(), sigmas, callback=on_step, **kwargs)

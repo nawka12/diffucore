@@ -315,7 +315,8 @@ def test_particle_seed_formula_and_registry():
         fn = K.get_sampler(name)
         assert fn.func is K.sample_cogent3_reward and fn.keywords == kw
         assert K.REWARD_SAMPLERS[name] == 6
-    assert set(K.REWARD_SAMPLERS) == {"cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward"}
+    assert set(K.REWARD_SAMPLERS) == {"cogent3_reward", "secant_anneal_reward", "cogent3_pump_onset_reward",
+                                     "cogent3_pump_rate_reward"}
     assert {n for n in K.SAMPLERS if n.startswith("cogent3_reward")} == {"cogent3_reward"}
 
 

@@ -1371,7 +1371,8 @@ def sample_cogent3(
 
 
 # Particle counts of the registry reward samplers.
-REWARD_SAMPLERS = {"cogent3_reward": 6, "secant_anneal_reward": 6, "cogent3_pump_onset_reward": 3}
+REWARD_SAMPLERS = {"cogent3_reward": 6, "secant_anneal_reward": 6, "cogent3_pump_onset_reward": 3,
+                   "cogent3_pump_rate_reward": 6}
 REWARD_SCORE_SIGMA = 0.90
 
 
@@ -2914,6 +2915,8 @@ SAMPLERS: dict[str, Denoiser] = {
     "secant_anneal_reward": partial(sample_secant_anneal_reward, k=REWARD_SAMPLERS["secant_anneal_reward"]),
     "cogent3_pump_onset_reward": partial(sample_cogent3_onset_reward, pump_strength=0.08, pump_h_ref=PUMP_H_REF,
                                          k=REWARD_SAMPLERS["cogent3_pump_onset_reward"]),
+    "cogent3_pump_rate_reward": partial(sample_cogent3_reward, pump_strength=0.08, pump_h_ref=PUMP_H_REF,
+                                        k=REWARD_SAMPLERS["cogent3_pump_rate_reward"]),
     "secant_onset": sample_secant_onset,
 }
 
