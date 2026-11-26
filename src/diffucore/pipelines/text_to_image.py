@@ -66,10 +66,13 @@ class TextToImage(_Pipeline):
         forecast_sigma: float = 0.75,
         reward_fn: "Callable[[object], object] | None" = None,
         deepcache_interval: int = 1,
+        reference_images: "list[Image.Image] | None" = None,
         progress_callback: Callable[[int, int], None] | None = None,
         preview_callback: Callable[[object], None] | None = None,
         return_info: bool = False,
     ) -> Image.Image:
+        if reference_images and self.model.spec.architecture != "flux2":
+            raise ValueError("reference_images is only supported for FLUX.2 models")
         if self.model.spec.architecture == "anima":
             # The default scheduler ("karras") and other SD-only schedules don't
             # apply to a flow model; fall back to the rectified-flow schedule.
@@ -161,12 +164,15 @@ class TextToImage(_Pipeline):
             # FLUX is flow-matching + guidance-distilled: cfg_scale is the distilled
             # guidance, and SD schedulers don't apply (fall back to "flux").
             flux_scheduler = scheduler if scheduler in _FLUX_SCHEDULERS else "flux"
+            # With references, an unset size follows the first reference.
+            default_size = None if reference_images else self.model.spec.image_size
             return flux_text_to_image(
                 self.model, prompt, negative_prompt,
                 steps=steps, guidance=cfg_scale, shift=shift,
-                width=width if width is not None else self.model.spec.image_size,
-                height=height if height is not None else self.model.spec.image_size,
+                width=width if width is not None else default_size,
+                height=height if height is not None else default_size,
                 seed=seed, sampler=sampler, scheduler=flux_scheduler,
+                reference_images=reference_images,
                 progress_callback=progress_callback,
                 preview_callback=preview_callback,
                 return_info=return_info,

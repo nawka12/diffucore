@@ -44,6 +44,7 @@ _FLOW_AWARE_SAMPLERS = {
 _FLUX_SCHEDULERS = (
     "flux", "flow", "sgm_uniform", "simple",
     "normal", "infinity", "infinity_htds", "kl_optimal", "linear_quadratic",
+    "flux2",  # FLUX.2 only: BFL empirical-mu shift (resolution + step-count aware)
 )
 
 # FLUX.2 uses ModelSamplingFlux with shift=2.02 (the log-shift `mu`).
@@ -69,6 +70,86 @@ def _flux_shift(seq_len: int, base_shift: float = 0.5, max_shift: float = 1.15) 
     m = (max_shift - base_shift) / (x2 - x1)
     mu = m * seq_len + base_shift - m * x1
     return math.exp(mu)
+
+
+def _flux2_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+    """BFL FLUX.2 empirical log-shift ``mu`` (diffusers ``compute_empirical_mu``):
+    a linear fit in the noisy-token count, interpolated between the 10- and
+    200-step fits by ``num_steps`` (200-step fit alone above 4300 tokens)."""
+    a1, b1 = 8.73809524e-05, 1.89833333
+    a2, b2 = 0.00016927, 0.45666666
+    if image_seq_len > 4300:
+        return float(a2 * image_seq_len + b2)
+    m_200 = a2 * image_seq_len + b2
+    m_10 = a1 * image_seq_len + b1
+    a = (m_200 - m_10) / 190.0
+    b = m_200 - 200.0 * a
+    return float(a * num_steps + b)
+
+
+def _flux2_reference_geometry(
+    size: "tuple[int, int]", *, max_area: int = 1024 * 1024, multiple: int = 16,
+) -> "tuple[tuple[int, int], tuple[int, int]]":
+    """``((resized_w, resized_h), (final_w, final_h))`` for a reference of
+    ``size = (w, h)``: over-area images are scaled to ``max_area`` (aspect
+    kept), then both sides floor to ``multiple``."""
+    w, h = size
+    if w < 64 or h < 64:
+        raise ValueError(f"reference image too small: {w}x{h} (both sides must be >= 64)")
+    if max(w / h, h / w) > 8:
+        raise ValueError(f"reference aspect ratio too extreme: {w}x{h} (max 8:1)")
+    if w * h > max_area:
+        scale = math.sqrt(max_area / (w * h))
+        w, h = int(w * scale), int(h * scale)
+    return (w, h), ((w // multiple) * multiple, (h // multiple) * multiple)
+
+
+def _flux2_prepare_reference(image: Image.Image) -> torch.Tensor:
+    """Reference image -> ``[1, 3, H, W]`` in ``[-1, 1]`` as the FLUX.2 pipeline
+    sees it: Lanczos resize if over the area cap, then a centre crop to the
+    /16 floor (no resample)."""
+    if not isinstance(image, Image.Image):
+        raise ValueError(f"reference image must be a PIL.Image.Image, got {type(image)}")
+    (w, h), (nw, nh) = _flux2_reference_geometry(image.size)
+    if (w, h) != image.size:
+        image = image.resize((w, h), Image.Resampling.LANCZOS)
+    left, top = (w - nw) // 2, (h - nh) // 2
+    image = image.crop((left, top, left + nw, top + nh)).convert("RGB")
+    arr = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+
+def _flux2_reference_ids(grids: "list[tuple[int, int]]", device) -> torch.Tensor:
+    """Position ids for the packed reference tokens: the i-th reference sits at
+    T = 10 + 10·i (the noisy latent is T = 0), H/W = its own latent grid."""
+    ids = []
+    for i, (gh, gw) in enumerate(grids):
+        r = _img_ids(gh, gw, 1, 4, device)
+        r[..., 0] = 10 + 10 * i
+        ids.append(r)
+    return torch.cat(ids, dim=1)
+
+
+def _flux2_encode_references(model: "ModelBundle", images, device, dtype):
+    """Encode the references once: ``(tokens [1, N_ref, 128], ids [1, N_ref, 4])``.
+    VAE posterior mode -> 2x2 pixel-shuffle -> batch-norm normalise -> flatten."""
+    policy = model.policy
+    tokens, grids = [], []
+    with torch.no_grad(), no_cudnn_autotune(), staged([model.vae], device, policy.offload_idle):
+        for img in images:
+            pixels = _flux2_prepare_reference(img).to(device, policy.vae_dtype)
+            lat = model.vae.encode(pixels, sample=False)
+            if lat.dtype == torch.float16 and not torch.isfinite(lat).all():
+                vae_fallback_to_fp32(model.vae, policy)
+                lat = model.vae.encode(pixels.float(), sample=False)
+            z = _flux2_patchify_latents(lat.float())
+            if getattr(model.vae, "flux2_latent_mean", None) is not None:
+                mean = model.vae.flux2_latent_mean.to(z.device, torch.float32)
+                std = model.vae.flux2_latent_std.to(z.device, torch.float32)
+                z = (z - mean) / std
+            grids.append(tuple(z.shape[-2:]))
+            tokens.append(_patchify(z.to(dtype), 1))
+    return torch.cat(tokens, dim=1), _flux2_reference_ids(grids, device)
 
 
 def _patchify(x: torch.Tensor, patch: int) -> torch.Tensor:
@@ -118,6 +199,7 @@ def _to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(img[0].permute(1, 2, 0).cpu().numpy())
 
 
+@torch.no_grad()
 def _encode_text(model: "ModelBundle", prompt: str, device, dtype):
     """``(context, pooled)`` for one prompt; FLUX.2 has no pooled vector."""
     tok = model.tokenizer
@@ -141,11 +223,12 @@ def flux_text_to_image(
     steps: int = 20,
     guidance: float = 3.5,
     shift: float = 3.0,
-    width: int = 1024,
-    height: int = 1024,
+    width: int | None = None,
+    height: int | None = None,
     seed: int | None = None,
     sampler: str = "euler",
     scheduler: str = "flux",
+    reference_images: "list[Image.Image] | None" = None,
     progress_callback: Callable[[int, int], None] | None = None,
     preview_callback: Callable[[object], None] | None = None,
     return_info: bool = False,
@@ -154,7 +237,14 @@ def flux_text_to_image(
 
     ``guidance`` is the distilled guidance scale (ignored without a guidance
     embedding). ``scheduler`` is ``"flux"`` (family-shifted default),
-    ``"flow"`` (constant ``shift``) or a flow table scheduler.
+    ``"flow"`` (constant ``shift``), ``"flux2"`` (FLUX.2 empirical-mu shift) or
+    a flow table scheduler.
+
+    ``reference_images`` (FLUX.2 only) turns this into reference-image editing:
+    each reference is encoded once and its tokens ride along with the noisy
+    tokens every step (T-axis ids 10, 20, ...); only the noisy tokens are
+    updated. ``width``/``height`` default to the first reference's processed
+    size, else 1024.
     """
     if sampler not in _FLUX_SAMPLERS:
         raise ValueError(f"FLUX sampler must be one of {sorted(_FLUX_SAMPLERS)}; got {sampler!r}")
@@ -165,6 +255,20 @@ def flux_text_to_image(
     geom = _geom(arch)
     policy = model.policy
     device, dtype = policy.device, policy.compute_dtype
+
+    if scheduler == "flux2" and arch != "flux2":
+        raise ValueError('scheduler "flux2" is only valid for FLUX.2 models')
+    if reference_images is not None and len(reference_images) == 0:
+        reference_images = None
+    if reference_images is not None:
+        if arch != "flux2":
+            raise ValueError("reference_images is only supported for FLUX.2 models")
+        if width is None or height is None:
+            ref_w, ref_h = _flux2_reference_geometry(reference_images[0].size)[1]
+            width = ref_w if width is None else width
+            height = ref_h if height is None else height
+    width = 1024 if width is None else width
+    height = 1024 if height is None else height
 
     if width % geom["downscale"] or height % geom["downscale"]:
         raise ValueError(f"width/height must be divisible by {geom['downscale']}; got {width}x{height}")
@@ -203,11 +307,20 @@ def flux_text_to_image(
             eff_shift = 1.0
         if scheduler == "flux":
             sigmas = flow_matching_schedule(steps, shift=eff_shift, device=device, dtype=torch.float32)
+        elif scheduler == "flux2":
+            # seq_len counts the noisy tokens only (references excluded)
+            eff_shift = math.exp(_flux2_empirical_mu(seq_len, steps))
+            sigmas = flow_matching_schedule(steps, shift=eff_shift, device=device, dtype=torch.float32)
         elif scheduler == "flow":
             eff_shift = shift
             sigmas = flow_matching_schedule(steps, shift=shift, device=device, dtype=torch.float32)
         else:
             sigmas = flow_table_schedule(scheduler, eff_shift, steps, device=device, dtype=torch.float32)
+
+        ref_tokens = ref_ids = None
+        if reference_images is not None:
+            ref_tokens, ref_ids = _flux2_encode_references(model, reference_images, device, dtype)
+            all_ids = torch.cat([img_ids, ref_ids], dim=1)
 
         gen = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
         x = _patchify(torch.randn(1, model.spec.latent_channels, h_lat, w_lat,
@@ -220,7 +333,11 @@ def flux_text_to_image(
 
         def velocity(x_tokens, sigma_scalar):
             t = torch.full((1,), float(sigma_scalar), device=device, dtype=dtype)
-            return model.backbone(x_tokens, img_ids, context, txt_ids, t, pooled, guidance_vec)
+            if ref_tokens is None:
+                return model.backbone(x_tokens, img_ids, context, txt_ids, t, pooled, guidance_vec)
+            out = model.backbone(torch.cat([x_tokens, ref_tokens], dim=1), all_ids,
+                                 context, txt_ids, t, pooled, guidance_vec)
+            return out[:, :x_tokens.shape[1]]
 
         # 4. integrate (CONST: denoised = x − σ·v). preview_callback isn't wired:
         # the latent is token-space and would need unpatchifying first.
@@ -344,7 +461,12 @@ def flux_img2img(
         else:
             eff_shift = 1.0
         sched_steps = int(steps / strength)
+        if scheduler == "flux2" and arch != "flux2":
+            scheduler = "flux"
         if scheduler == "flux":
+            sigmas = flow_matching_schedule(sched_steps, shift=eff_shift, device=device, dtype=torch.float32)
+        elif scheduler == "flux2":
+            eff_shift = math.exp(_flux2_empirical_mu(seq_len, sched_steps))
             sigmas = flow_matching_schedule(sched_steps, shift=eff_shift, device=device, dtype=torch.float32)
         elif scheduler == "flow":
             eff_shift = shift

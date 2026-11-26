@@ -299,6 +299,10 @@ class DoubleStreamBlock(nn.Module):
         img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
         txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
         txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+        if txt.dtype == torch.float16:
+            # FLUX.2's text stream carries activations past the fp16 range; a
+            # saturating clip (as in diffusers/ComfyUI) turns inf, not NaN.
+            txt = txt.clip(-65504, 65504)
         return img, txt
 
 
@@ -333,7 +337,10 @@ class SingleStreamBlock(nn.Module):
         q, k = self.norm(q, k, v)
         attn = attention(q, k, v, pe=pe, backend=self.attn_backend)
         out = self.linear2(torch.cat((attn, self.mlp_act(mlp)), dim=2))
-        return x + mod.gate * out
+        x = x + mod.gate * out
+        if x.dtype == torch.float16:
+            x = x.clip(-65504, 65504)
+        return x
 
 
 class LastLayer(nn.Module):
